@@ -15,11 +15,35 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "jrpxy-backend"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "jrpxy-body",
+ "jrpxy-http-message",
+ "jrpxy-util",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "jrpxy-body"
 version = "0.1.0"
 dependencies = [
  "bytes",
  "httparse",
+ "jrpxy-util",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
+name = "jrpxy-frontend"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "jrpxy-body",
+ "jrpxy-http-message",
  "jrpxy-util",
  "thiserror",
  "tokio",
