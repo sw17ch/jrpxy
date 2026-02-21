@@ -1,0 +1,19 @@
+[package]
+name = "jrpxy-proxy"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jrpxy-backend = { workspace = true }
+jrpxy-frontend = { workspace = true }
+jrpxy-http-message = { workspace = true }
+jrpxy-request-forwarder = { workspace = true }
+jrpxy-response-forwarder = { workspace = true }
+jrpxy-util = { workspace = true }
+
+bytes = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+
+[dev-dependencies]
+httparse = { workspace = true }

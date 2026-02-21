@@ -1,0 +1,16 @@
+[package]
+name = "jrpxy-request-forwarder"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jrpxy-backend = { workspace = true }
+jrpxy-body = { workspace = true }
+jrpxy-frontend = { workspace = true }
+jrpxy-http-message = { workspace = true }
+
+tokio = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+jrpxy-util = { workspace = true }

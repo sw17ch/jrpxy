@@ -1,0 +1,17 @@
+[package]
+name = "jrpxy"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "jrpxy"
+path = "src/main.rs"
+
+[dependencies]
+jrpxy-backend = { workspace = true }
+jrpxy-frontend = { workspace = true }
+jrpxy-proxy = { workspace = true }
+jrpxy-http-message = { workspace = true }
+
+thiserror = { workspace = true }
+tokio = { workspace = true }
