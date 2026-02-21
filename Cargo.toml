@@ -1,0 +1,17 @@
+[workspace]
+resolver = "3"
+members = [
+    "body",
+    "http-message",
+    "util",
+]
+
+[workspace.dependencies]
+jrpxy-http-message = { path = "http-message" }
+jrpxy-body = { path = "body" }
+jrpxy-util = { path = "util" }
+
+bytes = "1.11.0"
+httparse = "1.10.1"
+thiserror = "2.0.17"
+tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "time"] }

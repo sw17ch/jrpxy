@@ -1,0 +1,10 @@
+[package]
+name = "jrpxy-http-message"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+bytes = { workspace = true }
+thiserror = { workspace = true }
+httparse = { workspace = true }
+jrpxy-util = { workspace = true }

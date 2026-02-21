@@ -1,0 +1,12 @@
+[package]
+name = "jrpxy-body"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jrpxy-util = { workspace = true }
+
+httparse = { workspace = true }
+bytes = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
