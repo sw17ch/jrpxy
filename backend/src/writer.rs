@@ -140,9 +140,6 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
         Ok(())
     }
 
-    // TODO: add an "abort" that explicitly abandons the write. for
-    // chunk-encoding, we probably want this to write out an invalid chunk.
-
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
         let Self { mut io, state } = self;
         state
