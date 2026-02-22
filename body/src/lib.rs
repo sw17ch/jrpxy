@@ -24,6 +24,8 @@ pub enum BodyError {
     TrailerError(#[from] TrailerError),
     #[error("Unexpected EOF")]
     UnexpectedEOF,
+    #[error("Invalid chunk footer: expected {0} got {0}")]
+    InvalidChunkFooter(u8, u8),
 }
 
 pub type BodyResult<T> = Result<T, BodyError>;
@@ -285,7 +287,8 @@ impl ContentLengthBodyReader {
 enum ChunkedBodyReaderState {
     InChunkHeader,
     InChunkBody { remaining: u64 },
-    InChunkFooter { have_cr: bool },
+    InChunkFooterNeedCR,
+    InChunkFooterNeedLF,
     InTrailers,
     Done,
 }
@@ -322,7 +325,7 @@ impl ChunkedBodyReader {
                 }
                 ChunkedBodyReaderState::InChunkBody { remaining } => {
                     if *remaining == 0 {
-                        self.state = ChunkedBodyReaderState::InChunkFooter { have_cr: false };
+                        self.state = ChunkedBodyReaderState::InChunkFooterNeedCR;
                     } else if buffer.is_empty() {
                         return Ok(BodyReadResult::NeedRead);
                     } else {
@@ -332,17 +335,28 @@ impl ChunkedBodyReader {
                         return Ok(BodyReadResult::DidRead(body_buf.freeze()));
                     }
                 }
-                ChunkedBodyReaderState::InChunkFooter { have_cr } => {
-                    if let Ok(b) = buffer.try_get_u8() {
-                        if !*have_cr && b == b'\r' {
-                            *have_cr = true;
-                        } else if b == b'\n' {
-                            self.state = ChunkedBodyReaderState::InChunkHeader;
-                        }
-                    } else {
+                ChunkedBodyReaderState::InChunkFooterNeedCR => match buffer.try_get_u8() {
+                    Ok(b'\r') => {
+                        self.state = ChunkedBodyReaderState::InChunkFooterNeedLF;
+                    }
+                    Ok(unexpected) => {
+                        return Err(BodyError::InvalidChunkFooter(b'\r', unexpected));
+                    }
+                    Err(_) => {
                         return Ok(BodyReadResult::NeedRead);
                     }
-                }
+                },
+                ChunkedBodyReaderState::InChunkFooterNeedLF => match buffer.try_get_u8() {
+                    Ok(b'\n') => {
+                        self.state = ChunkedBodyReaderState::InChunkHeader;
+                    }
+                    Ok(unexpected) => {
+                        return Err(BodyError::InvalidChunkFooter(b'\n', unexpected));
+                    }
+                    Err(_) => {
+                        return Ok(BodyReadResult::NeedRead);
+                    }
+                },
                 ChunkedBodyReaderState::InTrailers => match parse_trailers(buffer)? {
                     httparse::Status::Complete(end_at) => {
                         let _trailers = buffer.split_to(end_at);
@@ -575,7 +589,7 @@ mod test {
     use bytes::BytesMut;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{BodyReadMode, BodyReader, ChunkedBodyWriter};
+    use crate::{BodyError, BodyReadMode, BodyReader, ChunkedBodyWriter};
 
     #[tokio::test]
     async fn cl_peek_full() {
@@ -752,6 +766,49 @@ mod test {
         let (complete, slice) = br.peek(10).await.expect("peek works");
         assert!(complete);
         assert_eq!(b"0123012", slice);
+    }
+
+    #[tokio::test]
+    async fn chunked_reject_invalid_chunk_footer() {
+        // Note that the 'X' is where the '\r' should be.
+        let input = b"\
+            4\r\n\
+            0123X\r\n\
+            0\r\n\
+            \r\n\
+            ";
+
+        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::Chunk);
+
+        // The body bytes themselves are valid and should be readable.
+        let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
+        assert_eq!(b"0123", chunk.as_ref());
+
+        // Reading past the body must result in an error.
+        assert!(matches!(
+            br.read(1).await.unwrap_err(),
+            BodyError::InvalidChunkFooter(b'\r', b'X'),
+        ));
+
+        // Note that the 'X' is where the '\n' should be.
+        let input = b"\
+            4\r\n\
+            0123\rX\n\
+            0\r\n\
+            \r\n\
+            ";
+
+        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::Chunk);
+
+        // The body bytes themselves are valid and should be readable.
+        let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
+        assert_eq!(b"0123", chunk.as_ref());
+
+        // Reading past the body must result in an error.
+        assert!(matches!(
+            br.read(1).await.unwrap_err(),
+            BodyError::InvalidChunkFooter(b'\n', b'X'),
+        ));
     }
 
     #[tokio::test]
