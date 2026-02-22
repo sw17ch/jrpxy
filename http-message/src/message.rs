@@ -24,8 +24,8 @@ impl Span {
     fn from_subslice(buf: &[u8], sub: &[u8]) -> Self {
         let buf_start = buf.as_ptr() as usize;
         let sub_start = sub.as_ptr() as usize;
-        debug_assert!(sub_start >= buf_start);
-        debug_assert!(sub_start + sub.len() <= buf_start + buf.len());
+        assert!(sub_start >= buf_start);
+        assert!(sub_start + sub.len() <= buf_start + buf.len());
         Self {
             offset: sub_start - buf_start,
             len: sub.len(),
