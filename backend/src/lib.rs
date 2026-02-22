@@ -175,6 +175,15 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
             .map_err(BackendError::BodyWriteError)
     }
 
+    pub async fn abort(self) -> BackendResult<()> {
+        let Self { mut io, state } = self;
+        state
+            .abort(&mut io)
+            .await
+            .map_err(BackendError::BodyWriteError)?;
+        Ok(())
+    }
+
     // TODO: add an "abort" that explicitly abandons the write. for
     // chunk-encoding, we probably want this to write out an invalid chunk.
 

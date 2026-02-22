@@ -60,6 +60,26 @@ impl BodyWriterState {
         io.flush().await.map_err(BodyError::BodyWriteError)?;
         Ok(())
     }
+
+    /// Explicitly abort a body write. This will, for certain transfer types,
+    /// perform an invalid write which may help prevent insufficiently strict
+    /// body readers from considering the body complete.
+    pub async fn abort<I: AsyncWriteExt + Unpin>(self, mut io: I) -> BodyResult<()> {
+        match self {
+            BodyWriterState::CL(_w) => {
+                // do nothing when aborting a content-length body. just drop the
+                // connection.
+            }
+            BodyWriterState::TE(w) => {
+                // there are chunked body readers out there that don't wait
+                // around for the empty chunk to consider a body complete, so we
+                // do something special.
+                w.abort(&mut io).await?
+            }
+        }
+        io.flush().await.map_err(BodyError::BodyWriteError)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -162,6 +182,16 @@ impl ChunkedBodyWriter {
         io.write_all(b"0\r\n\r\n")
             .await
             .map_err(BodyError::BodyWriteError)
+    }
+
+    async fn abort<I: AsyncWriteExt + Unpin>(&self, mut io: I) -> BodyResult<()> {
+        // we allow users to explicitly abandon a transfer-encoding:chunked
+        // write by emitting a bad chunk header. this should be a little more
+        // durable when badly-configured body readers don't wait for the
+        // terminating empty chunk to consider a body complete.
+        //
+        // we write an 'x' because it is not a valid hexadecimal character
+        io.write_all(b"x").await.map_err(BodyError::BodyWriteError)
     }
 }
 
@@ -545,7 +575,7 @@ mod test {
     use bytes::BytesMut;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{BodyReadMode, BodyReader};
+    use crate::{BodyReadMode, BodyReader, ChunkedBodyWriter};
 
     #[tokio::test]
     async fn cl_peek_full() {
@@ -722,5 +752,44 @@ mod test {
         let (complete, slice) = br.peek(10).await.expect("peek works");
         assert!(complete);
         assert_eq!(b"0123012", slice);
+    }
+
+    #[tokio::test]
+    async fn chunked_write_abort() {
+        let mut write_buf = Vec::new();
+        let mut bw = ChunkedBodyWriter::new();
+        bw.write(&mut write_buf, b"hello").await.unwrap();
+        bw.write(&mut write_buf, b"there").await.unwrap();
+        bw.abort(&mut write_buf).await.unwrap();
+
+        assert_eq!(
+            "\
+            5\r\n\
+            hello\r\n\
+            5\r\n\
+            there\r\n\
+            x",
+            std::str::from_utf8(&write_buf).unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_write() {
+        let mut write_buf = Vec::new();
+        let mut bw = ChunkedBodyWriter::new();
+        bw.write(&mut write_buf, b"hello").await.unwrap();
+        bw.write(&mut write_buf, b"there").await.unwrap();
+        bw.finish(&mut write_buf).await.unwrap();
+
+        assert_eq!(
+            "\
+            5\r\n\
+            hello\r\n\
+            5\r\n\
+            there\r\n\
+            0\r\n\
+            \r\n",
+            std::str::from_utf8(&write_buf).unwrap(),
+        );
     }
 }
