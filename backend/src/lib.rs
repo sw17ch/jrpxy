@@ -8,7 +8,7 @@ use jrpxy_body::{
 use jrpxy_http_message::{
     framing::HeadFraming,
     header::HeaderError,
-    message::{HttpParseError, Request, Response},
+    message::{MessageError, Request, Response},
     version::HttpVersion,
 };
 use jrpxy_util::buffer;
@@ -29,7 +29,7 @@ pub enum BackendError {
     #[error("Unexpected end of file while reading")]
     UnexpectedEOF,
     #[error("Failed to parse response: {0}")]
-    HttpResponseParseError(HttpParseError),
+    HttpResponseParseError(MessageError),
     #[error("Header error: {0}")]
     HeaderError(#[from] HeaderError),
     #[error("101-switching-protocols unsupported")]

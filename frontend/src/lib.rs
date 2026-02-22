@@ -114,7 +114,7 @@ use jrpxy_body::{
 use jrpxy_http_message::{
     framing::HeadFraming,
     header::HeaderError,
-    message::{HttpParseError, Request, Response},
+    message::{MessageError, Request, Response},
 };
 use jrpxy_util::buffer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -135,7 +135,7 @@ pub enum FrontendError {
     #[error("Unexpected end of file while reading")]
     UnexpectedEOF,
     #[error("Failed to parse request: {0}")]
-    HttpRequestParseError(HttpParseError),
+    HttpRequestParseError(MessageError),
     #[error("Header error: {0}")]
     HeaderError(#[from] HeaderError),
     #[error("Request head exceeded size limit: {0} >= {1}")]

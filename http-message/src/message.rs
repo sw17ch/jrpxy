@@ -12,6 +12,16 @@ use crate::{
     version::HttpVersion,
 };
 
+#[derive(thiserror::Error, Debug)]
+pub enum MessageError {
+    #[error("Error parsing HTTP: {0}")]
+    Parse(#[from] HttpParseError),
+    #[error("Unsupported http version: {0}")]
+    HttpVersion(u8),
+}
+
+pub type MessageResult<T> = Result<T, MessageError>;
+
 #[derive(Copy, Clone)]
 struct Span {
     offset: usize,
@@ -62,7 +72,7 @@ impl<'p, 'b: 'p, 'h: 'b> RequestOffset<'h> {
         buf: &'b [u8],
         parse_headers: &mut [MaybeUninit<httparse::Header<'p>>],
         out_headers: &'h mut [MaybeUninit<HeaderOffset>],
-    ) -> Result<Option<(Self, usize)>, httparse::Error> {
+    ) -> MessageResult<Option<(Self, usize)>> {
         debug_assert_eq!(parse_headers.len(), out_headers.len());
 
         let mut req = HttparseRequest::new(&mut []);
@@ -72,12 +82,12 @@ impl<'p, 'b: 'p, 'h: 'b> RequestOffset<'h> {
             parse_headers,
         ) {
             Ok(httparse::Status::Partial) => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
             Ok(httparse::Status::Complete(head_len)) => {
                 let method = req.method.unwrap_or_default();
                 let path = req.path.unwrap_or_default();
-                let version =
-                    HttpVersion::try_from(req.version.unwrap_or_default()).expect("FIX ME");
+                let version = HttpVersion::try_from(req.version.unwrap_or_default())
+                    .map_err(MessageError::HttpVersion)?;
 
                 let out_headers = &mut out_headers[0..req.headers.len()];
                 let headers = populate_header_offsets(buf, out_headers, req.headers);
@@ -107,7 +117,7 @@ impl<'p, 'b: 'p, 'h: 'b> ResponseOffset<'h> {
         buf: &'b [u8],
         parse_headers: &mut [MaybeUninit<httparse::Header<'p>>],
         out_headers: &'h mut [MaybeUninit<HeaderOffset>],
-    ) -> Result<Option<(Self, usize)>, httparse::Error> {
+    ) -> MessageResult<Option<(Self, usize)>> {
         debug_assert_eq!(parse_headers.len(), out_headers.len());
 
         let mut res = HttparseResponse::new(&mut []);
@@ -117,10 +127,10 @@ impl<'p, 'b: 'p, 'h: 'b> ResponseOffset<'h> {
             parse_headers,
         ) {
             Ok(httparse::Status::Partial) => Ok(None),
-            Err(e) => Err(e),
+            Err(e) => Err(e.into()),
             Ok(httparse::Status::Complete(head_len)) => {
-                let version =
-                    HttpVersion::try_from(res.version.unwrap_or_default()).expect("FIX ME");
+                let version = HttpVersion::try_from(res.version.unwrap_or_default())
+                    .map_err(MessageError::HttpVersion)?;
                 let code = res.code.unwrap_or_default();
                 let reason = res.reason.unwrap_or_default();
 
@@ -170,7 +180,7 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn parse(buf: &mut Buffer, max_headers: usize) -> Result<Option<Self>, httparse::Error> {
+    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
         let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
         let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
         match RequestOffset::parse(&*buf, &mut parse_headers, &mut out_headers)? {
@@ -246,7 +256,7 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn parse(buf: &mut Buffer, max_headers: usize) -> Result<Option<Self>, httparse::Error> {
+    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
         let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
         let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
         match ResponseOffset::parse(&*buf, &mut parse_headers, &mut out_headers)? {
