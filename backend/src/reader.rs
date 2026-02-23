@@ -94,20 +94,26 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
             return match info_code {
                 100 => Ok(ResponseStream::Informational(
                     res,
-                    Self {
-                        io,
-                        max_head_length,
-                        buffer,
+                    BackendStreamReader {
+                        allow_body,
+                        reader: Self {
+                            io,
+                            max_head_length,
+                            buffer,
+                        },
                     },
                 )),
                 101 => Err(BackendError::HttpSwitchingProtocolsUnsupported),
                 102 => Err(BackendError::HttpProcessingUnsupported),
                 103 => Ok(ResponseStream::Informational(
                     res,
-                    Self {
-                        io,
-                        max_head_length,
-                        buffer,
+                    BackendStreamReader {
+                        allow_body,
+                        reader: Self {
+                            io,
+                            max_head_length,
+                            buffer,
+                        },
                     },
                 )),
                 unk => Err(BackendError::HttpUnsupportedInformational(unk)),
@@ -158,7 +164,7 @@ pub enum ResponseStream<I> {
     /// out the body, if any.
     Response(BackendResponse<I>),
     /// We got an informational response.
-    Informational(Response, BackendReader<I>),
+    Informational(Response, BackendStreamReader<I>),
 }
 
 impl<I> ResponseStream<I> {
@@ -169,7 +175,7 @@ impl<I> ResponseStream<I> {
         }
     }
 
-    pub fn try_into_informational(self) -> Result<(Response, BackendReader<I>), Self> {
+    pub fn try_into_informational(self) -> Result<(Response, BackendStreamReader<I>), Self> {
         match self {
             r @ ResponseStream::Response(_) => Err(r),
             ResponseStream::Informational(res, reader) => Ok((res, reader)),
@@ -183,6 +189,18 @@ impl<I: std::fmt::Debug> std::fmt::Debug for ResponseStream<I> {
             Self::Response(_) => write!(f, "Response"),
             Self::Informational(_, _) => write!(f, "Informational"),
         }
+    }
+}
+
+pub struct BackendStreamReader<I> {
+    allow_body: bool,
+    reader: BackendReader<I>,
+}
+
+impl<I: AsyncReadExt + Unpin> BackendStreamReader<I> {
+    pub async fn read(self) -> BackendResult<ResponseStream<I>> {
+        let Self { allow_body, reader } = self;
+        reader.read(allow_body).await
     }
 }
 
@@ -594,5 +612,39 @@ mod test {
         let result = reader.read(true).await;
 
         assert!(result.is_err(),);
+    }
+
+    #[tokio::test]
+    async fn status_1xx_stream() {
+        let buf = b"\
+            HTTP/1.1 100 Continue\r\n\
+            x-res: 1\r\n\
+            \r\n\
+            HTTP/1.1 100 Continue\r\n\
+            x-res: 2\r\n\
+            \r\n\
+            HTTP/1.1 200 Ok\r\n\
+            x-res: 3\r\n\
+            \r\n\
+            ";
+
+        let reader = BackendReader::new(buf.as_slice(), 128);
+        let result = reader.read(true).await.expect("failed to read");
+
+        let (res, reader) = result.try_into_informational().expect("not informational");
+        let xres = res.get_header("x-res").expect("header not present");
+        assert_eq!(xres, b"1".as_ref());
+
+        let result = reader.read().await.expect("failed to read");
+        let (res, reader) = result.try_into_informational().expect("not informational");
+        let xres = res.get_header("x-res").expect("header not present");
+        assert_eq!(xres, b"2".as_ref());
+
+        let result = reader.read().await.expect("read failed");
+        let res = result.try_into_response().expect("not response");
+        let (res, body_reader) = res.into_parts();
+        let xres = res.get_header("x-res").expect("header not present");
+        assert_eq!(xres, b"3".as_ref());
+        let _out = body_reader.drain().await.expect("failed to drain");
     }
 }
