@@ -1,6 +1,13 @@
 //! Tools for writing responses to a HTTP/1.x frontend.
 //!
-//! We can use [`FrontendWriter`] to write a stream of requests.
+//! Each `send_as_*` method on [`FrontendWriter`] writes the response
+//! head and hands back a per-encoding [`Ready`](body::Ready)-shaped
+//! state. The state machine for each encoding mirrors the body crate
+//! shape (`Ready -> Open -> Write -> Close -> Ready`, terminating in
+//! `Finish` or `Abort`). The encoding-generic [`body`] module wraps the
+//! four per-encoding states in an enum that exposes only their common
+//! surface; chunked-only operations such as trailer support live on
+//! [`chunked::Ready`] directly.
 //!
 //! ```rust
 //! use jrpxy_frontend::writer::FrontendWriter;
@@ -8,175 +15,201 @@
 //!
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() {
-//!    let mut buf = Vec::new();
+//!     let mut buf = Vec::new();
+//!     let frontend_writer = FrontendWriter::new(&mut buf);
 //!
-//!    // Write the first response
-//!    let frontend_writer = FrontendWriter::new(&mut buf);
-//!    let mut builder = ResponseBuilder::new(4);
-//!    let resp = builder
-//!        .with_version(HttpVersion::Http11)
-//!        .with_code(200)
-//!        .with_reason("Ok")
-//!        .build();
-//!    let mut frontend_body_writer = frontend_writer
-//!        .send_as_content_length(&resp, 5)
-//!        .await
-//!        .unwrap();
-//!    frontend_body_writer.write(b"ab").await.unwrap();
-//!    frontend_body_writer.write(b"cde").await.unwrap();
-//!    let frontend_writer = frontend_body_writer.finish().await.unwrap();
+//!     let mut builder = ResponseBuilder::new(4);
+//!     let resp = builder
+//!         .with_version(HttpVersion::Http11)
+//!         .with_code(200)
+//!         .with_reason("Ok")
+//!         .build()
+//!         .expect("failed to build")
+//!         .into();
 //!
-//!    // Write the second response
-//!    let mut builder = ResponseBuilder::new(4);
-//!    let resp = builder
-//!        .with_version(HttpVersion::Http11)
-//!        .with_code(404)
-//!        .with_reason("Not Found")
-//!        .build();
-//!    let mut frontend_body_writer = frontend_writer.send_as_chunked(&resp).await.unwrap();
-//!    frontend_body_writer.write(b"01234").await.unwrap();
-//!    frontend_body_writer.write(b"567").await.unwrap();
-//!    frontend_body_writer.write(b"89").await.unwrap();
-//!    let _frontend_writer = frontend_body_writer.finish().await.unwrap();
+//!     // send the response head with content-length: 5
+//!     let ready = frontend_writer
+//!         .send_as_content_length(&resp, 5)
+//!         .await
+//!         .expect("failed to send");
 //!
-//!    assert_eq!(
-//!        b"\
-//!            HTTP/1.1 200 Ok\r\n\
-//!            content-length: 5\r\n\
-//!            \r\n\
-//!            abcde\
-//!            HTTP/1.1 404 Not Found\r\n\
-//!            transfer-encoding: chunked\r\n\
-//!            \r\n\
-//!            5\r\n\
-//!            01234\r\n\
-//!            3\r\n\
-//!            567\r\n\
-//!            2\r\n\
-//!            89\r\n\
-//!            0\r\n\
-//!            \r\n\
-//!            ",
-//!        &buf[..]
-//!    );
+//!     // drive a single Open/Write/Close cycle of 5 bytes
+//!     let open = ready.open(5).expect("open");
+//!     let mut write = open.open().await.expect("open async");
+//!     write.write_all(b"abcde").await.expect("write_all");
+//!     let close = write.into_close().expect("into_close");
+//!     let ready = close.close().await.expect("close");
+//!
+//!     // terminate cleanly
+//!     let _frontend_writer = ready
+//!         .finish()
+//!         .expect("finish")
+//!         .finish()
+//!         .await
+//!         .expect("flush");
+//!
+//!     assert_eq!(
+//!         &b"HTTP/1.1 200 Ok\r\ncontent-length: 5\r\n\r\nabcde"[..],
+//!         &buf[..]
+//!     );
 //! }
 //! ```
 
-use jrpxy_body::BodyWriterState;
-use jrpxy_body::ChunkedBodyWriter;
-use jrpxy_body::ContentLengthBodyWriter;
-use jrpxy_body::is_framing_header;
-use jrpxy_http_message::framing::HeadFraming;
-use jrpxy_http_message::message::Response;
-use tokio::io;
-use tokio::io::AsyncWriteExt;
+pub mod body;
+pub mod bodyless;
+pub mod chunked;
+pub mod content_length;
+pub mod eof;
 
-use crate::error::FrontendError;
-use crate::error::FrontendResult;
+use jrpxy_body::writer::{
+    bodyless as body_bodyless, chunked as body_chunked, content_length as body_content_length,
+    eof as body_eof,
+};
+use jrpxy_http_message::{
+    framing::{WriteFraming, is_framing_header},
+    message::Response,
+};
+use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 
-/// Writes a response to a frontend.
+use crate::error::{FrontendError, FrontendResult};
+
+/// Connection-level writer. Each `send_as_*` writes the response head
+/// and hands back the per-encoding body-writer `Ready` for the chosen
+/// framing.
 #[derive(Debug)]
 pub struct FrontendWriter<I> {
-    pub(crate) io: I,
+    writer: I,
 }
 
-impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
-    /// Create a new frontend writer that will write responses into the
-    /// specified `io`.
-    pub fn new(io: I) -> Self {
-        Self { io }
+impl<I> FrontendWriter<I> {
+    /// Create a new [`FrontendWriter`].
+    pub fn new(writer: I) -> Self {
+        Self { writer }
     }
 
-    /// Send the specified response with a chunked response body.
-    pub async fn send_as_chunked(
-        self,
-        response: &Response,
-    ) -> FrontendResult<FrontendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_response_to(response, HeadFraming::Chunked, &mut io)
+    /// Convert back to the contained writer.
+    pub fn into_inner(self) -> I {
+        let Self { writer } = self;
+        writer
+    }
+}
+
+impl<I> FrontendWriter<I>
+where
+    I: AsyncWrite + Unpin,
+{
+    /// Send the response head with a body terminated by connection close (RFC
+    /// 9112 section 6.3). Any framing headers from the origin are stripped. Use
+    /// this when the client cannot decode chunked transfer encoding (e.g.
+    /// HTTP/1.0).
+    ///
+    /// The returned [`eof::Ready`] cannot be recycled into a
+    /// [`FrontendWriter`]; the connection must be closed after the body is
+    /// sent.
+    ///
+    /// Framing headers will be stripped from `response`.
+    pub async fn send_as_eof(self, response: &Response) -> FrontendResult<eof::Ready<I>> {
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::StripFraming, &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter {
-            io,
-            state: BodyWriterState::TE(ChunkedBodyWriter::new()),
-        })
+        Ok(eof::Ready::new(body_eof::Ready::new(writer)))
     }
 
-    /// Send the specified response with a content-length delimited response
-    /// body. The [`FrontendBodyWriter`] will only accept the specified number
-    /// of bytes.
+    /// Send the response head with a chunked body (RFC9112 section 7.1).
+    ///
+    /// Framing headers will be stripped from `response`, and replaced with
+    /// `transfer-encoding: chunked`.
+    pub async fn send_as_chunked(self, response: &Response) -> FrontendResult<chunked::Ready<I>> {
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::Chunked, &mut writer)
+            .await
+            .map_err(FrontendError::WriteError)?;
+        Ok(chunked::Ready::new(body_chunked::Ready::new(writer)))
+    }
+
+    /// Send the response head with a `content-length`-delimited body.
+    ///
+    /// Framing headers will be stripped from `response`, and replaced with
+    /// `content-length: <body_len>`.
     pub async fn send_as_content_length(
         self,
         response: &Response,
         body_len: u64,
-    ) -> FrontendResult<FrontendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_response_to(response, HeadFraming::Length(body_len), &mut io)
+    ) -> FrontendResult<content_length::Ready<I>> {
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::Length(body_len), &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter {
-            io,
-            state: BodyWriterState::CL(ContentLengthBodyWriter::new(body_len)),
-        })
+        Ok(content_length::Ready::new(body_content_length::Ready::new(
+            writer, body_len,
+        )))
     }
 
-    /// Send the response to the frontend as bodyless. This is used most
-    /// frequently as a response to a `HEAD` request. This will not remove any
-    /// framing header sent from the origin, and will not add its own. This
-    /// means that the request may specify a `content-length` or
-    /// `transfer-encoding: chunked` header, and it will remain in place when
-    /// forwarding to the frontend. If this is used with something like a
-    /// 1xx-informational response, it is assumed the user has ensured that the
-    /// response adheres to the standard (no content-length or transfer-encoding
-    /// headers in the 1xx response, etc).
-    pub async fn send_as_bodyless(
+    /// Send the response head with no body, preserving any framing headers.
+    ///
+    /// Use this for responses to `HEAD` requests and `304 Not Modified`
+    /// responses, where framing headers describe the representation that
+    /// *would* have been sent rather than an actual body.
+    ///
+    /// Framing headers in `response` will be preserved.
+    pub async fn send_as_bodyless_keep_framing(
         self,
         response: &Response,
-    ) -> Result<FrontendBodyWriter<I>, FrontendError> {
-        let Self { mut io } = self;
-        write_response_to(response, HeadFraming::NoFraming, &mut io)
+    ) -> FrontendResult<bodyless::Ready<I>> {
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::PreserveFraming, &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter {
-            io,
-            state: BodyWriterState::CL(ContentLengthBodyWriter::new(0)),
-        })
+        Ok(bodyless::Ready::new(body_bodyless::Ready::new(writer)))
     }
 
-    pub fn into_inner(self) -> I {
-        let Self { io } = self;
-        io
+    /// Send the response head with no body, stripping any framing
+    /// headers from the origin.
+    ///
+    /// Use this for responses that must never carry a body by
+    /// definition: `1xx` informational responses and `204 No Content`.
+    /// Forwarding a `content-length` on these would corrupt the client's
+    /// parser.
+    ///
+    /// Framing headers in `response` will be stripped.
+    pub async fn send_as_no_content(
+        self,
+        response: &Response,
+    ) -> FrontendResult<bodyless::Ready<I>> {
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::StripFraming, &mut writer)
+            .await
+            .map_err(FrontendError::WriteError)?;
+        Ok(bodyless::Ready::new(body_bodyless::Ready::new(writer)))
     }
 }
 
-pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
-    res: &Response,
-    framing: HeadFraming,
-    mut w: W,
-) -> io::Result<()> {
-    let version = res.version().to_static();
+async fn write_response_to<W>(res: &Response, framing: WriteFraming, mut w: W) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
     let code = res.code();
     let reason = res.reason();
 
     // TODO: we can avoid this heap allocation
     let code = format!("{code}");
 
-    // write out the status line
-    // TODO: we should always send HTTP/1.1
-    w.write_all(version.as_bytes()).await?;
+    // we always send HTTP/1.1 from the proxy even if the client or server is
+    // HTTP/1.0.
+    w.write_all(b"HTTP/1.1").await?;
     w.write_all(b" ").await?;
     w.write_all(code.as_bytes()).await?;
     w.write_all(b" ").await?;
     w.write_all(reason).await?;
     w.write_all(b"\r\n").await?;
 
-    // if framing is specified, remove any existing framing header. otherwise,
-    // we'll leave the framing header specified by the origin in place. this is
-    // mostly useful for responses to HEAD requests.
+    // PreserveFraming leaves the origin's framing headers in place (HEAD /
+    // 304). All other variants strip them and optionally append a new one.
     let headers = res
         .headers()
         .iter()
-        .filter(|(n, _)| framing.is_no_framing() || !is_framing_header(n));
+        .filter(|(n, _)| framing.preserves_framing() || !is_framing_header(n));
 
     // write out each header
     for (n, v) in headers {
@@ -186,15 +219,15 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
         w.write_all(b"\r\n").await?;
     }
 
-    // add the framing header
+    // add the framing header, if any
     match framing {
-        HeadFraming::NoFraming => {}
-        HeadFraming::Length(l) => {
+        WriteFraming::PreserveFraming | WriteFraming::StripFraming => {}
+        WriteFraming::Length(l) => {
             // TODO: we can avoid this heap allocation
             let cl = format!("content-length: {l}\r\n");
             w.write_all(cl.as_bytes()).await?;
         }
-        HeadFraming::Chunked => {
+        WriteFraming::Chunked => {
             w.write_all(b"transfer-encoding: chunked\r\n").await?;
         }
     }
@@ -202,69 +235,65 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
     // write out the \r\n indicating the end of the head
     w.write_all(b"\r\n").await?;
 
-    // flush the response head so that the backend has a chance to respond to
-    // just the head in case this writer is buffered.
+    // flush the response head so that the client has a chance to start
+    // processing the response without waiting for any of the body. Many
+    // clients can act on just the head.
     w.flush().await?;
 
     Ok(())
 }
 
-/// A frontend response body writer.
-pub struct FrontendBodyWriter<I> {
-    pub(crate) io: I,
-    pub(crate) state: BodyWriterState,
-}
-
-impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
-    pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
-        self.state
-            .write(&mut self.io, buf)
-            .await
-            .map_err(FrontendError::BodyWriteError)
-    }
-
-    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
-        let Self { mut io, state } = self;
-        state
-            .finish(&mut io)
-            .await
-            .map_err(FrontendError::BodyWriteError)?;
-        Ok(FrontendWriter { io })
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use jrpxy_body::BodyError;
+    use jrpxy_body::error::BodyError;
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
     use jrpxy_util::debug::AsciiDebug;
+    use tokio::io::AsyncWrite;
 
-    use crate::{error::FrontendError, writer::FrontendWriter};
+    use crate::writer::{FrontendWriter, body};
+
+    /// Drive a single `Open(N) -> Write -> Close -> Ready` cycle on the
+    /// unifier.
+    async fn drive_chunk<I>(ready: body::Ready<I>, data: &[u8]) -> body::Ready<I>
+    where
+        I: AsyncWrite + Unpin,
+    {
+        let open = ready.open(data.len() as u64).expect("open");
+        let mut write = open.open().await.expect("open async");
+        write.write_all(data).await.expect("write_all");
+        let close = write.into_close().expect("into_close");
+        close.close().await.expect("close")
+    }
 
     #[tokio::test]
     async fn frontend_writer() {
         let mut cr = ResponseBuilder::new(8);
         let res = cr
             .with_code(200)
-            .with_reason("Ok".into())
+            .with_reason("Ok")
             .with_version(HttpVersion::Http11)
             .with_header("x-hello", &b"World"[..])
             .with_header("content-LENGTH", &b"400"[..])
             .with_header("TRANSFER-ENCODING", &b"chunked"[..])
             .build()
-            .into();
+            .expect("failed to build response");
 
         let mut buf = Vec::new();
         let cw = FrontendWriter::new(&mut buf);
-        let r = cw.send_as_content_length(&res, 0).await.expect("can write");
+        let ready = cw.send_as_content_length(&res, 0).await.expect("can write");
 
-        let buf = r.finish().await.expect("failed to finish").into_inner();
+        let buf = ready
+            .finish()
+            .expect("finish")
+            .finish()
+            .await
+            .expect("flush")
+            .into_inner();
 
-        // now we validate that the response contains what we expect. Notably:
-        // - expect that the content-length has been replaced with 0
-        // - expect we strip out transfer-encoding header
-        // - expect the remaining header to be present
-
+        // we strip the origin's framing headers and emit our own:
+        // - content-length is replaced with 0
+        // - transfer-encoding is dropped
+        // - the unrelated header is preserved
         let expected = b"\
             HTTP/1.1 200 Ok\r\n\
             x-hello: World\r\n\
@@ -279,21 +308,17 @@ mod test {
         let mut cr = ResponseBuilder::new(8);
         let res = cr
             .with_code(200)
-            .with_reason("Ok".into())
+            .with_reason("Ok")
             .with_version(HttpVersion::Http11)
             .build()
-            .into();
+            .expect("failed to build response");
 
         let mut buf = Vec::new();
         let cw = FrontendWriter::new(&mut buf);
-        let mut r = cw.send_as_content_length(&res, 0).await.expect("can write");
+        let ready = cw.send_as_content_length(&res, 0).await.expect("can write");
 
-        // expect that attempting to write to the body results in an unexpected EOF
-        let r = r.write(&b"hello"[..]).await.expect_err("wasn't an error");
-        assert!(matches!(
-            r,
-            FrontendError::BodyWriteError(BodyError::BodyOverflow(0))
-        ));
+        let err = ready.open(5).expect_err("open should overflow");
+        assert!(matches!(err, BodyError::BodyOverflow(0)));
     }
 
     // TODO: boundary tests around u64::MAX
@@ -303,27 +328,27 @@ mod test {
         let mut cr = ResponseBuilder::new(8);
         let res = cr
             .with_code(200)
-            .with_reason("Ok".into())
+            .with_reason("Ok")
             .with_version(HttpVersion::Http11)
             .build()
-            .into();
+            .expect("failed to build response");
 
         let mut buf = Vec::new();
         let cw = FrontendWriter::new(&mut buf);
-        let mut r = cw
+        let ready: body::Ready<_> = cw
             .send_as_content_length(&res, 10)
             .await
-            .expect("can write");
+            .expect("can write")
+            .into();
 
-        r.write(&b"01234"[..]).await.expect("write works");
-        r.write(&b"56789"[..]).await.expect("write works");
+        let ready = drive_chunk(ready, b"01234").await;
+        let ready = drive_chunk(ready, b"56789").await;
 
+        let err = ready.open(1).expect_err("open should overflow");
         assert!(matches!(
-            r.write(&b"X"[..]).await.expect_err("this overflows"),
-            FrontendError::BodyWriteError(BodyError::BodyOverflow(10))
+            err,
+            crate::error::FrontendError::BodyWriteError(BodyError::BodyOverflow(10))
         ));
-
-        let _buf = r.finish().await.expect("failed to finish").into_inner();
     }
 
     #[tokio::test]
@@ -331,25 +356,27 @@ mod test {
         let mut cr = ResponseBuilder::new(8);
         let res = cr
             .with_code(200)
-            .with_reason("Ok".into())
+            .with_reason("Ok")
             .with_version(HttpVersion::Http11)
             .build()
-            .into();
+            .expect("failed to build response");
 
         let mut buf = Vec::new();
         let cw = FrontendWriter::new(&mut buf);
-        let mut r = cw
+        let ready: body::Ready<_> = cw
             .send_as_content_length(&res, 10)
             .await
-            .expect("can write");
+            .expect("can write")
+            .into();
 
-        r.write(&b"01234"[..]).await.expect("write works");
+        // do not write all 10 bytes, and then try to finish. finishing will
+        // fail.
+        let ready = drive_chunk(ready, b"01234").await;
 
-        // do not write all 10 bytes, and then try to finish. finishing will fail.
-
+        let err = ready.finish().expect_err("finish should error");
         assert!(matches!(
-            r.finish().await.expect_err("failed to emit error"),
-            FrontendError::BodyWriteError(BodyError::IncompleteBody {
+            err,
+            crate::error::FrontendError::BodyWriteError(BodyError::IncompleteBody {
                 expected: 10,
                 actual: 5
             })
@@ -361,22 +388,25 @@ mod test {
         let mut cr = ResponseBuilder::new(8);
         let res = cr
             .with_code(200)
-            .with_reason("Ok".into())
+            .with_reason("Ok")
             .with_version(HttpVersion::Http11)
             .build()
-            .into();
+            .expect("failed to build response");
 
         let mut buf = Vec::new();
         let cw = FrontendWriter::new(&mut buf);
-        let mut r = cw.send_as_chunked(&res).await.expect("can write");
+        let ready: body::Ready<_> = cw.send_as_chunked(&res).await.expect("can write").into();
 
-        r.write(&b"01234"[..]).await.expect("write works");
-        r.write(&b"56789"[..]).await.expect("write works");
-        r.write(&b""[..])
+        let ready = drive_chunk(ready, b"01234").await;
+        let ready = drive_chunk(ready, b"56789").await;
+
+        let _frontend = ready
+            .finish()
+            .expect("finish")
+            .finish()
             .await
-            .expect("works, but shouldn't generate a chunk");
-
-        let _buf = r.finish().await.expect("failed to finish").into_inner();
+            .expect("flush")
+            .expect("not eof");
     }
 
     #[tokio::test]
@@ -384,53 +414,76 @@ mod test {
         let mut output_buf = Vec::with_capacity(4096);
         let cw = FrontendWriter::new(&mut output_buf);
 
-        // first response
+        // first response: empty CL body
         let mut cr = ResponseBuilder::new(8);
         let res = cr
             .with_code(200)
-            .with_reason("Ok".into())
+            .with_reason("Ok")
             .with_version(HttpVersion::Http11)
             .with_header("x-req", b"first")
             .build()
-            .into();
-        let body_writer = cw
+            .expect("failed to build response");
+        let ready = cw
             .send_as_content_length(&res, 0)
             .await
             .expect("first write works");
-        let cw = body_writer.finish().await.expect("failed to finish");
+        // The Finish wrapper's `finish().await?` hands back the
+        // FrontendWriter directly, ready for the next response.
+        let cw = ready
+            .finish()
+            .expect("finish")
+            .finish()
+            .await
+            .expect("flush");
 
-        // second response
+        // second response: CL body of 5 bytes
         let mut cr = ResponseBuilder::new(8);
         let res = cr
             .with_code(200)
-            .with_reason("Ok".into())
+            .with_reason("Ok")
             .with_version(HttpVersion::Http11)
             .with_header("x-req", b"second")
             .build()
-            .into();
-        let mut body_writer = cw
+            .expect("failed to build response");
+        let ready: body::Ready<_> = cw
             .send_as_content_length(&res, 5)
             .await
-            .expect("first write works");
-        body_writer.write(b"01234").await.expect("failed to write");
-        let cw = body_writer.finish().await.expect("failed to finish");
+            .expect("second write works")
+            .into();
+        let ready = drive_chunk(ready, b"01234").await;
+        let cw = ready
+            .finish()
+            .expect("finish")
+            .finish()
+            .await
+            .expect("flush")
+            .expect("not eof");
 
-        // third response
+        // third response: chunked
         let mut cr = ResponseBuilder::new(8);
         let res = cr
             .with_code(200)
-            .with_reason("Ok".into())
+            .with_reason("Ok")
             .with_version(HttpVersion::Http11)
             .with_header("x-req", b"third")
             .build()
+            .expect("failed to build response");
+        let ready: body::Ready<_> = cw
+            .send_as_chunked(&res)
+            .await
+            .expect("third write works")
             .into();
-        let mut body_writer = cw.send_as_chunked(&res).await.expect("first write works");
-        body_writer.write(b"01234").await.expect("failed to write");
-        body_writer.write(b"5").await.expect("failed to write");
-        body_writer.write(b"6789").await.expect("failed to write");
-        let cw = body_writer.finish().await.expect("failed to finish");
+        let ready = drive_chunk(ready, b"01234").await;
+        let ready = drive_chunk(ready, b"5").await;
+        let ready = drive_chunk(ready, b"6789").await;
+        let cw = ready
+            .finish()
+            .expect("finish")
+            .finish()
+            .await
+            .expect("flush")
+            .expect("not eof");
 
-        // check the output
         let output_buf = cw.into_inner().as_slice();
 
         let expected = b"\
@@ -458,5 +511,39 @@ mod test {
         ";
 
         assert_eq!(AsciiDebug(expected), AsciiDebug(output_buf));
+    }
+
+    #[tokio::test]
+    async fn frontend_writer_eof() {
+        let mut buf = Vec::new();
+        let cw = FrontendWriter::new(&mut buf);
+
+        let mut cr = ResponseBuilder::new(8);
+        let res = cr
+            .with_code(200)
+            .with_reason("Ok")
+            .with_version(HttpVersion::Http11)
+            .build()
+            .expect("failed to build response");
+
+        // EOF is not addressable through the unifier's recycle path - the
+        // unifier's Finish::into_writer returns None for EOF.
+        let ready: body::Ready<_> = cw.send_as_eof(&res).await.expect("can write").into();
+        let ready = drive_chunk(ready, b"hello").await;
+
+        let recycled = ready
+            .finish()
+            .expect("finish")
+            .finish()
+            .await
+            .expect("flush");
+        assert!(recycled.is_none(), "EOF must not yield a recyclable writer");
+
+        let expected = b"\
+            HTTP/1.1 200 Ok\r\n\
+            \r\n\
+            hello\
+        ";
+        assert_eq!(AsciiDebug(expected), AsciiDebug(&buf[..]));
     }
 }

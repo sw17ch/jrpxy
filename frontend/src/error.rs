@@ -1,6 +1,9 @@
-use jrpxy_http_message::{header::HeaderError, message::MessageError};
+use jrpxy_http_message::{
+    header::{ConnectionTokenParserError, HeaderError},
+    message::MessageError,
+};
 
-use jrpxy_body::BodyError;
+use jrpxy_body::error::BodyError;
 use tokio::io;
 
 /// Possible errors from interacting with frontends.
@@ -22,9 +25,17 @@ pub enum FrontendError {
     HttpRequestParseError(MessageError),
     #[error("Header error: {0}")]
     HeaderError(#[from] HeaderError),
+    #[error("Invalid connection header: {0}")]
+    InvalidConnectionHeader(#[from] ConnectionTokenParserError),
     #[error("Request head exceeded size limit: {0} >= {1}")]
     MaxHeadLenExceeded(usize, usize),
 }
 
 /// A result type where the error is [`FrontendError`].
 pub type FrontendResult<T> = Result<T, FrontendError>;
+
+impl From<BodyError> for FrontendError {
+    fn from(e: BodyError) -> Self {
+        FrontendError::BodyWriteError(e)
+    }
+}

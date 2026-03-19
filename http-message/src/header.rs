@@ -1,13 +1,15 @@
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
+use jrpxy_util::parse::is_valid_tchar;
 
-use crate::framing::HeadFraming;
+use crate::{framing::ParsedFraming, version::HttpVersion};
 
+/// Errors resulting from handling headers.
 #[derive(Debug, thiserror::Error)]
 pub enum HeaderError {
     #[error("Invalid content length: {0}")]
     InvalidContentLength(String),
-    #[error("Found at least two content-length headers with values: {0}, {0}")]
-    MultipleContentLength(u64, u64),
+    #[error("Conflicting content-length values observed: {0}, {1}")]
+    ConflictingContentLength(u64, u64),
     #[error("Multiple transfer-encoding headers")]
     MultipleTransferEncodingHeaders,
     #[error("Unsupported transfer-encoding value: {0}")]
@@ -16,19 +18,37 @@ pub enum HeaderError {
     BothTeAndCl,
 }
 
+/// Errors encountered when parsing the tokens of a `Connection` header field.
+#[derive(Debug, PartialEq, Eq)]
+pub enum ConnectionTokenParserError {
+    /// An illegal character was found in a connection token.
+    IllegalChar(u8),
+}
+
+impl std::error::Error for ConnectionTokenParserError {}
+
+impl std::fmt::Display for ConnectionTokenParserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::IllegalChar(c) => {
+                write!(f, "Illegal character in connection token: ")?;
+                for c in std::ascii::escape_default(*c) {
+                    write!(f, "{}", c as char)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// An iterator over a set of headers.
 pub struct HeaderIter<'s> {
-    position: usize,
     spans: &'s [(Bytes, Bytes)],
 }
 
 impl<'s> HeaderIter<'s> {
-    /// An iterator over headers inside of `buf` identified by `spans`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any span falls outside of the buffer.
-    pub fn new(spans: &'s [(Bytes, Bytes)]) -> Self {
-        Self { position: 0, spans }
+    fn new(spans: &'s [(Bytes, Bytes)]) -> Self {
+        Self { spans }
     }
 }
 
@@ -36,64 +56,147 @@ impl<'s> Iterator for HeaderIter<'s> {
     type Item = &'s (Bytes, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.spans.len() {
-            return None;
-        }
-        let p = self.position;
-        self.position += 1;
-        Some(&self.spans[p])
+        self.spans.split_off_first()
     }
 }
 
+/// An iterator over a filtered set of headers.
+pub struct HeadersFilter<'s, F> {
+    iter: HeaderIter<'s>,
+    filter_fn: F,
+}
+
+impl<'s, F> HeadersFilter<'s, F> {
+    fn new(spans: &'s [(Bytes, Bytes)], filter_fn: F) -> Self {
+        Self {
+            iter: HeaderIter::new(spans),
+            filter_fn,
+        }
+    }
+}
+
+impl<'s, F> Iterator for HeadersFilter<'s, F>
+where
+    F: FnMut(&[u8], &[u8]) -> bool,
+{
+    type Item = &'s (Bytes, Bytes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter.by_ref().find(|&h| (self.filter_fn)(&h.0, &h.1))
+    }
+}
+
+/// An iterator over a set of headers selected by name.
+pub struct HeaderNameIter<'s, 'n> {
+    needle: &'n [u8],
+    iter: HeaderIter<'s>,
+}
+
+impl<'s, 'n> HeaderNameIter<'s, 'n> {
+    fn new(spans: &'s [(Bytes, Bytes)], needle: &'n [u8]) -> Self {
+        Self {
+            needle,
+            iter: HeaderIter::new(spans),
+        }
+    }
+}
+
+impl<'s, 'n> Iterator for HeaderNameIter<'s, 'n> {
+    type Item = &'s (Bytes, Bytes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.iter
+            .by_ref()
+            .find(|&h| self.needle.eq_ignore_ascii_case(&h.0))
+    }
+}
+
+/// A set of headers.
+#[derive(Debug, Default, Clone)]
 pub struct Headers {
     headers: Vec<(Bytes, Bytes)>,
 }
 impl Headers {
+    /// Creates a new [`Headers`] with `capacity` header slots pre-allocated.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             headers: Vec::with_capacity(capacity),
         }
     }
 
+    /// Add a new `(name,value)` header pair.
     pub fn push(&mut self, name: impl Into<Bytes>, value: impl Into<Bytes>) {
+        // TODO: we need to validate that name and value are safe
         self.headers.push((name.into(), value.into()));
     }
 
+    /// An iterator over all headers.
     pub fn iter(&self) -> HeaderIter<'_> {
         HeaderIter::new(&self.headers)
     }
 
-    pub fn get_header(&self, needle: &str) -> Option<&Bytes> {
-        let needle = needle.as_bytes();
-        for (name, value) in self.iter() {
-            if needle.eq_ignore_ascii_case(name) {
-                return Some(value);
-            }
-        }
-
-        None
+    /// The number of header pairs
+    pub fn len(&self) -> usize {
+        self.headers.len()
     }
 
-    pub fn framing(&self) -> Result<HeadFraming, HeaderError> {
+    /// True when there are no headers.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Filter the headers using `predicate`.
+    pub fn filter_headers<P>(&self, predicate: P) -> HeadersFilter<'_, P>
+    where
+        P: FnMut(&[u8], &[u8]) -> bool,
+    {
+        HeadersFilter::new(&self.headers, predicate)
+    }
+
+    /// An iterator over all headers that match `name`. Comparisons are done
+    /// ignoring case.
+    pub fn get_header<'s, 'n>(&'s self, name: &'n str) -> HeaderNameIter<'s, 'n> {
+        let needle = name.as_bytes();
+        HeaderNameIter::new(&self.headers, needle)
+    }
+
+    /// Determines the framing represented in the set of headers.
+    pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
         let mut cl = None;
         let mut te = false;
 
         for (name, value) in self.iter() {
             if name.eq_ignore_ascii_case(b"content-length") {
                 let value = value.trim_ascii();
-                let cl_str = std::str::from_utf8(value).map_err(|_| {
-                    HeaderError::InvalidContentLength(String::from_utf8_lossy(value).to_string())
-                })?;
-                let cl_val = cl_str
-                    .parse::<u64>()
-                    .map_err(|_| HeaderError::InvalidContentLength(cl_str.to_string()))?;
-                if let Some(old_cl_val) = cl.replace(cl_val) {
-                    return Err(HeaderError::MultipleContentLength(old_cl_val, cl_val));
+                // RFC 9110 section 8.6: a Content-Length field may carry a
+                // single decimal value or a list of identical decimal values
+                // produced by an upstream that combined duplicate fields
+                // (e.g. "5, 5"). Multiple Content-Length header occurrences
+                // are likewise acceptable as long as every value agrees -
+                // disagreement leaves the framing ambiguous and must be
+                // rejected.
+                for raw in value.split(|&b| b == b',') {
+                    let trimmed = raw.trim_ascii();
+                    let cl_str = std::str::from_utf8(trimmed).map_err(|_| {
+                        HeaderError::InvalidContentLength(
+                            String::from_utf8_lossy(value).to_string(),
+                        )
+                    })?;
+                    let cl_val = cl_str.parse::<u64>().map_err(|_| {
+                        HeaderError::InvalidContentLength(
+                            String::from_utf8_lossy(value).to_string(),
+                        )
+                    })?;
+                    if let Some(old_cl_val) = cl
+                        && old_cl_val != cl_val
+                    {
+                        return Err(HeaderError::ConflictingContentLength(old_cl_val, cl_val));
+                    }
+                    cl = Some(cl_val);
                 }
-                cl = Some(cl_val);
             } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
                 let te_value = value.trim_ascii();
-                if te_value != b"chunked" {
+                if !te_value.eq_ignore_ascii_case(b"chunked") {
                     return Err(HeaderError::UnsupportedTransferEncoding(
                         String::from_utf8_lossy(te_value).to_string(),
                     ));
@@ -108,13 +211,65 @@ impl Headers {
         }
 
         match (cl, te) {
-            (None, true) => Ok(HeadFraming::Chunked),
-            (None, false) => Ok(HeadFraming::NoFraming),
+            (None, true) => Ok(ParsedFraming::Chunked),
+            (None, false) => Ok(ParsedFraming::NoFraming),
             (Some(_), true) => Err(HeaderError::BothTeAndCl),
-            (Some(cl), false) => Ok(HeadFraming::Length(cl)),
+            (Some(cl), false) => Ok(ParsedFraming::Length(cl)),
         }
     }
 
+    /// Iterate the connection options carried by the `Connection` header
+    /// field. Options spread across
+    /// multiple `Connection` header lines are flattened into one sequence.
+    /// Each well-formed token is a zero-copy view into the header bytes.
+    pub fn connection_tokens(
+        &self,
+    ) -> impl Iterator<Item = Result<Bytes, ConnectionTokenParserError>> + '_ {
+        self.get_header("connection")
+            .flat_map(|(_name, value)| TokenParser(value.clone()))
+    }
+
+    /// Whether a connection carrying a message of this `version` with this
+    /// header set stays open for reuse afterward (RFC 9112 section 9.3, 9.6).
+    /// HTTP/1.1 is persistent unless `Connection: close` is present; HTTP/1.0
+    /// closes unless `Connection: keep-alive` is present. Returns an error if
+    /// the `Connection` header carries a malformed token.
+    pub fn connection_is_persistent(
+        &self,
+        version: HttpVersion,
+    ) -> Result<bool, ConnectionTokenParserError> {
+        let mut close = false;
+        let mut keep_alive = false;
+        for token in self.connection_tokens() {
+            let token = token?;
+            if token.eq_ignore_ascii_case(b"close") {
+                close = true;
+            } else if token.eq_ignore_ascii_case(b"keep-alive") {
+                keep_alive = true;
+            }
+        }
+        Ok(match version {
+            // RFC 9112 section 9.6: `close` is the authoritative tear-down
+            // signal, so it dominates a contradictory `keep-alive` in both
+            // versions. HTTP/1.1 is otherwise persistent; HTTP/1.0 is
+            // otherwise persistent only with an explicit `keep-alive`.
+            HttpVersion::Http11 => !close,
+            HttpVersion::Http10 => keep_alive && !close,
+        })
+    }
+
+    /// Remove all headers for which `pred` returns false, in place. Use this
+    /// when the caller has no use for the removed entries - it avoids the
+    /// allocation that [`Headers::remove`] performs to return them.
+    pub fn retain<P>(&mut self, pred: P)
+    where
+        P: FnMut(&(Bytes, Bytes)) -> bool,
+    {
+        self.headers.retain(pred);
+    }
+
+    /// Remove all the headers matching by `pred` and return the removed headers
+    /// as a new [`Headers`]. The non-removed headers are retained in `self`.
     pub fn remove<P>(&mut self, mut pred: P) -> Self
     where
         P: FnMut(&(Bytes, Bytes)) -> bool,
@@ -136,15 +291,194 @@ impl Headers {
         Self { headers: remove }
     }
 
+    /// Merge another set of headers into this headers.
+    pub fn merge(&mut self, other: &Headers) {
+        // Append all headers from other onto self. No deduplication is
+        // performed; callers are responsible for removing any headers from
+        // self that should be overridden before calling this method.
+        self.headers.extend_from_slice(&other.headers);
+    }
+
+    /// Convert the header set into its internal representation.
     pub fn into_inner(self) -> Vec<(Bytes, Bytes)> {
         let Self { headers } = self;
         headers
     }
 }
 
+/// Iterator over the comma-separated tokens of a single `Connection` header
+/// value. Splits on `OWS "," OWS` (RFC 9110 section 5.6.1, 7.6.1), skips empty
+/// entries, and rejects any token containing a non-token character.
+struct TokenParser(Bytes);
+
+impl Iterator for TokenParser {
+    type Item = Result<Bytes, ConnectionTokenParserError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        fn skip_whitespace(val: &mut Bytes) {
+            while let Some(&b) = val.first() {
+                if matches!(b, b'\t' | b' ') {
+                    let _discard_whitespace = val.get_u8();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let Self(inner) = self;
+        loop {
+            if inner.is_empty() {
+                return None;
+            }
+            let ix_first_non_tok_char = inner
+                .iter()
+                .enumerate()
+                .find(|(_ix, b)| !is_valid_tchar(**b))
+                .map(|(ix, _b)| ix)
+                .unwrap_or(inner.len());
+
+            let tok = inner.split_to(ix_first_non_tok_char);
+
+            // RFC9110 5.6.1 and 7.6.1: list elements are separated by OWS "," OWS.
+            skip_whitespace(inner);
+            if let Some(&next) = inner.first() {
+                if next != b',' {
+                    // Fuse on error: drop the remaining bytes so a caller that
+                    // keeps polling after an `Err` (e.g. via `filter_map` or
+                    // `flatten`) terminates instead of re-reading the same
+                    // offending byte forever.
+                    inner.clear();
+                    return Some(Err(ConnectionTokenParserError::IllegalChar(next)));
+                }
+                let _discard_comma = inner.get_u8();
+            }
+            skip_whitespace(inner);
+
+            // if the token is empty (as would be the case with `connection: ,
+            // `), try again. we may also want to turn this into an error.
+            if tok.is_empty() {
+                // TODO: are empty tokens legal?
+                continue;
+            }
+
+            return Some(Ok(tok));
+        }
+    }
+}
+
 #[cfg(test)]
 mod test {
-    use crate::header::Headers;
+    use crate::{header::Headers, version::HttpVersion};
+
+    #[test]
+    fn http11_persistent_by_default() {
+        let headers = Headers::with_capacity(0);
+        assert_eq!(
+            Ok(true),
+            headers.connection_is_persistent(HttpVersion::Http11)
+        );
+    }
+
+    #[test]
+    fn http11_close_is_not_persistent() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"connection".as_slice(), b"close".as_slice());
+        assert_eq!(
+            Ok(false),
+            headers.connection_is_persistent(HttpVersion::Http11)
+        );
+    }
+
+    #[test]
+    fn http10_closes_by_default() {
+        let headers = Headers::with_capacity(0);
+        assert_eq!(
+            Ok(false),
+            headers.connection_is_persistent(HttpVersion::Http10)
+        );
+    }
+
+    #[test]
+    fn http10_keep_alive_is_persistent() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"connection".as_slice(), b"keep-alive".as_slice());
+        assert_eq!(
+            Ok(true),
+            headers.connection_is_persistent(HttpVersion::Http10)
+        );
+    }
+
+    #[test]
+    fn close_dominates_keep_alive_on_http10() {
+        let mut headers = Headers::with_capacity(1);
+        // Contradictory options: `close` must win (RFC 9112 9.6), so an
+        // HTTP/1.0 client that also sent keep-alive is still not persistent.
+        headers.push(b"connection".as_slice(), b"close, keep-alive".as_slice());
+        assert_eq!(
+            Ok(false),
+            headers.connection_is_persistent(HttpVersion::Http10)
+        );
+    }
+
+    #[test]
+    fn close_dominates_keep_alive_on_http11() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"connection".as_slice(), b"keep-alive, close".as_slice());
+        assert_eq!(
+            Ok(false),
+            headers.connection_is_persistent(HttpVersion::Http11)
+        );
+    }
+
+    #[test]
+    fn connection_options_may_span_multiple_headers() {
+        let mut headers = Headers::with_capacity(2);
+        headers.push(b"connection".as_slice(), b"keep-alive".as_slice());
+        headers.push(b"connection".as_slice(), b"close".as_slice());
+        // `close` wins regardless of which line it appears on.
+        assert_eq!(
+            Ok(false),
+            headers.connection_is_persistent(HttpVersion::Http11)
+        );
+
+        let mut headers = Headers::with_capacity(2);
+        headers.push(b"connection".as_slice(), b"close".as_slice());
+        headers.push(b"connection".as_slice(), b"keep-alive".as_slice());
+        // `close` wins regardless of which line it appears on.
+        assert_eq!(
+            Ok(false),
+            headers.connection_is_persistent(HttpVersion::Http11)
+        );
+    }
+
+    #[test]
+    fn malformed_connection_token_is_rejected() {
+        let mut headers = Headers::with_capacity(1);
+        // A NUL is not a valid token character; parsing must surface an error
+        // rather than silently treating the connection as persistent.
+        headers.push(b"connection".as_slice(), b"clo\x00se".as_slice());
+        assert!(
+            headers
+                .connection_is_persistent(HttpVersion::Http11)
+                .is_err()
+        );
+    }
+
+    /// The token iterator must fuse after an error: once it yields `Err`, it
+    /// must yield `None` rather than re-reading the offending byte forever (a
+    /// caller using `filter_map`/`flatten` would otherwise hang).
+    #[test]
+    fn connection_tokens_fuse_after_error() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"connection".as_slice(), b"clo\x00se".as_slice());
+
+        let mut tokens = headers.connection_tokens();
+        assert!(tokens.next().expect("an item is yielded").is_err());
+        assert!(
+            tokens.next().is_none(),
+            "iterator must terminate after yielding an error"
+        );
+    }
 
     /// Requests with both CL and TE headers must be rejected to prevent HTTP
     /// Request Smuggling attacks.
@@ -178,6 +512,59 @@ mod test {
         );
     }
 
+    /// RFC 9110 section 8.6: multiple Content-Length headers carrying the
+    /// same decimal value MUST be accepted (an upstream is permitted to
+    /// fold duplicates this way).
+    #[test]
+    fn accept_duplicate_cl_headers_with_identical_values() {
+        let mut headers = Headers::with_capacity(2);
+        headers.push(b"content-length".as_slice(), b"5".as_slice());
+        headers.push(b"content-length".as_slice(), b"5".as_slice());
+
+        assert!(matches!(
+            headers.framing(),
+            Ok(crate::framing::ParsedFraming::Length(5))
+        ));
+    }
+
+    /// RFC 9110 section 8.6: a single Content-Length whose value is a list
+    /// of identical decimals (e.g. "5, 5") MUST be accepted as equivalent
+    /// to a single occurrence of that value.
+    #[test]
+    fn accept_comma_list_cl_header_with_identical_values() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"content-length".as_slice(), b"5, 5".as_slice());
+
+        assert!(matches!(
+            headers.framing(),
+            Ok(crate::framing::ParsedFraming::Length(5))
+        ));
+    }
+
+    /// A comma-separated list with a disagreeing value leaves the framing
+    /// ambiguous and must be rejected.
+    #[test]
+    fn reject_comma_list_cl_header_with_conflicting_values() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"content-length".as_slice(), b"5, 6".as_slice());
+
+        assert!(headers.framing().is_err());
+    }
+
+    /// RFC 9110 section 8.6: `Content-Length = 1*DIGIT`. A header with no
+    /// digits at all (empty value, or only whitespace) is syntactically
+    /// invalid and must be rejected rather than silently treated as zero.
+    #[test]
+    fn reject_empty_cl_header() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"content-length".as_slice(), b"".as_slice());
+
+        assert!(matches!(
+            headers.framing(),
+            Err(crate::header::HeaderError::InvalidContentLength(_))
+        ));
+    }
+
     #[test]
     fn reject_message_with_multiple_te_headers() {
         let mut headers = Headers::with_capacity(2);
@@ -186,7 +573,45 @@ mod test {
 
         assert!(
             headers.framing().is_err(),
-            "Requests with multiple Content-Length headers must be rejected"
+            "Requests with multiple Transfer-Encoding headers must be rejected"
         );
+    }
+
+    #[test]
+    fn accept_te_headers_with_capitalized_chunked() {
+        let mut headers = Headers::with_capacity(2);
+        headers.push(b"transfer-encoding".as_slice(), b"Chunked".as_slice());
+
+        assert!(
+            headers.framing().is_ok(),
+            "transfer-coding names are case insensitive according to RFC9112 section 7"
+        );
+    }
+
+    fn b<const C: usize>(a: &'static [u8; C]) -> bytes::Bytes {
+        bytes::Bytes::from(a.as_slice())
+    }
+
+    #[test]
+    fn merge_appends() {
+        let mut headers = Headers::with_capacity(4);
+        headers.push(b"a".as_slice(), b"1".as_slice());
+        headers.push(b"Via".as_slice(), b"1.0 upstream".as_slice());
+
+        let mut other = Headers::with_capacity(2);
+        other.push(b"b".as_slice(), b"2".as_slice());
+        other.push(b"Via".as_slice(), b"1.1 proxy".as_slice());
+
+        headers.merge(&other);
+
+        // Both Via entries must be preserved - no deduplication.
+        let expected = vec![
+            (b(b"a"), b(b"1")),
+            (b(b"Via"), b(b"1.0 upstream")),
+            (b(b"b"), b(b"2")),
+            (b(b"Via"), b(b"1.1 proxy")),
+        ];
+
+        assert_eq!(&expected, &headers.headers);
     }
 }

@@ -2,25 +2,237 @@ use std::mem::MaybeUninit;
 
 use bytes::{Bytes, BytesMut};
 use httparse::{Request as HttparseRequest, Response as HttparseResponse};
-use jrpxy_util::buffer::Buffer;
+use jrpxy_util::{
+    io_buffer::BytesReader,
+    parse::{OriginFormError, is_valid_tchar, validate_origin_form},
+};
 
 pub use httparse::Error as HttpParseError;
 
 use crate::{
-    framing::HeadFraming,
+    framing::ParsedFraming,
     header::{HeaderError, Headers},
     version::HttpVersion,
 };
 
+/// Errors produced while parsing HTTP messages.
 #[derive(thiserror::Error, Debug)]
 pub enum MessageError {
     #[error("Error parsing HTTP: {0}")]
     Parse(#[from] HttpParseError),
     #[error("Unsupported http version: {0}")]
     HttpVersion(u8),
+    #[error("Cannot build: {0}")]
+    BuildError(#[from] BuildError),
 }
 
+/// A [`Result`] with [`MessageError`] as the error type.
 pub type MessageResult<T> = Result<T, MessageError>;
+
+/// Errors produced while building a HTTP message.
+#[derive(thiserror::Error, Debug)]
+pub enum BuildError {
+    #[error("Method not specified")]
+    MissingMethod,
+    #[error("Path not specified")]
+    MissingPath,
+    #[error("Version not specified")]
+    MissingVersion,
+    #[error("Code is not specified")]
+    MissingCode,
+    #[error("Result is not specified")]
+    MissingResult,
+    #[error("Method contains invalid characters (RFC9110, 9.1)")]
+    InvalidMethod(String),
+}
+
+/// A buffer type that carries no type or lifetime information that has the same
+/// size and alignment as [`httparse::Header`]. We use this type to avoid
+/// lifetime problems that usually arise from trying to reuse header slot
+/// allocations across parse attempts.
+mod header_buf {
+    use std::mem::MaybeUninit;
+
+    use httparse::Header;
+
+    /// A struct used for allocation only. Its internal representation should
+    /// never be used.
+    #[derive(Copy, Clone)]
+    pub(crate) struct HeaderBuf {
+        _do_not_use_name: &'static str,
+        _do_not_use_value: &'static [u8],
+    }
+    // These cases must be true for this to be safe.
+    const _HEADER_BUF_SIZE_MATCH: () = const {
+        assert!(std::mem::size_of::<HeaderBuf>() == std::mem::size_of::<httparse::Header<'_>>());
+        assert!(std::mem::align_of::<HeaderBuf>() == std::mem::align_of::<httparse::Header<'_>>());
+    };
+
+    /// Parse `buf` into `req` using `header_slots` as the space into which we
+    /// will record headers. The lifetime of `req` ensures that `header_slots`
+    /// and `buf` are alive long enough for it to be safe to access the headers
+    /// from `req` once parsed.
+    pub(crate) fn parse_request<'b, 'h>(
+        buf: &'b [u8],
+        header_slots: &'h mut [MaybeUninit<HeaderBuf>],
+        req: &mut httparse::Request<'h, 'b>,
+    ) -> Result<httparse::Status<usize>, httparse::Error> {
+        // SAFETY: HeaderBuf and Header<'b> have the same size and alignment
+        // (verified by the const assertion above). The slice resulting from the
+        // cast does not escape this function; it is consumed immediately by
+        // httparse, which writes Header<'b> values whose 'b is tied to `buf`.
+        let headers = unsafe {
+            let ptr = header_slots.as_mut_ptr() as *mut MaybeUninit<Header<'b>>;
+            std::slice::from_raw_parts_mut(ptr, header_slots.len())
+        };
+        httparse::ParserConfig::default().parse_request_with_uninit_headers(req, buf, headers)
+    }
+
+    /// See docs for [`parse_request`].
+    pub(crate) fn parse_response<'b>(
+        buf: &'b [u8],
+        header_slots: &mut [MaybeUninit<HeaderBuf>],
+        res: &mut httparse::Response<'_, 'b>,
+    ) -> Result<httparse::Status<usize>, httparse::Error> {
+        // SAFETY: same as parse_request.
+        let headers = unsafe {
+            let ptr = header_slots.as_mut_ptr() as *mut MaybeUninit<Header<'b>>;
+            std::slice::from_raw_parts_mut(ptr, header_slots.len())
+        };
+        httparse::ParserConfig::default().parse_response_with_uninit_headers(res, buf, headers)
+    }
+
+    /// Same as [`parse_request`], but for just a buffer of headers as might
+    /// appear in HTTP trailers.
+    pub(crate) fn parse_headers<'b, 's>(
+        buf: &'b [u8],
+        header_slots: &'s mut [MaybeUninit<HeaderBuf>],
+    ) -> Result<httparse::Status<(usize, &'s [Header<'b>])>, httparse::Error> {
+        // SAFETY: same as parse_request.
+        let headers = unsafe {
+            let ptr = header_slots.as_mut_ptr() as *mut MaybeUninit<Header<'b>>;
+            std::slice::from_raw_parts_mut(ptr, header_slots.len())
+        };
+        // TODO: this loop would not be necessary if
+        // `httparse::parse_headers_with_uninit_headers()` was available.
+        for slot in headers.iter_mut() {
+            // Initialize each slot to an empty header so that we do not have
+            // uninitialized memory.
+            slot.write(httparse::EMPTY_HEADER);
+        }
+        // SAFETY: we have just initialized each header to a valid state
+        let headers = unsafe { headers.assume_init_mut() };
+
+        // TODO: Sure would be nice if this was a method available on ParserConfig.
+        httparse::parse_headers(buf, headers)
+    }
+}
+use header_buf::HeaderBuf;
+
+/// Space into which headers can be parsed. The internals are intentionally
+/// opaque.
+pub struct ParseSlots {
+    parse_headers: Vec<MaybeUninit<HeaderBuf>>,
+    out_headers: Vec<MaybeUninit<HeaderOffset>>,
+}
+
+impl Default for ParseSlots {
+    fn default() -> Self {
+        Self::new(16)
+    }
+}
+
+impl std::fmt::Debug for ParseSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.parse_headers.len();
+        f.debug_tuple("ParseSlots").field(&len).finish()
+    }
+}
+
+impl ParseSlots {
+    /// Create a new [`ParseSlots`] with space to parse up to `slot_count`
+    /// headers. This slot count is a maximum.
+    pub fn new(slot_count: usize) -> Self {
+        Self {
+            parse_headers: vec![MaybeUninit::uninit(); slot_count],
+            out_headers: vec![MaybeUninit::uninit(); slot_count],
+        }
+    }
+
+    /// Parse a request using these slots as the temporary storage.
+    pub fn parse_request<I>(&mut self, buf: &mut BytesReader<I>) -> MessageResult<Option<Request>> {
+        let Self {
+            parse_headers,
+            out_headers,
+        } = self;
+        match RequestOffset::parse(buf.as_bytes(), parse_headers, out_headers)? {
+            None => Ok(None),
+            Some((req, head_len)) => {
+                let head_buf = buf.split_to(head_len);
+                let method = req.method.slice_from(&head_buf);
+                let path = req.path.slice_from(&head_buf);
+                let version = req.version;
+                let headers = populate_headers(req.headers, &head_buf);
+                Ok(Some(Request {
+                    inner: Box::new(RequestInner {
+                        method,
+                        path,
+                        version,
+                        headers,
+                    }),
+                }))
+            }
+        }
+    }
+
+    /// Parse a response using these slots as the temporary storage.
+    pub fn parse_response<I>(
+        &mut self,
+        buf: &mut BytesReader<I>,
+    ) -> MessageResult<Option<Response>> {
+        let Self {
+            parse_headers,
+            out_headers,
+        } = self;
+        match ResponseOffset::parse(buf.as_bytes(), parse_headers, out_headers)? {
+            None => Ok(None),
+            Some((res, head_len)) => {
+                let head_buf = buf.split_to(head_len);
+                let version = res.version;
+                let code = res.code;
+                let reason = res.reason.slice_from(&head_buf);
+                let headers = populate_headers(res.headers, &head_buf);
+                Ok(Some(Response {
+                    inner: Box::new(ResponseInner {
+                        version,
+                        code,
+                        reason,
+                        headers,
+                    }),
+                }))
+            }
+        }
+    }
+
+    /// Parse headers using these slots as temporary storage.
+    pub fn parse_headers<I>(&mut self, buf: &mut BytesReader<I>) -> MessageResult<Option<Headers>> {
+        let Self {
+            parse_headers,
+            out_headers,
+        } = self;
+        match header_buf::parse_headers(buf.as_bytes(), parse_headers)? {
+            httparse::Status::Partial => Ok(None),
+            httparse::Status::Complete((len, headers)) => {
+                let out_headers = &mut out_headers[..headers.len()];
+                let header_offsets =
+                    populate_header_offsets(&buf.as_bytes()[..len], out_headers, headers);
+                let header_buf = buf.split_to(len);
+                let headers = populate_headers(header_offsets, &header_buf);
+                Ok(Some(headers))
+            }
+        }
+    }
+}
 
 #[derive(Copy, Clone)]
 struct Span {
@@ -67,20 +279,16 @@ struct RequestOffset<'h> {
     headers: &'h [HeaderOffset],
 }
 
-impl<'p, 'b: 'p, 'h: 'b> RequestOffset<'h> {
+impl<'h> RequestOffset<'h> {
     fn parse(
-        buf: &'b [u8],
-        parse_headers: &mut [MaybeUninit<httparse::Header<'p>>],
+        buf: &[u8],
+        parse_headers: &mut [MaybeUninit<HeaderBuf>],
         out_headers: &'h mut [MaybeUninit<HeaderOffset>],
     ) -> MessageResult<Option<(Self, usize)>> {
         debug_assert_eq!(parse_headers.len(), out_headers.len());
 
         let mut req = HttparseRequest::new(&mut []);
-        match httparse::ParserConfig::default().parse_request_with_uninit_headers(
-            &mut req,
-            buf,
-            parse_headers,
-        ) {
+        match header_buf::parse_request(buf, parse_headers, &mut req) {
             Ok(httparse::Status::Partial) => Ok(None),
             Err(e) => Err(e.into()),
             Ok(httparse::Status::Complete(head_len)) => {
@@ -112,20 +320,16 @@ struct ResponseOffset<'h> {
     headers: &'h [HeaderOffset],
 }
 
-impl<'p, 'b: 'p, 'h: 'b> ResponseOffset<'h> {
+impl<'h> ResponseOffset<'h> {
     fn parse(
-        buf: &'b [u8],
-        parse_headers: &mut [MaybeUninit<httparse::Header<'p>>],
+        buf: &[u8],
+        parse_headers: &mut [MaybeUninit<HeaderBuf>],
         out_headers: &'h mut [MaybeUninit<HeaderOffset>],
     ) -> MessageResult<Option<(Self, usize)>> {
         debug_assert_eq!(parse_headers.len(), out_headers.len());
 
         let mut res = HttparseResponse::new(&mut []);
-        match httparse::ParserConfig::default().parse_response_with_uninit_headers(
-            &mut res,
-            buf,
-            parse_headers,
-        ) {
+        match header_buf::parse_response(buf, parse_headers, &mut res) {
             Ok(httparse::Status::Partial) => Ok(None),
             Err(e) => Err(e.into()),
             Ok(httparse::Status::Complete(head_len)) => {
@@ -167,6 +371,7 @@ fn populate_header_offsets<'o, 'b>(
     unsafe { out_headers.assume_init_mut() }
 }
 
+#[derive(Clone)]
 struct RequestInner {
     method: Bytes,
     path: Bytes,
@@ -175,61 +380,48 @@ struct RequestInner {
     headers: Headers,
 }
 
+/// A HTTP request.
+#[derive(Clone)]
 pub struct Request {
     inner: Box<RequestInner>,
 }
 
 impl Request {
-    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
-        let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
-        let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
-        match RequestOffset::parse(&*buf, &mut parse_headers, &mut out_headers)? {
-            None => Ok(None),
-            Some((req, head_len)) => {
-                let head_buf = buf.split_to(head_len).freeze();
-                let method = req.method.slice_from(&head_buf);
-                let path = req.path.slice_from(&head_buf);
-                let version = req.version;
-
-                let headers = populate_headers(req.headers, &head_buf);
-
-                Ok(Some(Request {
-                    inner: Box::new(RequestInner {
-                        method,
-                        path,
-                        version,
-                        headers,
-                    }),
-                }))
-            }
-        }
-    }
-
+    /// The method of the request.
     pub fn method(&self) -> &Bytes {
         &self.inner.method
     }
 
+    /// The path of the request.
     pub fn path(&self) -> &Bytes {
         &self.inner.path
     }
 
+    /// Replace the path of the request after validating `path` as origin-form
+    /// per RFC 9112 section 3.2.1.
+    pub fn set_origin_form_path(&mut self, path: Bytes) -> Result<(), OriginFormError> {
+        validate_origin_form(&path)?;
+        self.inner.path = path;
+        Ok(())
+    }
+
+    /// The version of the request.
     pub fn version(&self) -> HttpVersion {
         self.inner.version
     }
 
+    /// Headers associated with the request.
     pub fn headers(&self) -> &Headers {
         &self.inner.headers
     }
 
+    /// A mutable reference to the headers associated with the request.
     pub fn headers_mut(&mut self) -> &mut Headers {
         &mut self.inner.headers
     }
 
-    pub fn get_header(&self, needle: &str) -> Option<&Bytes> {
-        self.inner.headers.get_header(needle)
-    }
-
-    pub fn framing(&self) -> Result<HeadFraming, HeaderError> {
+    /// The parsed framing from the headers.
+    pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
         self.inner.headers.framing()
     }
 
@@ -243,6 +435,23 @@ impl Request {
     }
 }
 
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut f = f.debug_struct("Request");
+        f.field(":method", &self.inner.method)
+            .field(":path", &self.inner.path)
+            .field(":version", &self.inner.version);
+        for (n, v) in self.inner.headers.iter() {
+            let Ok(n) = std::str::from_utf8(n) else {
+                continue;
+            };
+            f.field(n, v);
+        }
+        f.finish()
+    }
+}
+
+#[derive(Clone)]
 struct ResponseInner {
     version: HttpVersion,
     code: u16,
@@ -251,76 +460,65 @@ struct ResponseInner {
     headers: Headers,
 }
 
+/// A HTTP response.
+#[derive(Clone)]
 pub struct Response {
     inner: Box<ResponseInner>,
 }
 
 impl Response {
-    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
-        let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
-        let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
-        match ResponseOffset::parse(&*buf, &mut parse_headers, &mut out_headers)? {
-            None => Ok(None),
-            Some((res, head_len)) => {
-                let head_buf = buf.split_to(head_len).freeze();
-                let version = res.version;
-                let code = res.code;
-                let reason = res.reason.slice_from(&head_buf);
-
-                let headers = populate_headers(res.headers, &head_buf);
-
-                Ok(Some(Response {
-                    inner: Box::new(ResponseInner {
-                        version,
-                        code,
-                        reason,
-                        headers,
-                    }),
-                }))
-            }
-        }
-    }
-
+    /// The response version.
     pub fn version(&self) -> HttpVersion {
         self.inner.version
     }
 
+    /// The response code.
     pub fn code(&self) -> u16 {
         self.inner.code
     }
 
+    /// The response reason.
     pub fn reason(&self) -> &Bytes {
         &self.inner.reason
     }
 
+    /// The response headers.
     pub fn headers(&self) -> &Headers {
         &self.inner.headers
     }
 
+    /// The response headers as a mutable reference.
     pub fn headers_mut(&mut self) -> &mut Headers {
         &mut self.inner.headers
     }
 
-    pub fn get_header(&self, needle: &str) -> Option<&Bytes> {
-        self.inner.headers.get_header(needle)
-    }
-
-    pub fn framing(&self) -> Result<HeadFraming, HeaderError> {
+    /// Detect the framing indicated by the response. Note: this does not take
+    /// into account the response code. If the response contains framing
+    /// headers, this will attempt to interpret them.
+    pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
         self.inner.headers.framing()
     }
 
+    /// Returns `Some(1xx)` when the response is an informational response.
     pub fn is_informational(&self) -> Option<u16> {
         let c = self.code();
         (100..200).contains(&c).then_some(c)
     }
+}
 
-    pub fn into_version(mut self, frontend_version: HttpVersion) -> Self {
-        self.inner.version = frontend_version;
-
-        // TODO: strip out or convert response headers not supported by the
-        // target version
-
-        self
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut f = f.debug_struct("Response");
+        f.field(":version", &self.inner.version)
+            .field(":code", &self.inner.code)
+            .field(":reason", &self.inner.reason);
+        for (n, v) in self.inner.headers.iter() {
+            let Ok(n) = std::str::from_utf8(n) else {
+                continue;
+            };
+            f.field(n, v);
+        }
+        f.finish()
     }
 }
 
@@ -334,21 +532,7 @@ fn populate_headers(header_offsets: &[HeaderOffset], head_buf: &Bytes) -> Header
     headers
 }
 
-pub struct InformationalResponse(Response);
-
-impl InformationalResponse {
-    pub fn into_inner(self) -> Response {
-        let Self(r) = self;
-        r
-    }
-}
-
-impl From<Response> for InformationalResponse {
-    fn from(value: Response) -> Self {
-        Self(value)
-    }
-}
-
+/// A builder for a HTTP request.
 #[derive(Debug, Default)]
 pub struct RequestBuilder<'s> {
     method: Option<&'s str>,
@@ -358,36 +542,43 @@ pub struct RequestBuilder<'s> {
 }
 
 impl<'s> RequestBuilder<'s> {
-    pub fn new(initial_header_count: usize) -> Self {
+    /// Create a new [`RequestBuilder`] with an initial header capacity of
+    /// `capacity`.
+    pub fn new(capacity: usize) -> Self {
         Self {
             method: None,
             path: None,
             version: None,
-            headers: Vec::with_capacity(initial_header_count),
+            headers: Vec::with_capacity(capacity),
         }
     }
 
+    /// Specify the request method.
     pub fn with_method(&mut self, method: &'s str) -> &mut Self {
         self.method = Some(method);
         self
     }
 
+    /// Specify the request path.
     pub fn with_path(&mut self, path: &'s str) -> &mut Self {
         self.path = Some(path);
         self
     }
 
+    /// Specify the request version.
     pub fn with_version(&mut self, version: HttpVersion) -> &mut Self {
         self.version = Some(version);
         self
     }
 
+    /// Add a request header. Does not replace any previously set header.
     pub fn with_header(&mut self, name: &'s str, value: &'s [u8]) -> &mut Self {
         self.headers.push((name, value));
         self
     }
 
-    pub fn build(&self) -> Request {
+    /// Build the request after checking for request validity.
+    pub fn build(&self) -> Result<Request, BuildError> {
         let Self {
             method,
             path,
@@ -395,16 +586,28 @@ impl<'s> RequestBuilder<'s> {
             headers: built_headers,
         } = self;
 
-        // TODO: validate method, path, and headers
-        // TODO: also make sure none of them are none
+        let Some(method) = method else {
+            return Err(BuildError::MissingMethod);
+        };
+        let Some(path) = path else {
+            return Err(BuildError::MissingPath);
+        };
+        let Some(version) = version else {
+            return Err(BuildError::MissingVersion);
+        };
+
+        if !method.bytes().all(is_valid_tchar) {
+            return Err(BuildError::InvalidMethod(method.to_string()));
+        }
+
+        // TODO: validate path, and headers
 
         let mut buf = BytesMut::with_capacity(128);
 
-        buf.extend_from_slice(method.unwrap_or("GET").as_bytes());
+        buf.extend_from_slice(method.as_bytes());
         let method = buf.split().freeze();
-        buf.extend_from_slice(path.unwrap_or("/").as_bytes());
+        buf.extend_from_slice(path.as_bytes());
         let path = buf.split().freeze();
-        let version = version.unwrap_or(HttpVersion::Http10);
 
         let mut headers = Headers::with_capacity(built_headers.len());
         for (name, value) in built_headers {
@@ -415,17 +618,18 @@ impl<'s> RequestBuilder<'s> {
             headers.push(name, value);
         }
 
-        Request {
+        Ok(Request {
             inner: Box::new(RequestInner {
                 method,
                 path,
-                version,
+                version: *version,
                 headers,
             }),
-        }
+        })
     }
 }
 
+/// A builder for a HTTP response.
 #[derive(Debug, Default)]
 pub struct ResponseBuilder<'s> {
     version: Option<HttpVersion>,
@@ -435,36 +639,43 @@ pub struct ResponseBuilder<'s> {
 }
 
 impl<'s> ResponseBuilder<'s> {
-    pub fn new(initial_header_capacity: usize) -> Self {
+    /// Create a new [`ResponseBuilder`] with an initial header capacity of
+    /// `capacity`.
+    pub fn new(capacity: usize) -> Self {
         Self {
             version: None,
             code: None,
             reason: None,
-            headers: Vec::with_capacity(initial_header_capacity),
+            headers: Vec::with_capacity(capacity),
         }
     }
 
+    /// Specify the response version.
     pub fn with_version(&mut self, version: HttpVersion) -> &mut Self {
         self.version = Some(version);
         self
     }
 
+    /// Specify the response code.
     pub fn with_code(&mut self, code: u16) -> &mut Self {
         self.code = Some(code);
         self
     }
 
+    /// Specify the response reason phrase.
     pub fn with_reason(&mut self, reason: &'s str) -> &mut Self {
         self.reason = Some(reason);
         self
     }
 
+    /// Add a response header. Does not replace any previously set header.
     pub fn with_header(&mut self, name: &'s str, value: &'s [u8]) -> &mut Self {
         self.headers.push((name, value));
         self
     }
 
-    pub fn build(&self) -> Response {
+    /// Build the response after checking for response validity.
+    pub fn build(&self) -> Result<Response, BuildError> {
         let Self {
             version,
             code,
@@ -472,15 +683,23 @@ impl<'s> ResponseBuilder<'s> {
             headers: built_headers,
         } = self;
 
+        let Some(version) = version else {
+            return Err(BuildError::MissingVersion);
+        };
+        let Some(code) = code else {
+            return Err(BuildError::MissingCode);
+        };
+        let Some(reason) = reason else {
+            return Err(BuildError::MissingResult);
+        };
+
         // TODO: validate code, reason, and headers
-        // TODO: also make sure none of them are none.
         // TODO: verify that a 1xx response follows content-length and transfer-encoding rules
 
         let mut buf = BytesMut::with_capacity(128);
 
-        let version = version.to_owned().unwrap_or(HttpVersion::Http10);
-        let code = code.to_owned().unwrap_or(200);
-        buf.extend_from_slice(reason.unwrap_or("Unknown").as_bytes());
+        let code = code.to_owned();
+        buf.extend_from_slice(reason.as_bytes());
         let reason = buf.split().freeze();
 
         let mut headers = Headers::with_capacity(built_headers.len());
@@ -492,13 +711,66 @@ impl<'s> ResponseBuilder<'s> {
             headers.push(name, value);
         }
 
-        Response {
+        Ok(Response {
             inner: Box::new(ResponseInner {
-                version,
+                version: *version,
                 code,
                 reason,
                 headers,
             }),
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use bytes::Bytes;
+    use jrpxy_util::parse::OriginFormError;
+
+    use crate::{message::BuildError, version::HttpVersion};
+
+    use super::RequestBuilder;
+
+    #[test]
+    fn build_with_invalid_method() {
+        let mut b = RequestBuilder::new(0);
+        b.with_method("METHOD SPACE")
+            .with_path("/")
+            .with_version(HttpVersion::Http11);
+        let req = b.build().unwrap_err();
+        if let BuildError::InvalidMethod(v) = &req
+            && v == "METHOD SPACE"
+        {
+            // good
+        } else {
+            panic!("unexpected error: {req:?}")
+        };
+    }
+
+    #[test]
+    fn set_origin_form_path_round_trip() {
+        let mut req = RequestBuilder::new(0)
+            .with_method("GET")
+            .with_path("/old")
+            .with_version(HttpVersion::Http11)
+            .build()
+            .unwrap();
+        req.set_origin_form_path(Bytes::from_static(b"/new?q=1"))
+            .unwrap();
+        assert_eq!(req.path().as_ref(), b"/new?q=1");
+    }
+
+    #[test]
+    fn set_origin_form_path_rejects_absolute_form() {
+        let mut req = RequestBuilder::new(0)
+            .with_method("GET")
+            .with_path("/")
+            .with_version(HttpVersion::Http11)
+            .build()
+            .unwrap();
+        let err = req
+            .set_origin_form_path(Bytes::from_static(b"http://example.com/"))
+            .unwrap_err();
+        assert!(matches!(err, OriginFormError::NotAbsolutePath));
     }
 }

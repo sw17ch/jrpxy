@@ -1,13 +1,16 @@
 [package]
-name = "jrpxy-body"
+name = "jrpxy-proxy"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-jrpxy-util = { workspace = true }
+jrpxy-backend = { workspace = true }
+jrpxy-body = { workspace = true }
+jrpxy-frontend = { workspace = true }
 jrpxy-http-message = { workspace = true }
+jrpxy-util = { workspace = true }
 
-httparse = { workspace = true }
 bytes = { workspace = true }
+httpdate = "1.0"
 tokio = { workspace = true }
 thiserror = { workspace = true }

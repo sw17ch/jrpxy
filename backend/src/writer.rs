@@ -1,78 +1,92 @@
-use jrpxy_body::{BodyWriterState, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header};
-use jrpxy_http_message::{framing::HeadFraming, message::Request};
-use tokio::io::{self, AsyncWriteExt};
+pub mod body;
+pub mod bodyless;
+pub mod chunked;
+pub mod content_length;
+
+use jrpxy_body::writer::{
+    bodyless as body_bodyless, chunked as body_chunked, content_length as body_content_length,
+};
+use jrpxy_http_message::{
+    framing::{WriteFraming, is_framing_header},
+    message::Request,
+};
+use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{BackendError, BackendResult};
 
+/// Connection-level writer. Each `send_as_*` writes the request head and
+/// hands back the per-encoding body-writer `Ready` for the chosen
+/// framing.
+#[derive(Debug)]
 pub struct BackendWriter<I> {
-    io: I,
+    writer: I,
 }
-impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
-    pub fn new(io: I) -> Self {
-        Self { io }
+
+impl<I> BackendWriter<I> {
+    pub fn new(writer: I) -> Self {
+        Self { writer }
     }
 
-    pub async fn send_as_chunked(self, request: &Request) -> BackendResult<BackendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_request_to(request, HeadFraming::Chunked, &mut io)
+    pub fn into_inner(self) -> I {
+        let Self { writer } = self;
+        writer
+    }
+}
+
+impl<I> BackendWriter<I>
+where
+    I: AsyncWrite + Unpin,
+{
+    pub async fn send_as_chunked(self, request: &Request) -> BackendResult<chunked::Ready<I>> {
+        let Self { mut writer } = self;
+        write_request_to(request, WriteFraming::Chunked, &mut writer)
             .await
             .map_err(BackendError::WriteError)?;
-        Ok(BackendBodyWriter {
-            io,
-            state: BodyWriterState::TE(ChunkedBodyWriter::new()),
-        })
+        Ok(chunked::Ready::new(body_chunked::Ready::new(writer)))
     }
 
     pub async fn send_as_content_length(
         self,
         request: &Request,
         body_len: u64,
-    ) -> BackendResult<BackendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_request_to(request, HeadFraming::Length(body_len), &mut io)
+    ) -> BackendResult<content_length::Ready<I>> {
+        let Self { mut writer } = self;
+        write_request_to(request, WriteFraming::Length(body_len), &mut writer)
             .await
             .map_err(BackendError::WriteError)?;
-        Ok(BackendBodyWriter {
-            io,
-            state: BodyWriterState::CL(ContentLengthBodyWriter::new(body_len)),
-        })
+        Ok(content_length::Ready::new(body_content_length::Ready::new(
+            writer, body_len,
+        )))
     }
 
-    // TODO: we need to support not sending a content-length header at all for
-    // things like 3xx, 204, and cases where the origin responds to a HEAD
-    // without specifying a content-length.
-
-    /// Send the response to the backend as bodyless. There's no mechanism for
-    /// specifying `content-length` or `transfer-encoding: chunked` on a
-    /// request, so in this case, we just elide any framing headers.
-    pub async fn send_as_bodyless(
-        self,
-        request: &Request,
-    ) -> Result<BackendBodyWriter<I>, BackendError> {
-        let Self { mut io } = self;
-        write_request_to(request, HeadFraming::NoFraming, &mut io)
+    /// Send the request to the backend without a body. There is no mechanism
+    /// for specifying `content-length` or `transfer-encoding: chunked` on a
+    /// request, so we just elide any framing headers.
+    pub async fn send_as_bodyless(self, request: &Request) -> BackendResult<bodyless::Ready<I>> {
+        let Self { mut writer } = self;
+        write_request_to(request, WriteFraming::StripFraming, &mut writer)
             .await
             .map_err(BackendError::WriteError)?;
-        Ok(BackendBodyWriter {
-            io,
-            state: BodyWriterState::CL(ContentLengthBodyWriter::new(0)),
-        })
-    }
-
-    pub fn into_inner(self) -> I {
-        let Self { io } = self;
-        io
+        Ok(bodyless::Ready::new(body_bodyless::Ready::new(writer)))
     }
 }
 
-async fn write_request_to<W: AsyncWriteExt + Unpin>(
-    req: &Request,
-    framing: HeadFraming,
-    mut w: W,
-) -> io::Result<()> {
+async fn write_request_to<W>(req: &Request, framing: WriteFraming, mut w: W) -> io::Result<()>
+where
+    W: AsyncWriteExt + Unpin,
+{
+    // PreserveFraming is a response-writer concept (e.g. 304 Not Modified
+    // quoting the framing of the would-be 200 response). The proxy is
+    // authoritative over the framing of the request it sends to the backend,
+    // so passing client framing headers through verbatim is never correct on
+    // this path.
+    debug_assert!(
+        !matches!(framing, WriteFraming::PreserveFraming),
+        "PreserveFraming is not valid when writing requests to a backend"
+    );
+
     let method = req.method();
     let path = req.path();
-    let version = req.version().to_static();
 
     // TODO: write vectored
 
@@ -81,8 +95,9 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
     w.write_all(b" ").await?;
     w.write_all(path).await?;
     w.write_all(b" ").await?;
-    // TODO: we should always send HTTP/1.1
-    w.write_all(version.as_bytes()).await?;
+    // we always send HTTP/1.1 from the proxy even if the client or server is
+    // HTTP/1.0.
+    w.write_all(b"HTTP/1.1").await?;
     w.write_all(b"\r\n").await?;
 
     // slice each header, and filter out framing headers
@@ -98,12 +113,12 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
 
     // add the framing header, if any
     match framing {
-        HeadFraming::NoFraming => {}
-        HeadFraming::Length(l) => {
+        WriteFraming::PreserveFraming | WriteFraming::StripFraming => {}
+        WriteFraming::Length(l) => {
             let cl = format!("content-length: {l}\r\n");
             w.write_all(cl.as_bytes()).await?;
         }
-        HeadFraming::Chunked => {
+        WriteFraming::Chunked => {
             w.write_all(b"transfer-encoding: chunked\r\n").await?;
         }
     }
@@ -112,50 +127,19 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
     w.write_all(b"\r\n").await?;
 
     // flush the request head so that the backend has a chance to respond to
-    // just the head in case this writer is buffered.
+    // just the head in case this writer is buffered. Many servers can start
+    // processing the response without waiting for any of the body.
     w.flush().await?;
 
     Ok(())
 }
 
-pub struct BackendBodyWriter<I> {
-    io: I,
-    state: BodyWriterState,
-}
-
-impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
-    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
-        self.state
-            .write(&mut self.io, buf)
-            .await
-            .map_err(BackendError::BodyWriteError)
-    }
-
-    pub async fn abort(self) -> BackendResult<()> {
-        let Self { mut io, state } = self;
-        state
-            .abort(&mut io)
-            .await
-            .map_err(BackendError::BodyWriteError)?;
-        Ok(())
-    }
-
-    pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
-        let Self { mut io, state } = self;
-        state
-            .finish(&mut io)
-            .await
-            .map_err(BackendError::BodyWriteError)?;
-        Ok(BackendWriter { io })
-    }
-}
-
 #[cfg(test)]
 mod test {
-    use jrpxy_body::BodyError;
+    use jrpxy_body::error::BodyError;
     use jrpxy_http_message::{message::RequestBuilder, version::HttpVersion};
 
-    use crate::{error::BackendError, writer::BackendWriter};
+    use crate::writer::{BackendWriter, body};
 
     #[tokio::test]
     async fn write_cl_backend() {
@@ -169,22 +153,43 @@ mod test {
             .with_version(HttpVersion::Http11)
             .with_header("hello", b"world")
             .build()
-            .into();
+            .expect("failed to build");
 
-        let mut w = writer
+        let ready = writer
             .send_as_content_length(&req, 0)
             .await
             .expect("failed to send");
 
-        // expect that attempting to write to the body results in an unexpected EOF
-        let e = w.write(&b"hello"[..]).await.expect_err("wasn't an error");
-        assert!(matches!(
-            e,
-            BackendError::BodyWriteError(BodyError::BodyOverflow(0))
-        ));
+        let err = ready.open(5).expect_err("open should overflow");
+        assert!(matches!(err, BodyError::BodyOverflow(0)));
+    }
 
-        let w = w.finish().await.expect("could not finish");
-        let buf = w.into_inner();
+    #[tokio::test]
+    async fn write_cl_backend_finish() {
+        let mut buf = Vec::new();
+        let writer = BackendWriter::new(&mut buf);
+
+        let mut b = RequestBuilder::new(8);
+        let req = b
+            .with_method("GET")
+            .with_path("/cl")
+            .with_version(HttpVersion::Http11)
+            .with_header("hello", b"world")
+            .build()
+            .expect("failed to build");
+
+        let ready = writer
+            .send_as_content_length(&req, 0)
+            .await
+            .expect("failed to send");
+
+        let backend = ready
+            .finish()
+            .expect("finish")
+            .finish()
+            .await
+            .expect("flush");
+        let buf = backend.into_inner();
 
         let expected = b"\
             GET /cl HTTP/1.1\r\n\
@@ -208,18 +213,24 @@ mod test {
             .with_version(HttpVersion::Http11)
             .with_header("hello", b"world")
             .build()
-            .into();
+            .expect("failed to build");
 
-        let mut w = writer.send_as_chunked(&req).await.expect("failed to send");
+        let ready = writer.send_as_chunked(&req).await.expect("failed to send");
 
-        w.write(&b"01234"[..]).await.expect("failed to write");
-        w.write(&b"56"[..]).await.expect("failed to write");
-        w.write(&b"7"[..]).await.expect("failed to write");
-        w.write(&b""[..]).await.expect("failed to write"); // should not result in a zero chunk
-        w.write(&b"8"[..]).await.expect("failed to write");
+        // drive several chunks of varying sizes through the unifier API.
+        let ready: body::Ready<_> = ready.into();
+        let ready = drive_chunk(ready, b"01234").await;
+        let ready = drive_chunk(ready, b"56").await;
+        let ready = drive_chunk(ready, b"7").await;
+        let ready = drive_chunk(ready, b"8").await;
 
-        let w = w.finish().await.expect("could not finish");
-        let buf = w.into_inner();
+        let backend = ready
+            .finish()
+            .expect("finish")
+            .finish()
+            .await
+            .expect("flush");
+        let buf = backend.into_inner();
 
         let expected = b"\
             GET /te HTTP/1.1\r\n\
@@ -239,5 +250,18 @@ mod test {
             ";
 
         assert_eq!(&expected[..], buf);
+    }
+
+    /// Drive a single `Open(N) -> Write -> Close -> Ready` cycle on the
+    /// unifier.
+    async fn drive_chunk<I>(ready: body::Ready<I>, data: &[u8]) -> body::Ready<I>
+    where
+        I: tokio::io::AsyncWrite + Unpin,
+    {
+        let open = ready.open(data.len() as u64).expect("open");
+        let mut write = open.open().await.expect("open async");
+        write.write_all(data).await.expect("write_all");
+        let close = write.into_close().expect("into_close");
+        close.close().await.expect("close")
     }
 }

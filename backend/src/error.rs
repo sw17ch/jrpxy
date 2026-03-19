@@ -1,5 +1,8 @@
-use jrpxy_body::BodyError;
-use jrpxy_http_message::{header::HeaderError, message::MessageError};
+use jrpxy_body::error::BodyError;
+use jrpxy_http_message::{
+    header::{ConnectionTokenParserError, HeaderError},
+    message::MessageError,
+};
 use tokio::io;
 
 #[derive(Debug, thiserror::Error)]
@@ -20,18 +23,26 @@ pub enum BackendError {
     HttpResponseParseError(MessageError),
     #[error("Header error: {0}")]
     HeaderError(#[from] HeaderError),
+    #[error("Invalid connection header: {0}")]
+    InvalidConnectionHeader(#[from] ConnectionTokenParserError),
     #[error("101-switching-protocols unsupported")]
     HttpSwitchingProtocolsUnsupported,
     #[error("102-processing deprecated")]
     HttpProcessingUnsupported,
-    #[error("Unsupported unknown informational status: {0}")]
-    HttpUnsupportedInformational(u16),
     #[error("Response head exceeded size limit: {0} >= {1}")]
     MaxHeadLenExceeded(usize, usize),
     #[error("1xx response contains framing headers")]
-    FramingHeadersOnInformationalResposne,
+    FramingHeadersOnInformationalResponse,
     #[error("204 No Content response contains framing headers")]
-    FramingHeadersOn204NoContentResposne,
+    FramingHeadersOn204NoContentResponse,
+    #[error("Received transfer-encoding header from HTTP/1.0 server")]
+    TransferEncodingOnHttp10Server,
 }
 
 pub type BackendResult<T> = Result<T, BackendError>;
+
+impl From<BodyError> for BackendError {
+    fn from(e: BodyError) -> Self {
+        BackendError::BodyWriteError(e)
+    }
+}
