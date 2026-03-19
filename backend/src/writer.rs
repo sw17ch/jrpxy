@@ -38,10 +38,6 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         })
     }
 
-    // TODO: we need to support not sending a content-length header at all for
-    // things like 3xx, 204, and cases where the origin responds to a HEAD
-    // without specifying a content-length.
-
     /// Send the response to the backend as bodyless. There's no mechanism for
     /// specifying `content-length` or `transfer-encoding: chunked` on a
     /// request, so in this case, we just elide any framing headers.
@@ -59,6 +55,17 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         })
     }
 
+    pub async fn send_as_same(
+        self,
+        request: &Request,
+    ) -> Result<BackendBodyWriter<I>, BackendError> {
+        match request.framing()? {
+            HeadFraming::Length(cl) => self.send_as_content_length(request, cl).await,
+            HeadFraming::Chunked => self.send_as_chunked(request).await,
+            HeadFraming::NoFraming => self.send_as_bodyless(request).await,
+        }
+    }
+
     pub fn into_inner(self) -> I {
         let Self { io } = self;
         io
@@ -72,7 +79,6 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
 ) -> io::Result<()> {
     let method = req.method();
     let path = req.path();
-    let version = req.version().to_static();
 
     // TODO: write vectored
 
@@ -81,8 +87,9 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
     w.write_all(b" ").await?;
     w.write_all(path).await?;
     w.write_all(b" ").await?;
-    // TODO: we should always send HTTP/1.1
-    w.write_all(version.as_bytes()).await?;
+    // we alaways send HTTP/1.1 from the proxy even if the client or server is
+    // HTTP/1.0.
+    w.write_all(b"HTTP/1.1").await?;
     w.write_all(b"\r\n").await?;
 
     // slice each header, and filter out framing headers

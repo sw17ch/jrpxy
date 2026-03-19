@@ -56,6 +56,17 @@ pub struct FrontendReader<I> {
     buffer: buffer::Buffer,
 }
 
+impl<I> FrontendReader<I> {
+    pub fn into_inner(self) -> (I, buffer::Buffer) {
+        let Self {
+            io,
+            max_head_length: _,
+            buffer,
+        } = self;
+        (io, buffer)
+    }
+}
+
 impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
     pub(crate) const MAX_HEADERS: usize = 256;
 

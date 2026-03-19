@@ -80,6 +80,13 @@ pub struct FrontendWriter<I> {
     pub(crate) io: I,
 }
 
+impl<I> FrontendWriter<I> {
+    pub fn into_inner(self) -> I {
+        let Self { io } = self;
+        io
+    }
+}
+
 impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
     /// Create a new frontend writer that will write responses into the
     /// specified `io`.
@@ -143,9 +150,15 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         })
     }
 
-    pub fn into_inner(self) -> I {
-        let Self { io } = self;
-        io
+    pub async fn send_as_same(
+        self,
+        response: &Response,
+    ) -> Result<FrontendBodyWriter<I>, FrontendError> {
+        match response.framing()? {
+            HeadFraming::Length(cl) => self.send_as_content_length(response, cl).await,
+            HeadFraming::Chunked => self.send_as_chunked(response).await,
+            HeadFraming::NoFraming => self.send_as_bodyless(response).await,
+        }
     }
 }
 
@@ -154,16 +167,15 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
     framing: HeadFraming,
     mut w: W,
 ) -> io::Result<()> {
-    let version = res.version().to_static();
     let code = res.code();
     let reason = res.reason();
 
     // TODO: we can avoid this heap allocation
     let code = format!("{code}");
 
-    // write out the status line
-    // TODO: we should always send HTTP/1.1
-    w.write_all(version.as_bytes()).await?;
+    // we always send HTTP/1.1 from the proxy even if the client or server is
+    // HTTP/1.0.
+    w.write_all(b"HTTP/1.1").await?;
     w.write_all(b" ").await?;
     w.write_all(code.as_bytes()).await?;
     w.write_all(b" ").await?;

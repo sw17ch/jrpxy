@@ -6,7 +6,7 @@ use crate::framing::HeadFraming;
 pub enum HeaderError {
     #[error("Invalid content length: {0}")]
     InvalidContentLength(String),
-    #[error("Found at least two content-length headers with values: {0}, {0}")]
+    #[error("Found at least two content-length headers with values: {0}, {1}")]
     MultipleContentLength(u64, u64),
     #[error("Multiple transfer-encoding headers")]
     MultipleTransferEncodingHeaders,
@@ -45,6 +45,7 @@ impl<'s> Iterator for HeaderIter<'s> {
     }
 }
 
+#[derive(Debug)]
 pub struct Headers {
     headers: Vec<(Bytes, Bytes)>,
 }
@@ -136,6 +137,13 @@ impl Headers {
         Self { headers: remove }
     }
 
+    pub fn merge(&mut self, other: &Headers) {
+        // Append all headers from other onto self. No deduplication is
+        // performed; callers are responsible for removing any headers from
+        // self that should be overridden before calling this method.
+        self.headers.extend_from_slice(&other.headers);
+    }
+
     pub fn into_inner(self) -> Vec<(Bytes, Bytes)> {
         let Self { headers } = self;
         headers
@@ -188,5 +196,32 @@ mod test {
             headers.framing().is_err(),
             "Requests with multiple Content-Length headers must be rejected"
         );
+    }
+
+    fn b<const C: usize>(a: &'static [u8; C]) -> bytes::Bytes {
+        bytes::Bytes::from(a.as_slice())
+    }
+
+    #[test]
+    fn merge_appends() {
+        let mut headers = Headers::with_capacity(4);
+        headers.push(b"a".as_slice(), b"1".as_slice());
+        headers.push(b"Via".as_slice(), b"1.0 upstream".as_slice());
+
+        let mut other = Headers::with_capacity(2);
+        other.push(b"b".as_slice(), b"2".as_slice());
+        other.push(b"Via".as_slice(), b"1.1 proxy".as_slice());
+
+        headers.merge(&other);
+
+        // Both Via entries must be preserved — no deduplication.
+        let expected = vec![
+            (b(b"a"), b(b"1")),
+            (b(b"Via"), b(b"1.0 upstream")),
+            (b(b"b"), b(b"2")),
+            (b(b"Via"), b(b"1.1 proxy")),
+        ];
+
+        assert_eq!(&expected, &headers.headers);
     }
 }

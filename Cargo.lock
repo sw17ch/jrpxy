@@ -60,6 +60,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "jrpxy-proxy"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "jrpxy-backend",
+ "jrpxy-frontend",
+ "jrpxy-http-message",
+ "jrpxy-util",
+ "pin-project-lite",
+ "thiserror",
+ "tokio",
+]
+
+[[package]]
 name = "jrpxy-util"
 version = "0.1.0"
 dependencies = [

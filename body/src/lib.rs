@@ -24,7 +24,7 @@ pub enum BodyError {
     TrailerError(#[from] TrailerError),
     #[error("Unexpected EOF")]
     UnexpectedEOF,
-    #[error("Invalid chunk footer: expected {0} got {0}")]
+    #[error("Invalid chunk footer: expected 0x{0:x} got 0x{1:x}")]
     InvalidChunkFooter(u8, u8),
 }
 

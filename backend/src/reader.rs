@@ -86,6 +86,8 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         if res.code() == 204 && !framing.is_no_framing() {
             return Err(BackendError::FramingHeadersOn204NoContentResposne);
         }
+        // TODO: 1xx cannot contain content or trailers (RFC9110 6.2, 15.2)
+        // TODO: 304 cannot contain content or trailers (RFC9110 6.2, 15.4.5)
         if is_informational.is_some() && !framing.is_no_framing() {
             return Err(BackendError::FramingHeadersOnInformationalResposne);
         }
