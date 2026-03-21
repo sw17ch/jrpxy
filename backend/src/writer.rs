@@ -176,6 +176,7 @@ mod test {
             .with_version(HttpVersion::Http11)
             .with_header("hello", b"world")
             .build()
+            .expect("failed to build")
             .into();
 
         let mut w = writer
@@ -215,6 +216,7 @@ mod test {
             .with_version(HttpVersion::Http11)
             .with_header("hello", b"world")
             .build()
+            .expect("failed to build")
             .into();
 
         let mut w = writer.send_as_chunked(&req).await.expect("failed to send");

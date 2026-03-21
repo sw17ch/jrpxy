@@ -2,7 +2,7 @@ use std::mem::MaybeUninit;
 
 use bytes::{Bytes, BytesMut};
 use httparse::{Request as HttparseRequest, Response as HttparseResponse};
-use jrpxy_util::buffer::Buffer;
+use jrpxy_util::{buffer::Buffer, parse::is_valid_tchar};
 
 pub use httparse::Error as HttpParseError;
 
@@ -18,9 +18,27 @@ pub enum MessageError {
     Parse(#[from] HttpParseError),
     #[error("Unsupported http version: {0}")]
     HttpVersion(u8),
+    #[error("Cannot build: {0}")]
+    BuildError(#[from] BuildError),
 }
 
 pub type MessageResult<T> = Result<T, MessageError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum BuildError {
+    #[error("Method not specified")]
+    MissingMethod,
+    #[error("Path not specified")]
+    MissingPath,
+    #[error("Version not specified")]
+    MissingVersion,
+    #[error("Code is not specified")]
+    MissingCode,
+    #[error("Result is not specified")]
+    MissingResult,
+    #[error("Method contains invalid characters (RFC9110, 9.1)")]
+    InvalidMethod(String),
+}
 
 #[derive(Copy, Clone)]
 struct Span {
@@ -243,6 +261,22 @@ impl Request {
     }
 }
 
+impl std::fmt::Debug for Request {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut f = f.debug_struct("Request");
+        f.field(":method", &self.inner.method)
+            .field(":path", &self.inner.path)
+            .field(":version", &self.inner.version);
+        for (n, v) in self.inner.headers.iter() {
+            let Ok(n) = std::str::from_utf8(n) else {
+                continue;
+            };
+            f.field(n, v);
+        }
+        f.finish()
+    }
+}
+
 struct ResponseInner {
     version: HttpVersion,
     code: u16,
@@ -378,7 +412,7 @@ impl<'s> RequestBuilder<'s> {
         self
     }
 
-    pub fn build(&self) -> Request {
+    pub fn build(&self) -> Result<Request, BuildError> {
         let Self {
             method,
             path,
@@ -386,16 +420,28 @@ impl<'s> RequestBuilder<'s> {
             headers: built_headers,
         } = self;
 
-        // TODO: validate method, path, and headers
-        // TODO: also make sure none of them are none
+        let Some(method) = method else {
+            return Err(BuildError::MissingMethod);
+        };
+        let Some(path) = path else {
+            return Err(BuildError::MissingPath);
+        };
+        let Some(version) = version else {
+            return Err(BuildError::MissingVersion);
+        };
+
+        if !method.bytes().all(is_valid_tchar) {
+            return Err(BuildError::InvalidMethod(method.to_string()));
+        }
+
+        // TODO: validate path, and headers
 
         let mut buf = BytesMut::with_capacity(128);
 
-        buf.extend_from_slice(method.unwrap_or("GET").as_bytes());
+        buf.extend_from_slice(method.as_bytes());
         let method = buf.split().freeze();
-        buf.extend_from_slice(path.unwrap_or("/").as_bytes());
+        buf.extend_from_slice(path.as_bytes());
         let path = buf.split().freeze();
-        let version = version.unwrap_or(HttpVersion::Http10);
 
         let mut headers = Headers::with_capacity(built_headers.len());
         for (name, value) in built_headers {
@@ -406,14 +452,14 @@ impl<'s> RequestBuilder<'s> {
             headers.push(name, value);
         }
 
-        Request {
+        Ok(Request {
             inner: Box::new(RequestInner {
                 method,
                 path,
-                version,
+                version: *version,
                 headers,
             }),
-        }
+        })
     }
 }
 
@@ -455,7 +501,7 @@ impl<'s> ResponseBuilder<'s> {
         self
     }
 
-    pub fn build(&self) -> Response {
+    pub fn build(&self) -> Result<Response, BuildError> {
         let Self {
             version,
             code,
@@ -463,15 +509,23 @@ impl<'s> ResponseBuilder<'s> {
             headers: built_headers,
         } = self;
 
+        let Some(version) = version else {
+            return Err(BuildError::MissingVersion);
+        };
+        let Some(code) = code else {
+            return Err(BuildError::MissingCode);
+        };
+        let Some(reason) = reason else {
+            return Err(BuildError::MissingResult);
+        };
+
         // TODO: validate code, reason, and headers
-        // TODO: also make sure none of them are none.
         // TODO: verify that a 1xx response follows content-length and transfer-encoding rules
 
         let mut buf = BytesMut::with_capacity(128);
 
-        let version = version.to_owned().unwrap_or(HttpVersion::Http10);
-        let code = code.to_owned().unwrap_or(200);
-        buf.extend_from_slice(reason.unwrap_or("Unknown").as_bytes());
+        let code = code.to_owned();
+        buf.extend_from_slice(reason.as_bytes());
         let reason = buf.split().freeze();
 
         let mut headers = Headers::with_capacity(built_headers.len());
@@ -483,13 +537,36 @@ impl<'s> ResponseBuilder<'s> {
             headers.push(name, value);
         }
 
-        Response {
+        Ok(Response {
             inner: Box::new(ResponseInner {
-                version,
+                version: *version,
                 code,
                 reason,
                 headers,
             }),
-        }
+        })
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use crate::message::BuildError;
+
+    use super::RequestBuilder;
+
+    #[test]
+    fn build_with_invalid_method() {
+        let mut b = RequestBuilder::new(0);
+        b.with_method("GET OHNOSPACE")
+            .with_path("/")
+            .with_version(crate::version::HttpVersion::Http11);
+        let req = b.build().unwrap_err();
+        if let BuildError::InvalidMethod(v) = &req
+            && v == "GET OHNOSPACE"
+        {
+            // good
+        } else {
+            panic!("unexpected error: {req:?}")
+        };
     }
 }

@@ -264,6 +264,7 @@ mod test {
             .with_header("content-LENGTH", &b"400"[..])
             .with_header("TRANSFER-ENCODING", &b"chunked"[..])
             .build()
+            .expect("failed to build response")
             .into();
 
         let mut buf = Vec::new();
@@ -294,6 +295,7 @@ mod test {
             .with_reason("Ok".into())
             .with_version(HttpVersion::Http11)
             .build()
+            .expect("failed to build response")
             .into();
 
         let mut buf = Vec::new();
@@ -318,6 +320,7 @@ mod test {
             .with_reason("Ok".into())
             .with_version(HttpVersion::Http11)
             .build()
+            .expect("failed to build response")
             .into();
 
         let mut buf = Vec::new();
@@ -346,6 +349,7 @@ mod test {
             .with_reason("Ok".into())
             .with_version(HttpVersion::Http11)
             .build()
+            .expect("failed to build response")
             .into();
 
         let mut buf = Vec::new();
@@ -376,6 +380,7 @@ mod test {
             .with_reason("Ok".into())
             .with_version(HttpVersion::Http11)
             .build()
+            .expect("failed to build response")
             .into();
 
         let mut buf = Vec::new();
@@ -404,6 +409,7 @@ mod test {
             .with_version(HttpVersion::Http11)
             .with_header("x-req", b"first")
             .build()
+            .expect("failed to build response")
             .into();
         let body_writer = cw
             .send_as_content_length(&res, 0)
@@ -419,6 +425,7 @@ mod test {
             .with_version(HttpVersion::Http11)
             .with_header("x-req", b"second")
             .build()
+            .expect("failed to build response")
             .into();
         let mut body_writer = cw
             .send_as_content_length(&res, 5)
@@ -435,6 +442,7 @@ mod test {
             .with_version(HttpVersion::Http11)
             .with_header("x-req", b"third")
             .build()
+            .expect("failed to build response")
             .into();
         let mut body_writer = cw.send_as_chunked(&res).await.expect("first write works");
         body_writer.write(b"01234").await.expect("failed to write");
