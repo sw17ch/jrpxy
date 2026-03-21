@@ -1,6 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use jrpxy_body::{BodyReadMode, BodyReader};
-use jrpxy_http_message::{framing::HeadFraming, message::Response, version::HttpVersion};
+use jrpxy_http_message::{framing::HeadFraming, message::Response};
 use jrpxy_util::buffer;
 use tokio::io::AsyncReadExt;
 
@@ -227,14 +227,6 @@ impl<I> BackendResponse<I> {
 
     pub fn mode(&self) -> BodyReadMode {
         self.reader.mode()
-    }
-
-    pub fn into_version(self, frontend_version: HttpVersion) -> Self {
-        let Self { res, reader } = self;
-        Self {
-            res: res.into_version(frontend_version),
-            reader,
-        }
     }
 }
 

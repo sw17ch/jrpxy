@@ -313,15 +313,6 @@ impl Response {
         let c = self.code();
         (100..200).contains(&c).then_some(c)
     }
-
-    pub fn into_version(mut self, frontend_version: HttpVersion) -> Self {
-        self.inner.version = frontend_version;
-
-        // TODO: strip out or convert response headers not supported by the
-        // target version
-
-        self
-    }
 }
 
 fn populate_headers(header_offsets: &[HeaderOffset], head_buf: &Bytes) -> Headers {

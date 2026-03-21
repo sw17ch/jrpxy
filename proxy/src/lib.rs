@@ -999,7 +999,7 @@ mod test {
         ProxyResponseStream::new(stream, "proxy.example.com")
     }
 
-#[tokio::test]
+    #[tokio::test]
     async fn test_oneshot_transaction() {
         let frontend_reader = b"\
             GET / HTTP/1.1\r\n\
