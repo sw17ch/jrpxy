@@ -47,7 +47,9 @@ pub enum ProxyCopyError {
     BackendError(#[from] BackendError),
 }
 
-type ProxyResult<T> = std::result::Result<T, ProxyError>;
+pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
+
+type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 
 pub trait BackendProxyProvider {
     /// The backend reader inner type
@@ -57,7 +59,7 @@ pub trait BackendProxyProvider {
 
     fn get_connection(
         &mut self,
-    ) -> impl Future<Output = ProxyResult<(BackendReader<Self::BR>, BackendWriter<Self::BW>)>>;
+    ) -> impl Future<Output = ProxyResult<BackendConnection<Self::BR, Self::BW>>>;
 
     fn give_connection(&mut self, reader: BackendReader<Self::BR>, writer: BackendWriter<Self::BW>);
 }
