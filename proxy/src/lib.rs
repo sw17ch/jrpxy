@@ -290,7 +290,7 @@ pub struct WroteBackendRequest<FR, FW, BR, BW, BP> {
     backend_provider: BP,
 }
 
-pub enum BackendResponseStatus<FR, FW, BR, BW, BP: BackendProxyProvider<BR = BR, BW = BW>> {
+pub enum BackendResponseStream<FR, FW, BR, BW, BP: BackendProxyProvider<BR = BR, BW = BW>> {
     Informational(ReadBackendInformationalResponse<FR, FW, BR, BW, BP>),
     Response(ReadBackendResponse<FR, FW, BR, BW, BP>),
 }
@@ -303,7 +303,7 @@ where
 {
     pub async fn read_backend_response(
         self,
-    ) -> ProxyResult<BackendResponseStatus<FR, FW, BR, BW, BP>> {
+    ) -> ProxyResult<BackendResponseStream<FR, FW, BR, BW, BP>> {
         let Self {
             options,
             allow_response_body,
@@ -320,7 +320,7 @@ where
         let response_stream = ProxyResponseStream::new(response_stream, &options.received_by);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
-                BackendResponseStatus::Response(ReadBackendResponse {
+                BackendResponseStream::Response(ReadBackendResponse {
                     options,
                     frontend_body_reader,
                     frontend_writer,
@@ -332,7 +332,7 @@ where
             ProxyResponseStream::Informational(
                 proxy_informational_response,
                 proxy_stream_reader,
-            ) => BackendResponseStatus::Informational(ReadBackendInformationalResponse {
+            ) => BackendResponseStream::Informational(ReadBackendInformationalResponse {
                 options,
                 proxy_informational_response,
                 frontend_body_reader,
@@ -376,13 +376,50 @@ where
         &mut self.proxy_informational_response
     }
 
-    pub fn drop_informational_response(self) -> BackendResponseStatus<FR, FW, BR, BW, BP> {
-        todo!()
+    pub async fn drop_informational_response(
+        self,
+    ) -> ProxyResult<BackendResponseStream<FR, FW, BR, BW, BP>> {
+        let Self {
+            proxy_informational_response: _,
+            frontend_body_reader,
+            frontend_writer,
+            proxy_stream_reader,
+            backend_body_writer,
+            backend_provider,
+            options,
+        } = self;
+
+        match proxy_stream_reader.read().await? {
+            ProxyResponseStream::Response(proxy_response) => {
+                Ok(BackendResponseStream::Response(ReadBackendResponse {
+                    frontend_body_reader,
+                    frontend_writer,
+                    proxy_response,
+                    backend_body_writer,
+                    backend_provider,
+                    options,
+                }))
+            }
+            ProxyResponseStream::Informational(
+                proxy_informational_response,
+                proxy_stream_reader,
+            ) => Ok(BackendResponseStream::Informational(
+                ReadBackendInformationalResponse {
+                    proxy_informational_response,
+                    frontend_body_reader,
+                    frontend_writer,
+                    proxy_stream_reader,
+                    backend_body_writer,
+                    backend_provider,
+                    options,
+                },
+            )),
+        }
     }
 
     pub async fn forward_informational_response(
         self,
-    ) -> ProxyResult<BackendResponseStatus<FR, FW, BR, BW, BP>> {
+    ) -> ProxyResult<BackendResponseStream<FR, FW, BR, BW, BP>> {
         let Self {
             proxy_informational_response,
             frontend_body_reader,
@@ -399,7 +436,7 @@ where
 
         match proxy_stream_reader.read().await? {
             ProxyResponseStream::Response(proxy_response) => {
-                Ok(BackendResponseStatus::Response(ReadBackendResponse {
+                Ok(BackendResponseStream::Response(ReadBackendResponse {
                     frontend_body_reader,
                     frontend_writer,
                     proxy_response,
@@ -411,7 +448,7 @@ where
             ProxyResponseStream::Informational(
                 proxy_informational_response,
                 proxy_stream_reader,
-            ) => Ok(BackendResponseStatus::Informational(
+            ) => Ok(BackendResponseStream::Informational(
                 ReadBackendInformationalResponse {
                     proxy_informational_response,
                     frontend_body_reader,
@@ -967,7 +1004,7 @@ mod test {
     use jrpxy_backend::reader::BackendReader;
     use jrpxy_frontend::reader::FrontendReader;
 
-    use crate::{BackendResponseStatus, OneshotBackend, ProxyClient, ProxyOptions};
+    use crate::{BackendResponseStream, OneshotBackend, ProxyClient, ProxyOptions};
 
     use super::{
         ProxyInformationalResponse, ProxyRequest, ProxyResponse, ProxyResponseStream,
@@ -1048,10 +1085,10 @@ mod test {
             .expect("failed to read backend response");
 
         let rbir = match be_res_stat {
-            BackendResponseStatus::Response(_read_backend_response) => {
+            BackendResponseStream::Response(_read_backend_response) => {
                 panic!("incorrect response type")
             }
-            BackendResponseStatus::Informational(read_backend_informational_response) => {
+            BackendResponseStream::Informational(read_backend_informational_response) => {
                 read_backend_informational_response
             }
         };
@@ -1101,8 +1138,8 @@ mod test {
             .expect("failed to forward informational response");
 
         let rbr = match be_res_stat {
-            BackendResponseStatus::Response(rbr) => rbr,
-            BackendResponseStatus::Informational(_rbir) => {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_rbir) => {
                 panic!("incorrect response type")
             }
         };
@@ -1187,7 +1224,84 @@ mod test {
 
     #[tokio::test]
     async fn test_oneshot_transaction_drop_informational() {
-        // todo!("test dropping the informational response when client is HTTP/1.0")
+        let frontend_reader = b"\
+            GET / HTTP/1.0\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let backend_reader = b"\
+            HTTP/1.1 100 Continue\r\n\
+            x-hdr: 1\r\n\
+            \r\n\
+            HTTP/1.1 200 Ok\r\n\
+            content-length: 5\r\n\
+            \r\n\
+            01234";
+
+        let mut backend_writer = Vec::new();
+
+        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+
+        let proxy_client = ProxyClient::new(
+            frontend_reader.as_ref(),
+            &mut frontend_writer,
+            bp,
+            ProxyOptions::default(),
+        );
+
+        let did_fe_read = proxy_client.start().await.expect("client start failed");
+
+        let did_be_write = did_fe_read
+            .write_backend_request()
+            .await
+            .expect("backend write failed");
+
+        let be_res_stat = did_be_write
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        // First, we get the informational response from the backend
+        let rbir = match be_res_stat {
+            BackendResponseStream::Response(_) => panic!("incorrect response type"),
+            BackendResponseStream::Informational(rbir) => rbir,
+        };
+
+        // We drop the informational response rather than forwarding it to the
+        // client (our client is HTTP/1.0 and doesn't support 1xx responses).
+        let be_res_stat = rbir
+            .drop_informational_response()
+            .await
+            .expect("failed to drop informational response");
+
+        // Now we can read the next response from the origin. This one is a
+        // normal response.
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("incorrect response type"),
+        };
+
+        // Normal responses can be forwarded to HTTP/1.0 clients.
+        let client = rbr
+            .forward_response()
+            .await
+            .expect("failed to forward response");
+
+        let (_frontend_reader, frontend_writer, _backend_provider) = client.into_parts();
+        let frontend_writer = frontend_writer.into_inner();
+
+        // The 1xx informational response must NOT be forwarded to an HTTP/1.0 client.
+        let expected_frontend_writer = b"\
+            HTTP/1.1 200 Ok\r\n\
+            Via: 1.1 jrpxy\r\n\
+            content-length: 5\r\n\
+            \r\n\
+            01234";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
     }
 
     #[tokio::test]
