@@ -6,6 +6,7 @@ use tokio::io::AsyncReadExt;
 
 use crate::error::{BackendError, BackendResult};
 
+#[derive(Debug)]
 pub struct BackendReader<I> {
     io: I,
     max_head_length: usize,
@@ -64,7 +65,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
 
     /// `allow_body` should be set to false when we do not expect the backend to
     /// respond with a body even if the response headers indicate a body would
-    /// be present such as is the case with a HEAD request.
+    /// be present such as is the case with a HEAD or CONNECT request.
     pub async fn read(mut self, allow_body: bool) -> BackendResult<ResponseStream<I>> {
         let res = self.head().await?;
         let Self {
@@ -86,11 +87,22 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         if res.code() == 204 && !framing.is_no_framing() {
             return Err(BackendError::FramingHeadersOn204NoContentResposne);
         }
-        // TODO: 1xx cannot contain content or trailers (RFC9110 6.2, 15.2)
-        // TODO: 304 cannot contain content or trailers (RFC9110 6.2, 15.4.5)
         if is_informational.is_some() && !framing.is_no_framing() {
             return Err(BackendError::FramingHeadersOnInformationalResposne);
         }
+        // While RFC 9112 section 6.3 specifies that a 304 does not contain body
+        // data, section 6.1 allows a transfer-encoding header in the response
+        // to indicate the server would have applied this a transfer-encoding in
+        // an unconditional GET. RFC 9110 section 8.6 says the same about 304
+        // and content-length. Therefor, we only reject status codes with
+        // framing that are 100..=199 and 204.
+        let expect_body = allow_body
+            && match res.code() {
+                100..200 => false,
+                204 => false,
+                304 => false,
+                _ => true,
+            };
 
         if let Some(info_code) = is_informational {
             return match info_code {
@@ -122,7 +134,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
             };
         }
 
-        let reader = if !allow_body {
+        let reader = if !expect_body {
             BackendBodyReader::new(
                 io,
                 max_head_length,

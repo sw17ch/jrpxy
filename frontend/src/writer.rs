@@ -17,7 +17,8 @@
 //!        .with_version(HttpVersion::Http11)
 //!        .with_code(200)
 //!        .with_reason("Ok")
-//!        .build();
+//!        .build()
+//!        .expect("failed to build");
 //!    let mut frontend_body_writer = frontend_writer
 //!        .send_as_content_length(&resp, 5)
 //!        .await
@@ -32,7 +33,8 @@
 //!        .with_version(HttpVersion::Http11)
 //!        .with_code(404)
 //!        .with_reason("Not Found")
-//!        .build();
+//!        .build()
+//!        .expect("failed to build");
 //!    let mut frontend_body_writer = frontend_writer.send_as_chunked(&resp).await.unwrap();
 //!    frontend_body_writer.write(b"01234").await.unwrap();
 //!    frontend_body_writer.write(b"567").await.unwrap();
