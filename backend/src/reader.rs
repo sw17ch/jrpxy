@@ -9,42 +9,40 @@ use crate::error::{BackendError, BackendResult};
 #[derive(Debug)]
 pub struct BackendReader<I> {
     io: I,
-    max_head_length: usize,
     buffer: buffer::Buffer,
 }
 
 impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     const MAX_HEADERS: usize = 256;
 
-    pub fn new(io: I, max_head_length: usize) -> Self {
-        Self::new_with_buffer(io, max_head_length, BytesMut::new())
+    pub fn new(io: I) -> Self {
+        Self::new_with_buffer(io, BytesMut::new())
     }
 
-    fn new_with_buffer(io: I, max_head_length: usize, buffer: BytesMut) -> BackendReader<I> {
+    fn new_with_buffer(io: I, buffer: BytesMut) -> BackendReader<I> {
         Self {
             io,
-            max_head_length,
             buffer: buffer::Buffer::new(buffer),
         }
     }
 
-    async fn head(&mut self) -> BackendResult<Response> {
+    async fn head(&mut self, max_head_length: usize) -> BackendResult<Response> {
         loop {
             if let Some(res) = Response::parse(&mut self.buffer, Self::MAX_HEADERS)
                 .map_err(BackendError::HttpResponseParseError)?
             {
                 return Ok(res);
-            } else if self.buffer.len() >= self.max_head_length {
+            } else if self.buffer.len() >= max_head_length {
                 return Err(BackendError::MaxHeadLenExceeded(
                     self.buffer.len(),
-                    self.max_head_length,
+                    max_head_length,
                 ));
             }
 
             let first_read = self.buffer.is_empty();
 
             // read some data into the buffer
-            let target_read_len = self.max_head_length.saturating_sub(self.buffer.len());
+            let target_read_len = max_head_length.saturating_sub(self.buffer.len());
             let len = self
                 .buffer
                 .read_from(&mut self.io, target_read_len)
@@ -66,13 +64,13 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     /// `allow_body` should be set to false when we do not expect the backend to
     /// respond with a body even if the response headers indicate a body would
     /// be present such as is the case with a HEAD or CONNECT request.
-    pub async fn read(mut self, allow_body: bool) -> BackendResult<ResponseStream<I>> {
-        let res = self.head().await?;
-        let Self {
-            io,
-            max_head_length,
-            buffer,
-        } = self;
+    pub async fn read(
+        mut self,
+        allow_body: bool,
+        max_head_length: usize,
+    ) -> BackendResult<ResponseStream<I>> {
+        let res = self.head(max_head_length).await?;
+        let Self { io, buffer } = self;
 
         let framing = res.framing()?;
         let is_informational = res.is_informational();
@@ -110,11 +108,8 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
                     res,
                     BackendStreamReader {
                         allow_body,
-                        reader: Self {
-                            io,
-                            max_head_length,
-                            buffer,
-                        },
+                        max_head_length,
+                        reader: Self { io, buffer },
                     },
                 )),
                 101 => Err(BackendError::HttpSwitchingProtocolsUnsupported),
@@ -123,11 +118,8 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
                     res,
                     BackendStreamReader {
                         allow_body,
-                        reader: Self {
-                            io,
-                            max_head_length,
-                            buffer,
-                        },
+                        max_head_length,
+                        reader: Self { io, buffer },
                     },
                 )),
                 unk => Err(BackendError::HttpUnsupportedInformational(unk)),
@@ -135,32 +127,18 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         }
 
         let reader = if !expect_body {
-            BackendBodyReader::new(
-                io,
-                max_head_length,
-                buffer.into_inner(),
-                BodyReadMode::Bodyless,
-            )
+            BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::Bodyless)
         } else {
             match framing {
-                HeadFraming::Length(cl) => BackendBodyReader::new(
-                    io,
-                    max_head_length,
-                    buffer.into_inner(),
-                    BodyReadMode::ContentLength(cl),
-                ),
-                HeadFraming::Chunked => BackendBodyReader::new(
-                    io,
-                    max_head_length,
-                    buffer.into_inner(),
-                    BodyReadMode::Chunk,
-                ),
-                HeadFraming::NoFraming => BackendBodyReader::new(
-                    io,
-                    max_head_length,
-                    buffer.into_inner(),
-                    BodyReadMode::Bodyless,
-                ),
+                HeadFraming::Length(cl) => {
+                    BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::ContentLength(cl))
+                }
+                HeadFraming::Chunked => {
+                    BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::Chunk)
+                }
+                HeadFraming::NoFraming => {
+                    BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::Bodyless)
+                }
             }
         };
 
@@ -208,13 +186,18 @@ impl<I: std::fmt::Debug> std::fmt::Debug for ResponseStream<I> {
 
 pub struct BackendStreamReader<I> {
     allow_body: bool,
+    max_head_length: usize,
     reader: BackendReader<I>,
 }
 
 impl<I: AsyncReadExt + Unpin> BackendStreamReader<I> {
     pub async fn read(self) -> BackendResult<ResponseStream<I>> {
-        let Self { allow_body, reader } = self;
-        reader.read(allow_body).await
+        let Self {
+            allow_body,
+            max_head_length,
+            reader,
+        } = self;
+        reader.read(allow_body, max_head_length).await
     }
 }
 
@@ -249,7 +232,6 @@ impl<I: AsyncReadExt + Unpin> BackendResponse<I> {
 }
 
 pub struct BackendBodyReader<I> {
-    max_head_length: usize,
     reader: BodyReader<I>,
 }
 
@@ -260,9 +242,8 @@ impl<I> BackendBodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
-    fn new(io: I, max_head_length: usize, buffer: BytesMut, mode: BodyReadMode) -> Self {
+    fn new(io: I, buffer: BytesMut, mode: BodyReadMode) -> Self {
         Self {
-            max_head_length,
             reader: BodyReader::new(io, buffer, mode),
         }
     }
@@ -286,17 +267,12 @@ impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
     }
 
     pub async fn drain(self) -> BackendResult<BackendReader<I>> {
-        let max_head_length = self.max_head_length;
         let (io, buffer) = self
             .reader
             .drain()
             .await
             .map_err(BackendError::BodyReadError)?;
-        Ok(BackendReader::new_with_buffer(
-            io,
-            max_head_length,
-            buffer.into_inner(),
-        ))
+        Ok(BackendReader::new_with_buffer(io, buffer.into_inner()))
     }
 }
 
@@ -317,9 +293,9 @@ mod test {
             01234\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
+        let reader = BackendReader::new(buf.as_slice());
         let (res, br) = reader
-            .read(true)
+            .read(true, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -352,9 +328,9 @@ mod test {
             01234\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
+        let reader = BackendReader::new(buf.as_slice());
         let (res, br) = reader
-            .read(true)
+            .read(true, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -403,9 +379,9 @@ mod test {
             \r\n\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
+        let reader = BackendReader::new(buf.as_slice());
         let (res, br) = reader
-            .read(true)
+            .read(true, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -443,9 +419,9 @@ mod test {
             \r\n\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
+        let reader = BackendReader::new(buf.as_slice());
         let (res, br) = reader
-            .read(true)
+            .read(true, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -488,9 +464,9 @@ mod test {
             \r\n\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
+        let reader = BackendReader::new(buf.as_slice());
         let (res, br) = reader
-            .read(false)
+            .read(false, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -516,9 +492,9 @@ mod test {
             \r\n\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
+        let reader = BackendReader::new(buf.as_slice());
         let (res, br) = reader
-            .read(false)
+            .read(false, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -543,9 +519,9 @@ mod test {
             \r\n\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
+        let reader = BackendReader::new(buf.as_slice());
         let (_res, br) = reader
-            .read(true)
+            .read(true, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -571,8 +547,8 @@ mod test {
             01234\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
-        let result = reader.read(true).await;
+        let reader = BackendReader::new(buf.as_slice());
+        let result = reader.read(true, 128).await;
 
         assert!(result.is_err());
 
@@ -582,8 +558,8 @@ mod test {
             \r\n\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
-        let result = reader.read(true).await;
+        let reader = BackendReader::new(buf.as_slice());
+        let result = reader.read(true, 128).await;
 
         assert!(result.is_err(),);
     }
@@ -603,8 +579,8 @@ mod test {
             01234\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
-        let result = reader.read(true).await;
+        let reader = BackendReader::new(buf.as_slice());
+        let result = reader.read(true, 128).await;
 
         assert!(result.is_err());
 
@@ -614,8 +590,8 @@ mod test {
             \r\n\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
-        let result = reader.read(true).await;
+        let reader = BackendReader::new(buf.as_slice());
+        let result = reader.read(true, 128).await;
 
         assert!(result.is_err(),);
     }
@@ -634,8 +610,8 @@ mod test {
             \r\n\
             ";
 
-        let reader = BackendReader::new(buf.as_slice(), 128);
-        let result = reader.read(true).await.expect("failed to read");
+        let reader = BackendReader::new(buf.as_slice());
+        let result = reader.read(true, 128).await.expect("failed to read");
 
         let (res, reader) = result.try_into_informational().expect("not informational");
         let xres = res.get_header("x-res").expect("header not present");

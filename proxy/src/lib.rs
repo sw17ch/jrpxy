@@ -248,7 +248,7 @@ where
         let allow_response_body = proxy_request.req().method() != b"HEAD".as_slice();
 
         let (backend_reader, backend_writer) = backend_provider.get_connection().await?;
-        let backend_reader = BackendReader::new(backend_reader, options.max_head_length);
+        let backend_reader = BackendReader::new(backend_reader);
         let backend_writer = BackendWriter::new(backend_writer);
 
         let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
@@ -307,7 +307,9 @@ where
             backend_provider,
         } = self;
 
-        let response_stream = backend_reader.read(allow_response_body).await?;
+        let response_stream = backend_reader
+            .read(allow_response_body, options.max_head_length)
+            .await?;
         let response_stream = ProxyResponseStream::new(response_stream, &options.received_by);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
@@ -994,8 +996,8 @@ mod test {
     }
 
     async fn make_proxy_response(raw: &[u8]) -> ProxyResponseStream<&[u8]> {
-        let reader = BackendReader::new(raw, 8192);
-        let stream = reader.read(true).await.expect("valid response");
+        let reader = BackendReader::new(raw);
+        let stream = reader.read(true, 8192).await.expect("valid response");
         ProxyResponseStream::new(stream, "proxy.example.com")
     }
 
@@ -1374,8 +1376,8 @@ mod test {
             Content-Length: 0\r\n\
             \r\n";
 
-        let reader = BackendReader::new(raw.as_slice(), 8192);
-        let stream = reader.read(true).await.expect("valid response");
+        let reader = BackendReader::new(raw.as_slice());
+        let stream = reader.read(true, 8192).await.expect("valid response");
         let proxy_stream = ProxyResponseStream::new(stream, "proxy.example.com");
 
         let (info, next_reader) = into_informational(proxy_stream);
@@ -1447,8 +1449,8 @@ mod test {
             X-Seq: 3\r\n\
             \r\n";
 
-        let reader = BackendReader::new(raw.as_slice(), 8192);
-        let stream = reader.read(true).await.expect("valid response");
+        let reader = BackendReader::new(raw.as_slice());
+        let stream = reader.read(true, 8192).await.expect("valid response");
         let proxy_stream = ProxyResponseStream::new(stream, "proxy.example.com");
 
         let (info1, r1) = into_informational(proxy_stream);
