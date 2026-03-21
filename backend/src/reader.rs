@@ -94,13 +94,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         // an unconditional GET. RFC 9110 section 8.6 says the same about 304
         // and content-length. Therefor, we only reject status codes with
         // framing that are 100..=199 and 204.
-        let expect_body = allow_body
-            && match res.code() {
-                100..200 => false,
-                204 => false,
-                304 => false,
-                _ => true,
-            };
+        let expect_body = allow_body && !matches!(res.code(), 100..200 | 204 | 304);
 
         if let Some(info_code) = is_informational {
             return match info_code {
@@ -145,9 +139,9 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         Ok(ResponseStream::Response(BackendResponse { res, reader }))
     }
 
-    pub fn into_inner(self) -> I {
-        let Self { io, .. } = self;
-        io
+    pub fn into_parts(self) -> (I, BytesMut) {
+        let Self { io, buffer } = self;
+        (io, buffer.into_inner())
     }
 }
 
@@ -314,8 +308,9 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let rest = reader.into_inner();
-        assert!(rest.is_empty());
+        let (rest_unread, rest_buffered) = reader.into_parts();
+        assert!(rest_unread.is_empty());
+        assert!(rest_buffered.is_empty());
     }
 
     #[tokio::test]
@@ -360,8 +355,9 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let rest = reader.into_inner();
-        assert!(rest.is_empty());
+        let (rest_unread, rest_buffered) = reader.into_parts();
+        assert!(rest_unread.is_empty());
+        assert!(rest_buffered.is_empty());
     }
 
     #[tokio::test]
@@ -400,8 +396,9 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let rest = reader.into_inner();
-        assert!(rest.is_empty());
+        let (rest_unread, rest_buffered) = reader.into_parts();
+        assert!(rest_unread.is_empty());
+        assert!(rest_buffered.is_empty());
     }
 
     #[tokio::test]
@@ -452,8 +449,9 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let rest = reader.into_inner();
-        assert!(rest.is_empty());
+        let (rest_unread, rest_buffered) = reader.into_parts();
+        assert!(rest_unread.is_empty());
+        assert!(rest_buffered.is_empty());
     }
 
     #[tokio::test]
@@ -480,8 +478,10 @@ mod test {
 
         assert!(br.read(5).await.expect("can read").is_none());
         let reader = br.drain().await.expect("failed to drian");
-        let rest = reader.into_inner();
-        assert!(rest.is_empty());
+
+        let (rest_unread, rest_buffered) = reader.into_parts();
+        assert!(rest_unread.is_empty());
+        assert!(rest_buffered.is_empty());
     }
 
     #[tokio::test]
@@ -508,8 +508,10 @@ mod test {
 
         assert!(br.read(5).await.expect("can read").is_none());
         let reader = br.drain().await.expect("failed to drian");
-        let rest = reader.into_inner();
-        assert!(rest.is_empty());
+
+        let (rest_unread, rest_buffered) = reader.into_parts();
+        assert!(rest_unread.is_empty());
+        assert!(rest_buffered.is_empty());
     }
 
     #[tokio::test]
@@ -628,5 +630,30 @@ mod test {
         let xres = res.get_header("x-res").expect("header not present");
         assert_eq!(xres, b"3".as_ref());
         let _out = body_reader.drain().await.expect("failed to drain");
+    }
+
+    #[tokio::test]
+    async fn status_304_has_no_body() {
+        let buf = b"\
+            HTTP/1.1 304 Ok\r\n\
+            content-length: 200\r\n\
+            \r\n\
+            dangling-ignored-data\
+            ";
+        let reader = BackendReader::new(buf.as_slice());
+        let result = reader.read(true, 128).await.expect("failed to read");
+        let response = result.try_into_response().expect("not a response");
+        let (_response, mut body_reader) = response.into_parts();
+        let body = body_reader.read(200).await.expect("failed to read body");
+        assert!(body.is_none());
+        let reader = body_reader.drain().await.expect("failed to drain");
+
+        let (rest_unread, rest_buffered) = reader.into_parts();
+        let rest = rest_unread
+            .iter()
+            .chain(rest_buffered.as_ref().iter())
+            .map(|b| *b)
+            .collect::<Vec<_>>();
+        assert_eq!("dangling-ignored-data".as_bytes(), rest);
     }
 }

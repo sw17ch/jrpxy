@@ -19,7 +19,7 @@ use jrpxy_http_message::{
     message::{Request, Response},
     version::HttpVersion,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
@@ -50,18 +50,20 @@ pub enum ProxyCopyError {
 type ProxyResult<T> = std::result::Result<T, ProxyError>;
 
 pub trait BackendProxyProvider {
-    type BackendReader;
-    type BackendWriter;
+    /// The backend reader inner type
+    type BR;
+    /// The backend writer inner type
+    type BW;
 
     fn get_connection(
         &mut self,
-    ) -> impl Future<Output = ProxyResult<(Self::BackendReader, Self::BackendWriter)>>;
+    ) -> impl Future<Output = ProxyResult<(BackendReader<Self::BR>, BackendWriter<Self::BW>)>>;
 
-    fn give_connection(&mut self, reader: Self::BackendReader, writer: Self::BackendWriter);
+    fn give_connection(&mut self, reader: BackendReader<Self::BR>, writer: BackendWriter<Self::BW>);
 }
 
 pub struct OneshotBackend<BR, BW> {
-    inner: Option<(BR, BW)>,
+    inner: Option<(BackendReader<BR>, BackendWriter<BW>)>,
 }
 
 pin_project_lite::pin_project! {
@@ -71,10 +73,17 @@ pin_project_lite::pin_project! {
     }
 }
 
-impl<BR, BW> OneshotBackend<BR, BW> {
+impl<BR, BW> OneshotBackend<BR, BW>
+where
+    BR: AsyncReadExt + Unpin,
+    BW: AsyncWrite + Unpin,
+{
     pub fn new(backend_reader: BR, backend_writer: BW) -> Self {
         Self {
-            inner: Some((backend_reader, backend_writer)),
+            inner: Some((
+                BackendReader::new(backend_reader),
+                BackendWriter::new(backend_writer),
+            )),
         }
     }
 }
@@ -97,16 +106,16 @@ impl<BR: Unpin, BW: Unpin> Future for OneshotConnector<BR, BW> {
 }
 
 impl<BR: Unpin, BW: Unpin> BackendProxyProvider for OneshotBackend<BR, BW> {
-    type BackendReader = BR;
-    type BackendWriter = BW;
+    type BR = BR;
+    type BW = BW;
 
     fn get_connection(
         &mut self,
     ) -> impl Future<
         Output = Result<
             (
-                <Self as BackendProxyProvider>::BackendReader,
-                <Self as BackendProxyProvider>::BackendWriter,
+                BackendReader<<Self as BackendProxyProvider>::BR>,
+                BackendWriter<<Self as BackendProxyProvider>::BW>,
             ),
             ProxyError,
         >,
@@ -116,7 +125,11 @@ impl<BR: Unpin, BW: Unpin> BackendProxyProvider for OneshotBackend<BR, BW> {
         }
     }
 
-    fn give_connection(&mut self, reader: Self::BackendReader, writer: Self::BackendWriter) {
+    fn give_connection(
+        &mut self,
+        reader: BackendReader<Self::BR>,
+        writer: BackendWriter<Self::BW>,
+    ) {
         self.inner = Some((reader, writer));
     }
 }
@@ -162,7 +175,7 @@ where
     FW: AsyncWriteExt + Unpin,
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BackendReader = BR, BackendWriter = BW>,
+    BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
     pub fn new(
         frontend_reader: FR,
@@ -233,7 +246,7 @@ impl<FR, FW, BR, BW, BP> ReadFrontendRequest<FR, FW, BP>
 where
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BackendReader = BR, BackendWriter = BW>,
+    BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
     pub async fn write_backend_request(
         self,
@@ -248,8 +261,6 @@ where
         let allow_response_body = proxy_request.req().method() != b"HEAD".as_slice();
 
         let (backend_reader, backend_writer) = backend_provider.get_connection().await?;
-        let backend_reader = BackendReader::new(backend_reader);
-        let backend_writer = BackendWriter::new(backend_writer);
 
         let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
 
@@ -277,13 +288,7 @@ pub struct WroteBackendRequest<FR, FW, BR, BW, BP> {
     backend_provider: BP,
 }
 
-pub enum BackendResponseStatus<
-    FR,
-    FW,
-    BR,
-    BW,
-    BP: BackendProxyProvider<BackendReader = BR, BackendWriter = BW>,
-> {
+pub enum BackendResponseStatus<FR, FW, BR, BW, BP: BackendProxyProvider<BR = BR, BW = BW>> {
     Informational(ReadBackendInformationalResponse<FR, FW, BR, BW, BP>),
     Response(ReadBackendResponse<FR, FW, BR, BW, BP>),
 }
@@ -292,7 +297,7 @@ impl<FR, FW, BR, BW, BP> WroteBackendRequest<FR, FW, BR, BW, BP>
 where
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BackendReader = BR, BackendWriter = BW>,
+    BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
     pub async fn read_backend_response(
         self,
@@ -343,7 +348,7 @@ pub struct ReadBackendInformationalResponse<
     FW,
     BR,
     BW,
-    BP: BackendProxyProvider<BackendReader = BR, BackendWriter = BW>,
+    BP: BackendProxyProvider<BR = BR, BW = BW>,
 > {
     proxy_informational_response: ProxyInformationalResponse,
     frontend_body_reader: FrontendBodyReader<FR>,
@@ -359,7 +364,7 @@ where
     FW: AsyncWriteExt + Unpin,
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BackendReader = BR, BackendWriter = BW>,
+    BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
     pub fn as_response(&self) -> &ProxyInformationalResponse {
         &self.proxy_informational_response
@@ -419,13 +424,7 @@ where
     }
 }
 
-pub struct ReadBackendResponse<
-    FR,
-    FW,
-    BR,
-    BW,
-    BP: BackendProxyProvider<BackendReader = BR, BackendWriter = BW>,
-> {
+pub struct ReadBackendResponse<FR, FW, BR, BW, BP: BackendProxyProvider<BR = BR, BW = BW>> {
     frontend_body_reader: FrontendBodyReader<FR>,
     frontend_writer: FrontendWriter<FW>,
     proxy_response: ProxyResponse<BR>,
@@ -440,7 +439,7 @@ where
     FW: AsyncWriteExt + Unpin,
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BackendReader = BR, BackendWriter = BW> + Unpin,
+    BP: BackendProxyProvider<BR = BR, BW = BW> + Unpin,
 {
     pub fn as_response(&self) -> &ProxyResponse<BR> {
         &self.proxy_response
@@ -577,7 +576,7 @@ where
             None => return Err(ProxyError::FrontendCopyIncomplete),
         };
 
-        backend_provider.give_connection(backend_reader.into_inner(), backend_writer.into_inner());
+        backend_provider.give_connection(backend_reader, backend_writer);
 
         Ok(ProxyClient {
             frontend_reader,
@@ -1155,6 +1154,7 @@ mod test {
         let (_frontend_reader, frontend_writer, backend_provider) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
         let (_backend_reader, backend_writer) = backend_provider.inner.unwrap();
+        let backend_writer = backend_writer.into_inner();
 
         let expected_backend_writer = b"\
             GET / HTTP/1.1\r\n\
