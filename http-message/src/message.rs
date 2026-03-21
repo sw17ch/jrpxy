@@ -349,6 +349,22 @@ impl Response {
     }
 }
 
+impl std::fmt::Debug for Response {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut f = f.debug_struct("Response");
+        f.field(":version", &self.inner.version)
+            .field(":code", &self.inner.code)
+            .field(":reason", &self.inner.reason);
+        for (n, v) in self.inner.headers.iter() {
+            let Ok(n) = std::str::from_utf8(n) else {
+                continue;
+            };
+            f.field(n, v);
+        }
+        f.finish()
+    }
+}
+
 fn populate_headers(header_offsets: &[HeaderOffset], head_buf: &Bytes) -> Headers {
     let mut headers = Headers::with_capacity(header_offsets.len());
     for h in header_offsets.iter() {

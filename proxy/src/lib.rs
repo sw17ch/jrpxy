@@ -142,6 +142,11 @@ pub struct ProxyOptions {
     pub received_by: Cow<'static, str>,
 }
 
+struct ClientOptions {
+    is_head: bool,
+    version: HttpVersion,
+}
+
 impl Default for ProxyOptions {
     fn default() -> Self {
         Self {
@@ -204,9 +209,14 @@ where
         } = self;
         let req = frontend_reader.read().await?;
         let proxy_request = ProxyRequest::new(req, &options.received_by);
+        let is_head = proxy_request.req().method() == b"HEAD".as_slice();
 
         Ok(ReadFrontendRequest {
             options,
+            client_options: ClientOptions {
+                is_head,
+                version: proxy_request.req().version(),
+            },
             proxy_request,
             frontend_writer,
             backend_provider,
@@ -219,6 +229,7 @@ pub struct ReadFrontendRequest<FR, FW, BP> {
     frontend_writer: FrontendWriter<FW>,
     backend_provider: BP,
     options: ProxyOptions,
+    client_options: ClientOptions,
 }
 
 impl<FR, FW, BP> ReadFrontendRequest<FR, FW, BP> {
@@ -255,12 +266,11 @@ where
     ) -> ProxyResult<WroteBackendRequest<FR, FW, BR, BW, BP>> {
         let Self {
             options,
+            client_options,
             proxy_request,
             frontend_writer,
             mut backend_provider,
         } = self;
-
-        let allow_response_body = proxy_request.req().method() != b"HEAD".as_slice();
 
         let (backend_reader, backend_writer) = backend_provider.get_connection().await?;
 
@@ -270,7 +280,7 @@ where
 
         Ok(WroteBackendRequest {
             options,
-            allow_response_body,
+            client_options,
             frontend_body_reader,
             frontend_writer,
             backend_reader,
@@ -282,7 +292,7 @@ where
 
 pub struct WroteBackendRequest<FR, FW, BR, BW, BP> {
     options: ProxyOptions,
-    allow_response_body: bool,
+    client_options: ClientOptions,
     frontend_body_reader: FrontendBodyReader<FR>,
     frontend_writer: FrontendWriter<FW>,
     backend_reader: BackendReader<BR>,
@@ -290,7 +300,7 @@ pub struct WroteBackendRequest<FR, FW, BR, BW, BP> {
     backend_provider: BP,
 }
 
-pub enum BackendResponseStream<FR, FW, BR, BW, BP: BackendProxyProvider<BR = BR, BW = BW>> {
+pub enum BackendResponseStream<FR, FW, BR, BW, BP> {
     Informational(ReadBackendInformationalResponse<FR, FW, BR, BW, BP>),
     Response(ReadBackendResponse<FR, FW, BR, BW, BP>),
 }
@@ -306,7 +316,7 @@ where
     ) -> ProxyResult<BackendResponseStream<FR, FW, BR, BW, BP>> {
         let Self {
             options,
-            allow_response_body,
+            client_options,
             frontend_body_reader,
             frontend_writer,
             backend_reader,
@@ -315,13 +325,14 @@ where
         } = self;
 
         let response_stream = backend_reader
-            .read(allow_response_body, options.max_head_length)
+            .read(!client_options.is_head, options.max_head_length)
             .await?;
         let response_stream = ProxyResponseStream::new(response_stream, &options.received_by);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 BackendResponseStream::Response(ReadBackendResponse {
                     options,
+                    client_options,
                     frontend_body_reader,
                     frontend_writer,
                     proxy_response,
@@ -334,6 +345,7 @@ where
                 proxy_stream_reader,
             ) => BackendResponseStream::Informational(ReadBackendInformationalResponse {
                 options,
+                client_options,
                 proxy_informational_response,
                 frontend_body_reader,
                 frontend_writer,
@@ -345,13 +357,21 @@ where
     }
 }
 
-pub struct ReadBackendInformationalResponse<
-    FR,
-    FW,
-    BR,
-    BW,
-    BP: BackendProxyProvider<BR = BR, BW = BW>,
-> {
+pub enum InformationalForwardResult<FR, FW, BR, BW, BP> {
+    Forwarded(BackendResponseStream<FR, FW, BR, BW, BP>),
+    Dropped(BackendResponseStream<FR, FW, BR, BW, BP>),
+}
+
+impl<FR, FW, BR, BW, BP> InformationalForwardResult<FR, FW, BR, BW, BP> {
+    pub fn into_inner(self) -> BackendResponseStream<FR, FW, BR, BW, BP> {
+        match self {
+            InformationalForwardResult::Forwarded(r) => r,
+            InformationalForwardResult::Dropped(r) => r,
+        }
+    }
+}
+
+pub struct ReadBackendInformationalResponse<FR, FW, BR, BW, BP> {
     proxy_informational_response: ProxyInformationalResponse,
     frontend_body_reader: FrontendBodyReader<FR>,
     frontend_writer: FrontendWriter<FW>,
@@ -359,6 +379,7 @@ pub struct ReadBackendInformationalResponse<
     backend_body_writer: BackendBodyWriter<BW>,
     backend_provider: BP,
     options: ProxyOptions,
+    client_options: ClientOptions,
 }
 
 impl<FR, FW, BR, BW, BP> ReadBackendInformationalResponse<FR, FW, BR, BW, BP>
@@ -376,100 +397,73 @@ where
         &mut self.proxy_informational_response
     }
 
-    pub async fn drop_informational_response(
-        self,
-    ) -> ProxyResult<BackendResponseStream<FR, FW, BR, BW, BP>> {
-        let Self {
-            proxy_informational_response: _,
-            frontend_body_reader,
-            frontend_writer,
-            proxy_stream_reader,
-            backend_body_writer,
-            backend_provider,
-            options,
-        } = self;
-
-        match proxy_stream_reader.read().await? {
-            ProxyResponseStream::Response(proxy_response) => {
-                Ok(BackendResponseStream::Response(ReadBackendResponse {
-                    frontend_body_reader,
-                    frontend_writer,
-                    proxy_response,
-                    backend_body_writer,
-                    backend_provider,
-                    options,
-                }))
-            }
-            ProxyResponseStream::Informational(
-                proxy_informational_response,
-                proxy_stream_reader,
-            ) => Ok(BackendResponseStream::Informational(
-                ReadBackendInformationalResponse {
-                    proxy_informational_response,
-                    frontend_body_reader,
-                    frontend_writer,
-                    proxy_stream_reader,
-                    backend_body_writer,
-                    backend_provider,
-                    options,
-                },
-            )),
-        }
-    }
-
     pub async fn forward_informational_response(
         self,
-    ) -> ProxyResult<BackendResponseStream<FR, FW, BR, BW, BP>> {
+    ) -> ProxyResult<InformationalForwardResult<FR, FW, BR, BW, BP>> {
         let Self {
             proxy_informational_response,
             frontend_body_reader,
-            frontend_writer,
+            mut frontend_writer,
             proxy_stream_reader,
             backend_body_writer,
             backend_provider,
             options,
+            client_options,
         } = self;
 
-        let response = proxy_informational_response.into_frontend_response();
-        let frontend_body_writer = frontend_writer.send_as_bodyless(&response).await?;
-        let frontend_writer = frontend_body_writer.finish().await?;
+        let client_supports_informational_response = client_options.version == HttpVersion::Http11;
 
-        match proxy_stream_reader.read().await? {
+        if client_supports_informational_response {
+            let response = proxy_informational_response.into_frontend_response();
+            let frontend_body_writer = frontend_writer.send_as_bodyless(&response).await?;
+            frontend_writer = frontend_body_writer.finish().await?;
+        } else {
+            drop(proxy_informational_response);
+        }
+
+        let response_stream = match proxy_stream_reader.read().await? {
             ProxyResponseStream::Response(proxy_response) => {
-                Ok(BackendResponseStream::Response(ReadBackendResponse {
+                BackendResponseStream::Response(ReadBackendResponse {
                     frontend_body_reader,
                     frontend_writer,
                     proxy_response,
                     backend_body_writer,
                     backend_provider,
                     options,
-                }))
+                    client_options,
+                })
             }
             ProxyResponseStream::Informational(
                 proxy_informational_response,
                 proxy_stream_reader,
-            ) => Ok(BackendResponseStream::Informational(
-                ReadBackendInformationalResponse {
-                    proxy_informational_response,
-                    frontend_body_reader,
-                    frontend_writer,
-                    proxy_stream_reader,
-                    backend_body_writer,
-                    backend_provider,
-                    options,
-                },
-            )),
-        }
+            ) => BackendResponseStream::Informational(ReadBackendInformationalResponse {
+                proxy_informational_response,
+                frontend_body_reader,
+                frontend_writer,
+                proxy_stream_reader,
+                backend_body_writer,
+                backend_provider,
+                options,
+                client_options,
+            }),
+        };
+
+        Ok(if client_supports_informational_response {
+            InformationalForwardResult::Forwarded(response_stream)
+        } else {
+            InformationalForwardResult::Dropped(response_stream)
+        })
     }
 }
 
-pub struct ReadBackendResponse<FR, FW, BR, BW, BP: BackendProxyProvider<BR = BR, BW = BW>> {
+pub struct ReadBackendResponse<FR, FW, BR, BW, BP> {
     frontend_body_reader: FrontendBodyReader<FR>,
     frontend_writer: FrontendWriter<FW>,
     proxy_response: ProxyResponse<BR>,
     backend_body_writer: BackendBodyWriter<BW>,
     backend_provider: BP,
     options: ProxyOptions,
+    client_options: ClientOptions,
 }
 
 impl<FR, FW, BR, BW, BP> ReadBackendResponse<FR, FW, BR, BW, BP>
@@ -496,7 +490,14 @@ where
             mut backend_body_writer,
             mut backend_provider,
             options,
+            client_options,
         } = self;
+
+        let _ = {
+            // TODO: use client_options to decide if we need to buffer the
+            // response (chunk-encoded) or if we can send back a content-length.
+            client_options
+        };
 
         let (response, mut backend_body_reader) = proxy_response.into_frontend_response();
         let mut frontend_body_writer = frontend_writer.send_as_same(&response).await?;
@@ -553,7 +554,9 @@ where
                                     ret = Err(ProxyCopyError::from(e));
                                 }
                             },
-                            Err(e) => ret = Err(ProxyCopyError::from(e)),
+                            Err(e) => {
+                                ret = Err(ProxyCopyError::from(e));
+                            }
                         }
                         break;
                     }
@@ -1137,7 +1140,7 @@ mod test {
             .await
             .expect("failed to forward informational response");
 
-        let rbr = match be_res_stat {
+        let rbr = match be_res_stat.into_inner() {
             BackendResponseStream::Response(rbr) => rbr,
             BackendResponseStream::Informational(_rbir) => {
                 panic!("incorrect response type")
@@ -1223,7 +1226,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_oneshot_transaction_drop_informational() {
+    async fn test_oneshot_transaction_drops_informational_for_http10_client() {
         let frontend_reader = b"\
             GET / HTTP/1.0\r\n\
             Host: example.com\r\n\
@@ -1268,12 +1271,17 @@ mod test {
             BackendResponseStream::Informational(rbir) => rbir,
         };
 
-        // We drop the informational response rather than forwarding it to the
-        // client (our client is HTTP/1.0 and doesn't support 1xx responses).
-        let be_res_stat = rbir
-            .drop_informational_response()
+        // We attempt to forward the informational to the HTTP/1.0 client.
+        let ifr = rbir
+            .forward_informational_response()
             .await
-            .expect("failed to drop informational response");
+            .expect("failed to forward");
+        let be_res_stat = match ifr {
+            crate::InformationalForwardResult::Dropped(r) => r,
+            crate::InformationalForwardResult::Forwarded(_r) => {
+                panic!("forwarded resposne when we expected a drop")
+            }
+        };
 
         // Now we can read the next response from the origin. This one is a
         // normal response.
