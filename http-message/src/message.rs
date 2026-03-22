@@ -41,38 +41,59 @@ pub enum BuildError {
 }
 
 /// A buffer type that carries no type or lifetime information that has the same
-/// size and alignment as [`httparse::Header`]. We do cast of this type to the
-/// type needed for parsing.
+/// size and alignment as [`httparse::Header`]. We use this type to avoid
+/// lifetime problems that usually arise from trying to reuse header allocations
+/// across parse attempts.
 mod header_buf {
     use std::mem::MaybeUninit;
 
     use httparse::Header;
 
+    /// A struct used for allocation only. Its internal representation should
+    /// never be used.
     #[derive(Copy, Clone)]
     pub struct HeaderBuf {
         _do_not_use_name: &'static str,
         _do_not_use_value: &'static [u8],
     }
+    // These cases must be true for this to be safe.
     const _HEADER_BUF_SIZE_MATCH: () = const {
         assert!(std::mem::size_of::<HeaderBuf>() == std::mem::size_of::<httparse::Header<'_>>());
         assert!(std::mem::align_of::<HeaderBuf>() == std::mem::align_of::<httparse::Header<'_>>());
     };
 
-    /// Cast the opaque type to [`httpparse::Header`]. The `lifetime_buf`
-    /// argument is ignored other than to convey its lifetime to the return
-    /// type.
-    ///
-    /// The first argument should be the buffer from which we will populate the
-    /// returned headers (or at least have the same lifetime as the buffer that
-    /// will be parsed).
-    pub(crate) unsafe fn as_headers<'s, 'b>(
-        lifetime_buf: &'b [u8],
-        opaque: &'s mut [MaybeUninit<HeaderBuf>],
-    ) -> &'s mut [MaybeUninit<Header<'b>>] {
-        let _ = lifetime_buf;
-        let ptr = opaque.as_mut_ptr() as *mut MaybeUninit<httparse::Header<'b>>;
-        let len = opaque.len();
-        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    /// Parse `buf` into `req` using `header_slots` as the space into which we
+    /// will record headers. The lifetime of `req` ensures that `header_slots`
+    /// and `buf` are alive long enough for it to be safe to access the headers
+    /// from `req` once parsed.
+    pub(crate) fn parse_request<'b, 'h>(
+        buf: &'b [u8],
+        header_slots: &'h mut [MaybeUninit<HeaderBuf>],
+        req: &mut httparse::Request<'h, 'b>,
+    ) -> Result<httparse::Status<usize>, httparse::Error> {
+        // SAFETY: HeaderBuf and Header<'b> have the same size and alignment
+        // (verified by the const assertion above). The slice resulting from the
+        // cast does not escape this function; it is consumed immediately by
+        // httparse, which writes Header<'b> values whose 'b is tied to `buf`.
+        let headers = unsafe {
+            let ptr = header_slots.as_mut_ptr() as *mut MaybeUninit<Header<'b>>;
+            std::slice::from_raw_parts_mut(ptr, header_slots.len())
+        };
+        httparse::ParserConfig::default().parse_request_with_uninit_headers(req, buf, headers)
+    }
+
+    /// See docs for [`parse_request`].
+    pub(crate) fn parse_response<'b>(
+        buf: &'b [u8],
+        opaque: &mut [MaybeUninit<HeaderBuf>],
+        res: &mut httparse::Response<'_, 'b>,
+    ) -> Result<httparse::Status<usize>, httparse::Error> {
+        // SAFETY: same as parse_request.
+        let headers = unsafe {
+            let ptr = opaque.as_mut_ptr() as *mut MaybeUninit<Header<'b>>;
+            std::slice::from_raw_parts_mut(ptr, opaque.len())
+        };
+        httparse::ParserConfig::default().parse_response_with_uninit_headers(res, buf, headers)
     }
 }
 pub use header_buf::HeaderBuf;
@@ -130,14 +151,8 @@ impl<'h> RequestOffset<'h> {
     ) -> MessageResult<Option<(Self, usize)>> {
         debug_assert_eq!(parse_headers.len(), out_headers.len());
 
-        let parse_headers = unsafe { header_buf::as_headers(buf, parse_headers) };
-
         let mut req = HttparseRequest::new(&mut []);
-        match httparse::ParserConfig::default().parse_request_with_uninit_headers(
-            &mut req,
-            buf,
-            parse_headers,
-        ) {
+        match header_buf::parse_request(buf, parse_headers, &mut req) {
             Ok(httparse::Status::Partial) => Ok(None),
             Err(e) => Err(e.into()),
             Ok(httparse::Status::Complete(head_len)) => {
@@ -177,14 +192,8 @@ impl<'h> ResponseOffset<'h> {
     ) -> MessageResult<Option<(Self, usize)>> {
         debug_assert_eq!(parse_headers.len(), out_headers.len());
 
-        let parse_headers = unsafe { header_buf::as_headers(buf, parse_headers) };
-
         let mut res = HttparseResponse::new(&mut []);
-        match httparse::ParserConfig::default().parse_response_with_uninit_headers(
-            &mut res,
-            buf,
-            parse_headers,
-        ) {
+        match header_buf::parse_response(buf, parse_headers, &mut res) {
             Ok(httparse::Status::Partial) => Ok(None),
             Err(e) => Err(e.into()),
             Ok(httparse::Status::Complete(head_len)) => {
