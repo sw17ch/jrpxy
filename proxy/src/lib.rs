@@ -411,6 +411,8 @@ where
             client_options,
         } = self;
 
+        // RFC9110 section 15.2 states that a server MUST NOT send any 1xx
+        // response to a HTTP/1.0 client.
         let client_supports_informational_response = client_options.version == HttpVersion::Http11;
 
         if client_supports_informational_response {
