@@ -110,6 +110,56 @@ impl ParseSlots {
             out_headers: vec![MaybeUninit::uninit(); slot_count],
         }
     }
+
+    pub fn parse_request(&mut self, buf: &mut Buffer) -> MessageResult<Option<Request>> {
+        let Self {
+            parse_headers,
+            out_headers,
+        } = self;
+        match RequestOffset::parse(&*buf, parse_headers, out_headers)? {
+            None => Ok(None),
+            Some((req, head_len)) => {
+                let head_buf = buf.split_to(head_len).freeze();
+                let method = req.method.slice_from(&head_buf);
+                let path = req.path.slice_from(&head_buf);
+                let version = req.version;
+                let headers = populate_headers(req.headers, &head_buf);
+                Ok(Some(Request {
+                    inner: Box::new(RequestInner {
+                        method,
+                        path,
+                        version,
+                        headers,
+                    }),
+                }))
+            }
+        }
+    }
+
+    pub fn parse_response(&mut self, buf: &mut Buffer) -> MessageResult<Option<Response>> {
+        let Self {
+            parse_headers,
+            out_headers,
+        } = self;
+        match ResponseOffset::parse(&*buf, parse_headers, out_headers)? {
+            None => Ok(None),
+            Some((res, head_len)) => {
+                let head_buf = buf.split_to(head_len).freeze();
+                let version = res.version;
+                let code = res.code;
+                let reason = res.reason.slice_from(&head_buf);
+                let headers = populate_headers(res.headers, &head_buf);
+                Ok(Some(Response {
+                    inner: Box::new(ResponseInner {
+                        version,
+                        code,
+                        reason,
+                        headers,
+                    }),
+                }))
+            }
+        }
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -262,40 +312,6 @@ pub struct Request {
 }
 
 impl Request {
-    /// Parse using the two pre-allocated slices. The slices should be the same
-    /// length. `parse_headers` is temporary scratch space while `out_headers`
-    /// is the slice in which the offsets and lengths of parsed elements will be
-    /// stored.
-    pub fn parse_with_slots(
-        buf: &mut Buffer,
-        parse_slots: &mut ParseSlots,
-    ) -> MessageResult<Option<Self>> {
-        let ParseSlots {
-            parse_headers,
-            out_headers,
-        } = parse_slots;
-        match RequestOffset::parse(&*buf, parse_headers, out_headers)? {
-            None => Ok(None),
-            Some((req, head_len)) => {
-                let head_buf = buf.split_to(head_len).freeze();
-                let method = req.method.slice_from(&head_buf);
-                let path = req.path.slice_from(&head_buf);
-                let version = req.version;
-
-                let headers = populate_headers(req.headers, &head_buf);
-
-                Ok(Some(Request {
-                    inner: Box::new(RequestInner {
-                        method,
-                        path,
-                        version,
-                        headers,
-                    }),
-                }))
-            }
-        }
-    }
-
     pub fn method(&self) -> &Bytes {
         &self.inner.method
     }
@@ -363,40 +379,6 @@ pub struct Response {
 }
 
 impl Response {
-    /// Parse using the two pre-allocated slices. The slices should be the same
-    /// length. `parse_headers` is temporary scratch space while `out_headers`
-    /// is the slice in which the offsets and lengths of parsed elements will be
-    /// stored.
-    pub fn parse_with_slots(
-        buf: &mut Buffer,
-        parse_slots: &mut ParseSlots,
-    ) -> MessageResult<Option<Self>> {
-        let ParseSlots {
-            parse_headers,
-            out_headers,
-        } = parse_slots;
-        match ResponseOffset::parse(&*buf, parse_headers, out_headers)? {
-            None => Ok(None),
-            Some((res, head_len)) => {
-                let head_buf = buf.split_to(head_len).freeze();
-                let version = res.version;
-                let code = res.code;
-                let reason = res.reason.slice_from(&head_buf);
-
-                let headers = populate_headers(res.headers, &head_buf);
-
-                Ok(Some(Response {
-                    inner: Box::new(ResponseInner {
-                        version,
-                        code,
-                        reason,
-                        headers,
-                    }),
-                }))
-            }
-        }
-    }
-
     pub fn version(&self) -> HttpVersion {
         self.inner.version
     }

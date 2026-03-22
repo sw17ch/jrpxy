@@ -32,7 +32,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     async fn head(&mut self, max_head_length: usize) -> BackendResult<Response> {
         let mut parse_slots = ParseSlots::new(Self::MAX_HEADERS);
         loop {
-            if let Some(res) = Response::parse_with_slots(&mut self.buffer, &mut parse_slots)
+            if let Some(res) = parse_slots.parse_response(&mut self.buffer)
                 .map_err(BackendError::HttpResponseParseError)?
             {
                 return Ok(res);

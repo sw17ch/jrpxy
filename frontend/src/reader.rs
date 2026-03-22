@@ -92,7 +92,7 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
     pub(crate) async fn head(&mut self) -> FrontendResult<Request> {
         let mut parse_slots = ParseSlots::new(Self::MAX_HEADERS);
         loop {
-            if let Some(req) = Request::parse_with_slots(&mut self.buffer, &mut parse_slots)
+            if let Some(req) = parse_slots.parse_request(&mut self.buffer)
                 .map_err(FrontendError::HttpRequestParseError)?
             {
                 return Ok(req);
