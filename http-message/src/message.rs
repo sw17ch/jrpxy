@@ -40,6 +40,43 @@ pub enum BuildError {
     InvalidMethod(String),
 }
 
+/// A buffer type that carries no type or lifetime information that has the same
+/// size and alignment as [`httparse::Header`]. We do cast of this type to the
+/// type needed for parsing.
+mod header_buf {
+    use std::mem::MaybeUninit;
+
+    use httparse::Header;
+
+    #[derive(Copy, Clone)]
+    pub struct HeaderBuf {
+        _do_not_use_name: &'static str,
+        _do_not_use_value: &'static [u8],
+    }
+    const _HEADER_BUF_SIZE_MATCH: () = const {
+        assert!(std::mem::size_of::<HeaderBuf>() == std::mem::size_of::<httparse::Header<'_>>());
+        assert!(std::mem::align_of::<HeaderBuf>() == std::mem::align_of::<httparse::Header<'_>>());
+    };
+
+    /// Cast the opaque type to [`httpparse::Header`]. The `lifetime_buf`
+    /// argument is ignored other than to convey its lifetime to the return
+    /// type.
+    ///
+    /// The first argument should be the buffer from which we will populate the
+    /// returned headers (or at least have the same lifetime as the buffer that
+    /// will be parsed).
+    pub(crate) unsafe fn as_headers<'s, 'b>(
+        lifetime_buf: &'b [u8],
+        opaque: &'s mut [MaybeUninit<HeaderBuf>],
+    ) -> &'s mut [MaybeUninit<Header<'b>>] {
+        let _ = lifetime_buf;
+        let ptr = opaque.as_mut_ptr() as *mut MaybeUninit<httparse::Header<'b>>;
+        let len = opaque.len();
+        unsafe { std::slice::from_raw_parts_mut(ptr, len) }
+    }
+}
+pub use header_buf::HeaderBuf;
+
 #[derive(Copy, Clone)]
 struct Span {
     offset: usize,
@@ -73,7 +110,7 @@ impl Span {
 }
 
 #[derive(Copy, Clone)]
-struct HeaderOffset {
+pub struct HeaderOffset {
     name: Span,
     value: Span,
 }
@@ -85,13 +122,15 @@ struct RequestOffset<'h> {
     headers: &'h [HeaderOffset],
 }
 
-impl<'p, 'b: 'p, 'h: 'b> RequestOffset<'h> {
+impl<'h> RequestOffset<'h> {
     fn parse(
-        buf: &'b [u8],
-        parse_headers: &mut [MaybeUninit<httparse::Header<'p>>],
+        buf: &[u8],
+        parse_headers: &mut [MaybeUninit<HeaderBuf>],
         out_headers: &'h mut [MaybeUninit<HeaderOffset>],
     ) -> MessageResult<Option<(Self, usize)>> {
         debug_assert_eq!(parse_headers.len(), out_headers.len());
+
+        let parse_headers = unsafe { header_buf::as_headers(buf, parse_headers) };
 
         let mut req = HttparseRequest::new(&mut []);
         match httparse::ParserConfig::default().parse_request_with_uninit_headers(
@@ -130,13 +169,15 @@ struct ResponseOffset<'h> {
     headers: &'h [HeaderOffset],
 }
 
-impl<'p, 'b: 'p, 'h: 'b> ResponseOffset<'h> {
+impl<'h> ResponseOffset<'h> {
     fn parse(
-        buf: &'b [u8],
-        parse_headers: &mut [MaybeUninit<httparse::Header<'p>>],
+        buf: &[u8],
+        parse_headers: &mut [MaybeUninit<HeaderBuf>],
         out_headers: &'h mut [MaybeUninit<HeaderOffset>],
     ) -> MessageResult<Option<(Self, usize)>> {
         debug_assert_eq!(parse_headers.len(), out_headers.len());
+
+        let parse_headers = unsafe { header_buf::as_headers(buf, parse_headers) };
 
         let mut res = HttparseResponse::new(&mut []);
         match httparse::ParserConfig::default().parse_response_with_uninit_headers(
@@ -198,10 +239,16 @@ pub struct Request {
 }
 
 impl Request {
-    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
-        let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
-        let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
-        match RequestOffset::parse(&*buf, &mut parse_headers, &mut out_headers)? {
+    /// Parse using the two pre-allocated slices. The slices should be the same
+    /// length. `parse_headers` is temporary scratch space while `out_headers`
+    /// is the slice in which the offsets and lengths of parsed elements will be
+    /// stored.
+    pub fn parse_with_vecs(
+        buf: &mut Buffer,
+        parse_headers: &mut [MaybeUninit<HeaderBuf>],
+        out_headers: &mut [MaybeUninit<HeaderOffset>],
+    ) -> MessageResult<Option<Self>> {
+        match RequestOffset::parse(&*buf, parse_headers, out_headers)? {
             None => Ok(None),
             Some((req, head_len)) => {
                 let head_buf = buf.split_to(head_len).freeze();
@@ -221,6 +268,12 @@ impl Request {
                 }))
             }
         }
+    }
+
+    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
+        let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
+        let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
+        Request::parse_with_vecs(buf, &mut parse_headers, &mut out_headers)
     }
 
     pub fn method(&self) -> &Bytes {
@@ -290,10 +343,16 @@ pub struct Response {
 }
 
 impl Response {
-    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
-        let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
-        let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
-        match ResponseOffset::parse(&*buf, &mut parse_headers, &mut out_headers)? {
+    /// Parse using the two pre-allocated slices. The slices should be the same
+    /// length. `parse_headers` is temporary scratch space while `out_headers`
+    /// is the slice in which the offsets and lengths of parsed elements will be
+    /// stored.
+    pub fn parse_with_vecs<'p, 'b: 'p, 'o: 'b>(
+        buf: &'b mut Buffer,
+        parse_headers: &'p mut [MaybeUninit<HeaderBuf>],
+        out_headers: &'o mut [MaybeUninit<HeaderOffset>],
+    ) -> MessageResult<Option<Self>> {
+        match ResponseOffset::parse(&*buf, parse_headers, out_headers)? {
             None => Ok(None),
             Some((res, head_len)) => {
                 let head_buf = buf.split_to(head_len).freeze();
@@ -313,6 +372,12 @@ impl Response {
                 }))
             }
         }
+    }
+
+    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
+        let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
+        let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
+        Self::parse_with_vecs(buf, &mut parse_headers, &mut out_headers)
     }
 
     pub fn version(&self) -> HttpVersion {
