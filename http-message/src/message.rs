@@ -85,15 +85,32 @@ mod header_buf {
     /// See docs for [`parse_request`].
     pub(crate) fn parse_response<'b>(
         buf: &'b [u8],
-        opaque: &mut [MaybeUninit<HeaderBuf>],
+        header_slots: &mut [MaybeUninit<HeaderBuf>],
         res: &mut httparse::Response<'_, 'b>,
     ) -> Result<httparse::Status<usize>, httparse::Error> {
         // SAFETY: same as parse_request.
         let headers = unsafe {
-            let ptr = opaque.as_mut_ptr() as *mut MaybeUninit<Header<'b>>;
-            std::slice::from_raw_parts_mut(ptr, opaque.len())
+            let ptr = header_slots.as_mut_ptr() as *mut MaybeUninit<Header<'b>>;
+            std::slice::from_raw_parts_mut(ptr, header_slots.len())
         };
         httparse::ParserConfig::default().parse_response_with_uninit_headers(res, buf, headers)
+    }
+
+    /// Same as [`parse_request`], but for just a buffer of headers as might
+    /// appear in HTTP trailers.
+    pub(crate) fn parse_headers<'b, 's>(
+        buf: &'b [u8],
+        header_slots: &'s mut [MaybeUninit<HeaderBuf>],
+    ) -> Result<httparse::Status<(usize, &'s [Header<'b>])>, httparse::Error> {
+        // SAFETY: same as parse_request.
+        let headers = unsafe {
+            let ptr = header_slots.as_mut_ptr() as *mut MaybeUninit<Header<'b>>;
+            std::slice::from_raw_parts_mut(ptr, header_slots.len())
+        };
+        let headers = unsafe { headers.assume_init_mut() };
+
+        // TODO: Sure would be nice if this was a method available on ParserConfig.
+        httparse::parse_headers(buf, headers)
     }
 }
 use header_buf::HeaderBuf;
@@ -157,6 +174,22 @@ impl ParseSlots {
                         headers,
                     }),
                 }))
+            }
+        }
+    }
+
+    pub fn parse_headers(&mut self, buf: &mut Buffer) -> MessageResult<Option<Headers>> {
+        let Self {
+            parse_headers,
+            out_headers,
+        } = self;
+        match header_buf::parse_headers(buf, parse_headers)? {
+            httparse::Status::Partial => Ok(None),
+            httparse::Status::Complete((len, headers)) => {
+                let header_offsets = populate_header_offsets(&buf[..len], out_headers, headers);
+                let header_buf = buf.split_to(len).freeze();
+                let headers = populate_headers(header_offsets, &header_buf);
+                Ok(Some(headers))
             }
         }
     }
