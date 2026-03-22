@@ -1315,6 +1315,65 @@ mod test {
     }
 
     #[tokio::test]
+    async fn content_length_backend_response_forwarded() {
+        let frontend_reader = b"\
+            GET / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let backend_reader = b"\
+            HTTP/1.1 200 Ok\r\n\
+            content-length: 5\r\n\
+            \r\n\
+            hello";
+        let mut backend_writer = Vec::new();
+
+        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let proxy_client = ProxyClient::new(
+            frontend_reader.as_ref(),
+            &mut frontend_writer,
+            bp,
+            ProxyOptions::default(),
+        );
+
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .write_backend_request()
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let client = rbr
+            .forward_response()
+            .await
+            .expect("failed to forward response");
+
+        let (_frontend_reader, frontend_writer, _backend_provider) = client.into_parts();
+        let frontend_writer = frontend_writer.into_inner();
+
+        let expected_frontend_writer = b"\
+            HTTP/1.1 200 Ok\r\n\
+            Via: 1.1 jrpxy\r\n\
+            content-length: 5\r\n\
+            \r\n\
+            hello";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
+    }
+
+    #[tokio::test]
     async fn removes_standard_hop_by_hop_headers() {
         let raw = b"\
             GET / HTTP/1.1\r\n\
