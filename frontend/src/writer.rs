@@ -151,17 +151,6 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             state: BodyWriterState::CL(ContentLengthBodyWriter::new(0)),
         })
     }
-
-    pub async fn send_as_same(
-        self,
-        response: &Response,
-    ) -> Result<FrontendBodyWriter<I>, FrontendError> {
-        match response.framing()? {
-            HeadFraming::Length(cl) => self.send_as_content_length(response, cl).await,
-            HeadFraming::Chunked => self.send_as_chunked(response).await,
-            HeadFraming::NoFraming => self.send_as_bodyless(response).await,
-        }
-    }
 }
 
 pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(

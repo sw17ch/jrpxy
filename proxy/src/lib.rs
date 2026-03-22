@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::task::Poll;
 
 use bytes::Bytes;
+use jrpxy_body::BodyReadMode;
 use jrpxy_backend::{
     error::{BackendError, BackendResult},
     reader::{
@@ -276,7 +277,13 @@ where
 
         let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
 
-        let backend_body_writer = backend_writer.send_as_same(&backend_request).await?;
+        let backend_body_writer = match frontend_body_reader.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(&backend_request).await?,
+            BodyReadMode::ContentLength(cl) => {
+                backend_writer.send_as_content_length(&backend_request, cl).await?
+            }
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&backend_request).await?,
+        };
 
         Ok(WroteBackendRequest {
             options,
@@ -502,7 +509,13 @@ where
         };
 
         let (response, mut backend_body_reader) = proxy_response.into_frontend_response();
-        let mut frontend_body_writer = frontend_writer.send_as_same(&response).await?;
+        let mut frontend_body_writer = match backend_body_reader.mode() {
+            BodyReadMode::Chunk => frontend_writer.send_as_chunked(&response).await?,
+            BodyReadMode::ContentLength(cl) => {
+                frontend_writer.send_as_content_length(&response, cl).await?
+            }
+            BodyReadMode::Bodyless => frontend_writer.send_as_bodyless(&response).await?,
+        };
 
         let f2b_fut = async move {
             let ret;
@@ -1432,6 +1445,142 @@ mod test {
         assert_eq!(
             jrpxy_util::debug::AsciiDebug(expected_backend_writer.as_slice()),
             jrpxy_util::debug::AsciiDebug(&backend_writer)
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_frontend_request_forwarded() {
+        let frontend_reader = b"\
+            POST / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            Transfer-Encoding: chunked\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let backend_reader = b"\
+            HTTP/1.1 200 Ok\r\n\
+            content-length: 0\r\n\
+            \r\n";
+        let mut backend_writer = Vec::new();
+
+        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let proxy_client = ProxyClient::new(
+            frontend_reader.as_ref(),
+            &mut frontend_writer,
+            bp,
+            ProxyOptions::default(),
+        );
+
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .write_backend_request()
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let client = rbr
+            .forward_response()
+            .await
+            .expect("failed to forward response");
+
+        let (_frontend_reader, _frontend_writer, backend_provider) = client.into_parts();
+        let (_backend_reader, backend_writer) = backend_provider.inner.unwrap();
+        let backend_writer = backend_writer.into_inner();
+
+        let expected_backend_writer = b"\
+            POST / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            Via: 1.1 jrpxy\r\n\
+            transfer-encoding: chunked\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_backend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&backend_writer)
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_backend_response_forwarded() {
+        // Demonstrates that the proxy correctly forwards a chunked backend
+        // response body to the frontend. This is a prerequisite for trailer
+        // forwarding (see chunked_trailers_forwarded).
+        let frontend_reader = b"\
+            GET / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let backend_reader = b"\
+            HTTP/1.1 200 Ok\r\n\
+            transfer-encoding: chunked\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            \r\n";
+        let mut backend_writer = Vec::new();
+
+        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let proxy_client = ProxyClient::new(
+            frontend_reader.as_ref(),
+            &mut frontend_writer,
+            bp,
+            ProxyOptions::default(),
+        );
+
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .write_backend_request()
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let client = rbr
+            .forward_response()
+            .await
+            .expect("failed to forward response");
+
+        let (_frontend_reader, frontend_writer, _backend_provider) = client.into_parts();
+        let frontend_writer = frontend_writer.into_inner();
+
+        let expected_frontend_writer = b"\
+            HTTP/1.1 200 Ok\r\n\
+            Via: 1.1 jrpxy\r\n\
+            transfer-encoding: chunked\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
         );
     }
 

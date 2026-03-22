@@ -55,17 +55,6 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         })
     }
 
-    pub async fn send_as_same(
-        self,
-        request: &Request,
-    ) -> Result<BackendBodyWriter<I>, BackendError> {
-        match request.framing()? {
-            HeadFraming::Length(cl) => self.send_as_content_length(request, cl).await,
-            HeadFraming::Chunked => self.send_as_chunked(request).await,
-            HeadFraming::NoFraming => self.send_as_bodyless(request).await,
-        }
-    }
-
     pub fn into_inner(self) -> I {
         let Self { io } = self;
         io

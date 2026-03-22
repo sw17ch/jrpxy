@@ -149,7 +149,7 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
                 io,
                 max_head_length,
                 buffer.into_inner(),
-                BodyReadMode::ContentLength(0),
+                BodyReadMode::Bodyless,
             ),
         };
 
