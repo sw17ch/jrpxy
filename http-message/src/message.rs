@@ -42,8 +42,8 @@ pub enum BuildError {
 
 /// A buffer type that carries no type or lifetime information that has the same
 /// size and alignment as [`httparse::Header`]. We use this type to avoid
-/// lifetime problems that usually arise from trying to reuse header allocations
-/// across parse attempts.
+/// lifetime problems that usually arise from trying to reuse header slot
+/// allocations across parse attempts.
 mod header_buf {
     use std::mem::MaybeUninit;
 
@@ -52,7 +52,7 @@ mod header_buf {
     /// A struct used for allocation only. Its internal representation should
     /// never be used.
     #[derive(Copy, Clone)]
-    pub struct HeaderBuf {
+    pub(crate) struct HeaderBuf {
         _do_not_use_name: &'static str,
         _do_not_use_value: &'static [u8],
     }
@@ -96,7 +96,21 @@ mod header_buf {
         httparse::ParserConfig::default().parse_response_with_uninit_headers(res, buf, headers)
     }
 }
-pub use header_buf::HeaderBuf;
+use header_buf::HeaderBuf;
+
+pub struct ParseSlots {
+    parse_headers: Vec<MaybeUninit<HeaderBuf>>,
+    out_headers: Vec<MaybeUninit<HeaderOffset>>,
+}
+
+impl ParseSlots {
+    pub fn new(slot_count: usize) -> Self {
+        Self {
+            parse_headers: vec![MaybeUninit::uninit(); slot_count],
+            out_headers: vec![MaybeUninit::uninit(); slot_count],
+        }
+    }
+}
 
 #[derive(Copy, Clone)]
 struct Span {
@@ -252,11 +266,14 @@ impl Request {
     /// length. `parse_headers` is temporary scratch space while `out_headers`
     /// is the slice in which the offsets and lengths of parsed elements will be
     /// stored.
-    pub fn parse_with_vecs(
+    pub fn parse_with_slots(
         buf: &mut Buffer,
-        parse_headers: &mut [MaybeUninit<HeaderBuf>],
-        out_headers: &mut [MaybeUninit<HeaderOffset>],
+        parse_slots: &mut ParseSlots,
     ) -> MessageResult<Option<Self>> {
+        let ParseSlots {
+            parse_headers,
+            out_headers,
+        } = parse_slots;
         match RequestOffset::parse(&*buf, parse_headers, out_headers)? {
             None => Ok(None),
             Some((req, head_len)) => {
@@ -277,12 +294,6 @@ impl Request {
                 }))
             }
         }
-    }
-
-    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
-        let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
-        let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
-        Request::parse_with_vecs(buf, &mut parse_headers, &mut out_headers)
     }
 
     pub fn method(&self) -> &Bytes {
@@ -356,11 +367,14 @@ impl Response {
     /// length. `parse_headers` is temporary scratch space while `out_headers`
     /// is the slice in which the offsets and lengths of parsed elements will be
     /// stored.
-    pub fn parse_with_vecs<'p, 'b: 'p, 'o: 'b>(
-        buf: &'b mut Buffer,
-        parse_headers: &'p mut [MaybeUninit<HeaderBuf>],
-        out_headers: &'o mut [MaybeUninit<HeaderOffset>],
+    pub fn parse_with_slots(
+        buf: &mut Buffer,
+        parse_slots: &mut ParseSlots,
     ) -> MessageResult<Option<Self>> {
+        let ParseSlots {
+            parse_headers,
+            out_headers,
+        } = parse_slots;
         match ResponseOffset::parse(&*buf, parse_headers, out_headers)? {
             None => Ok(None),
             Some((res, head_len)) => {
@@ -381,12 +395,6 @@ impl Response {
                 }))
             }
         }
-    }
-
-    pub fn parse(buf: &mut Buffer, max_headers: usize) -> MessageResult<Option<Self>> {
-        let mut parse_headers = vec![MaybeUninit::uninit(); max_headers];
-        let mut out_headers = vec![MaybeUninit::uninit(); max_headers];
-        Self::parse_with_vecs(buf, &mut parse_headers, &mut out_headers)
     }
 
     pub fn version(&self) -> HttpVersion {

@@ -41,6 +41,7 @@
 use bytes::Bytes;
 use bytes::BytesMut;
 use jrpxy_body::{BodyReadMode, BodyReader};
+use jrpxy_http_message::message::ParseSlots;
 use jrpxy_http_message::{framing::HeadFraming, message::Request};
 use jrpxy_util::buffer;
 use tokio::io::AsyncReadExt;
@@ -89,8 +90,9 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
 
     /// Wait for the full frontend head to be available
     pub(crate) async fn head(&mut self) -> FrontendResult<Request> {
+        let mut parse_slots = ParseSlots::new(Self::MAX_HEADERS);
         loop {
-            if let Some(req) = Request::parse(&mut self.buffer, Self::MAX_HEADERS)
+            if let Some(req) = Request::parse_with_slots(&mut self.buffer, &mut parse_slots)
                 .map_err(FrontendError::HttpRequestParseError)?
             {
                 return Ok(req);

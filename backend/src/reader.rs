@@ -1,6 +1,9 @@
 use bytes::{Bytes, BytesMut};
 use jrpxy_body::{BodyReadMode, BodyReader};
-use jrpxy_http_message::{framing::HeadFraming, message::Response};
+use jrpxy_http_message::{
+    framing::HeadFraming,
+    message::{ParseSlots, Response},
+};
 use jrpxy_util::buffer;
 use tokio::io::AsyncReadExt;
 
@@ -27,8 +30,9 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     }
 
     async fn head(&mut self, max_head_length: usize) -> BackendResult<Response> {
+        let mut parse_slots = ParseSlots::new(Self::MAX_HEADERS);
         loop {
-            if let Some(res) = Response::parse(&mut self.buffer, Self::MAX_HEADERS)
+            if let Some(res) = Response::parse_with_slots(&mut self.buffer, &mut parse_slots)
                 .map_err(BackendError::HttpResponseParseError)?
             {
                 return Ok(res);
