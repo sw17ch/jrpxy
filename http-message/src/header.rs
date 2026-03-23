@@ -64,6 +64,10 @@ impl Headers {
         HeaderIter::new(&self.headers)
     }
 
+    pub fn len(&self) -> usize {
+        self.headers.len()
+    }
+
     pub fn get_header(&self, needle: &str) -> Option<&Bytes> {
         let needle = needle.as_bytes();
         for (name, value) in self.iter() {

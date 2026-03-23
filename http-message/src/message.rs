@@ -120,6 +120,13 @@ pub struct ParseSlots {
     out_headers: Vec<MaybeUninit<HeaderOffset>>,
 }
 
+impl std::fmt::Debug for ParseSlots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let len = self.parse_headers.len();
+        f.debug_tuple("ParseSlots").field(&len).finish()
+    }
+}
+
 impl ParseSlots {
     pub fn new(slot_count: usize) -> Self {
         Self {

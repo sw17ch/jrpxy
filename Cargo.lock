@@ -32,6 +32,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "httparse",
+ "jrpxy-http-message",
  "jrpxy-util",
  "thiserror",
  "tokio",

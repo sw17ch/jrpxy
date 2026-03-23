@@ -13,6 +13,7 @@ use crate::error::{BackendError, BackendResult};
 pub struct BackendReader<I> {
     io: I,
     buffer: buffer::Buffer,
+    parse_slots: ParseSlots,
 }
 
 impl<I: AsyncReadExt + Unpin> BackendReader<I> {
@@ -26,13 +27,15 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         Self {
             io,
             buffer: buffer::Buffer::new(buffer),
+            parse_slots: ParseSlots::new(Self::MAX_HEADERS),
         }
     }
 
     async fn head(&mut self, max_head_length: usize) -> BackendResult<Response> {
-        let mut parse_slots = ParseSlots::new(Self::MAX_HEADERS);
         loop {
-            if let Some(res) = parse_slots.parse_response(&mut self.buffer)
+            if let Some(res) = self
+                .parse_slots
+                .parse_response(&mut self.buffer)
                 .map_err(BackendError::HttpResponseParseError)?
             {
                 return Ok(res);
@@ -74,7 +77,11 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         max_head_length: usize,
     ) -> BackendResult<ResponseStream<I>> {
         let res = self.head(max_head_length).await?;
-        let Self { io, buffer } = self;
+        let Self {
+            io,
+            buffer,
+            parse_slots,
+        } = self;
 
         let framing = res.framing()?;
         let is_informational = res.is_informational();
@@ -107,7 +114,11 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
                     BackendStreamReader {
                         allow_body,
                         max_head_length,
-                        reader: Self { io, buffer },
+                        reader: Self {
+                            io,
+                            buffer,
+                            parse_slots,
+                        },
                     },
                 )),
                 101 => Err(BackendError::HttpSwitchingProtocolsUnsupported),
@@ -117,7 +128,11 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
                     BackendStreamReader {
                         allow_body,
                         max_head_length,
-                        reader: Self { io, buffer },
+                        reader: Self {
+                            io,
+                            buffer,
+                            parse_slots,
+                        },
                     },
                 )),
                 unk => Err(BackendError::HttpUnsupportedInformational(unk)),
@@ -144,7 +159,11 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     }
 
     pub fn into_parts(self) -> (I, BytesMut) {
-        let Self { io, buffer } = self;
+        let Self {
+            io,
+            buffer,
+            parse_slots: _,
+        } = self;
         (io, buffer.into_inner())
     }
 }
