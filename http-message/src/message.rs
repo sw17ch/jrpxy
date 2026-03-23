@@ -120,6 +120,12 @@ pub struct ParseSlots {
     out_headers: Vec<MaybeUninit<HeaderOffset>>,
 }
 
+impl Default for ParseSlots {
+    fn default() -> Self {
+        Self::new(16)
+    }
+}
+
 impl std::fmt::Debug for ParseSlots {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let len = self.parse_headers.len();
@@ -193,6 +199,7 @@ impl ParseSlots {
         match header_buf::parse_headers(buf, parse_headers)? {
             httparse::Status::Partial => Ok(None),
             httparse::Status::Complete((len, headers)) => {
+                let out_headers = &mut out_headers[..headers.len()];
                 let header_offsets = populate_header_offsets(&buf[..len], out_headers, headers);
                 let header_buf = buf.split_to(len).freeze();
                 let headers = populate_headers(header_offsets, &header_buf);

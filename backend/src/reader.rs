@@ -140,18 +140,27 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         }
 
         let reader = if !expect_body {
-            BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::Bodyless)
+            BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::Bodyless, parse_slots)
         } else {
             match framing {
-                HeadFraming::Length(cl) => {
-                    BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::ContentLength(cl))
-                }
-                HeadFraming::Chunked => {
-                    BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::Chunk)
-                }
-                HeadFraming::NoFraming => {
-                    BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::Bodyless)
-                }
+                HeadFraming::Length(cl) => BackendBodyReader::new(
+                    io,
+                    buffer.into_inner(),
+                    BodyReadMode::ContentLength(cl),
+                    parse_slots,
+                ),
+                HeadFraming::Chunked => BackendBodyReader::new(
+                    io,
+                    buffer.into_inner(),
+                    BodyReadMode::Chunk,
+                    parse_slots,
+                ),
+                HeadFraming::NoFraming => BackendBodyReader::new(
+                    io,
+                    buffer.into_inner(),
+                    BodyReadMode::Bodyless,
+                    parse_slots,
+                ),
             }
         };
 
@@ -177,16 +186,16 @@ pub enum ResponseStream<I> {
 }
 
 impl<I> ResponseStream<I> {
-    pub fn try_into_response(self) -> Result<BackendResponse<I>, Self> {
+    pub fn try_into_response(self) -> Result<BackendResponse<I>, Box<Self>> {
         match self {
             ResponseStream::Response(r) => Ok(r),
-            s @ ResponseStream::Informational(_, _) => Err(s),
+            s @ ResponseStream::Informational(_, _) => Err(Box::new(s)),
         }
     }
 
-    pub fn try_into_informational(self) -> Result<(Response, BackendStreamReader<I>), Self> {
+    pub fn try_into_informational(self) -> Result<(Response, BackendStreamReader<I>), Box<Self>> {
         match self {
-            r @ ResponseStream::Response(_) => Err(r),
+            r @ ResponseStream::Response(_) => Err(Box::new(r)),
             ResponseStream::Informational(res, reader) => Ok((res, reader)),
         }
     }
@@ -259,9 +268,9 @@ impl<I> BackendBodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
-    fn new(io: I, buffer: BytesMut, mode: BodyReadMode) -> Self {
+    fn new(io: I, buffer: BytesMut, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         Self {
-            reader: BodyReader::new(io, buffer, mode),
+            reader: BodyReader::new(io, buffer, mode, parse_slots),
         }
     }
 

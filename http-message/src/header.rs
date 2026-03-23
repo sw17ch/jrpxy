@@ -68,6 +68,10 @@ impl Headers {
         self.headers.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn get_header(&self, needle: &str) -> Option<&Bytes> {
         let needle = needle.as_bytes();
         for (name, value) in self.iter() {

@@ -1,12 +1,24 @@
-mod parse_trailers;
-
-pub use parse_trailers::TrailerError;
-
 use bytes::{Bytes, BytesMut};
+use jrpxy_http_message::message::{MessageError, ParseSlots};
 use jrpxy_util::buffer::Buffer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use crate::parse_trailers::parse_trailers;
+fn map_trailer_error(e: MessageError) -> BodyError {
+    let trailer_error = match e {
+        MessageError::Parse(httparse::Error::TooManyHeaders) => TrailerError::TooManyFields,
+        MessageError::Parse(e) => TrailerError::InvalidField(e),
+        _ => unreachable!("parse_headers only produces Parse errors"),
+    };
+    BodyError::TrailerError(trailer_error)
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum TrailerError {
+    #[error("Invalid trailer field: {0}")]
+    InvalidField(httparse::Error),
+    #[error("Too many trailer fields")]
+    TooManyFields,
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum BodyError {
@@ -293,9 +305,17 @@ enum ChunkedBodyReaderState {
     Done,
 }
 
-#[derive(Debug)]
 pub struct ChunkedBodyReader {
     state: ChunkedBodyReaderState,
+    parse_slots: ParseSlots,
+}
+
+impl std::fmt::Debug for ChunkedBodyReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkedBodyReader")
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ChunkedBodyReader {
@@ -357,14 +377,21 @@ impl ChunkedBodyReader {
                         return Ok(BodyReadResult::NeedRead);
                     }
                 },
-                ChunkedBodyReaderState::InTrailers => match parse_trailers(buffer)? {
-                    httparse::Status::Complete(end_at) => {
-                        let _trailers = buffer.split_to(end_at);
-                        self.state = ChunkedBodyReaderState::Done;
-                        return Ok(BodyReadResult::Complete);
+                ChunkedBodyReaderState::InTrailers => {
+                    match self
+                        .parse_slots
+                        .parse_headers(buffer)
+                        .map_err(map_trailer_error)?
+                    {
+                        None => return Ok(BodyReadResult::NeedRead),
+                        Some(_headers) => {
+                            // TODO: capture the trailers so they are available
+                            // to higher level systems
+                            self.state = ChunkedBodyReaderState::Done;
+                            return Ok(BodyReadResult::Complete);
+                        }
                     }
-                    httparse::Status::Partial => return Ok(BodyReadResult::NeedRead),
-                },
+                }
                 ChunkedBodyReaderState::Done => return Ok(BodyReadResult::Complete),
             }
         }
@@ -409,9 +436,10 @@ impl ChunkedBodyReader {
         matches!(self.state, ChunkedBodyReaderState::Done)
     }
 
-    fn new() -> Self {
+    fn new(parse_slots: ParseSlots) -> Self {
         Self {
             state: ChunkedBodyReaderState::InChunkHeader,
+            parse_slots,
         }
     }
 }
@@ -458,12 +486,12 @@ impl<I> BodyReader<I> {
 impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     const CHUNK_READ_LEN: usize = 8 * 1024;
 
-    pub fn new(io: I, buffer: BytesMut, mode: BodyReadMode) -> Self {
+    pub fn new(io: I, buffer: BytesMut, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         let buffer = Buffer::new(buffer);
         let peeked = Buffer::new(BytesMut::new());
         let state = match mode {
             BodyReadMode::Bodyless => BodyReaderState::Bodyless,
-            BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader::new()),
+            BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader::new(parse_slots)),
             BodyReadMode::ContentLength(length) => {
                 BodyReaderState::CL(ContentLengthBodyReader::new(length))
             }
@@ -587,6 +615,7 @@ mod test {
     use std::time::Duration;
 
     use bytes::BytesMut;
+    use jrpxy_http_message::message::ParseSlots;
     use tokio::io::AsyncWriteExt;
 
     use crate::{BodyError, BodyReadMode, BodyReader, ChunkedBodyWriter};
@@ -597,7 +626,12 @@ mod test {
             0123456789
             ";
 
-        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::ContentLength(10));
+        let mut br = BodyReader::new(
+            &input[..],
+            BytesMut::new(),
+            BodyReadMode::ContentLength(10),
+            ParseSlots::default(),
+        );
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(!complete);
         assert_eq!(b"01234", slice);
@@ -625,7 +659,12 @@ mod test {
             0123456789
             ";
 
-        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::ContentLength(10));
+        let mut br = BodyReader::new(
+            &input[..],
+            BytesMut::new(),
+            BodyReadMode::ContentLength(10),
+            ParseSlots::default(),
+        );
 
         // read one byte
         let buf = br
@@ -681,8 +720,12 @@ mod test {
         });
 
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
-            let mut reader =
-                BodyReader::new(right, BytesMut::new(), BodyReadMode::ContentLength(10));
+            let mut reader = BodyReader::new(
+                right,
+                BytesMut::new(),
+                BodyReadMode::ContentLength(10),
+                ParseSlots::default(),
+            );
             let (complete, buf) = reader.peek(9).await.expect("can't break into parts");
 
             assert!(!complete);
@@ -713,7 +756,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::Chunk);
+        let mut br = BodyReader::new(
+            &input[..],
+            BytesMut::new(),
+            BodyReadMode::Chunk,
+            ParseSlots::default(),
+        );
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(!complete);
         assert_eq!(b"01234", slice);
@@ -742,7 +790,12 @@ mod test {
     async fn bodyless_peek() {
         let input = b"";
 
-        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::Bodyless);
+        let mut br = BodyReader::new(
+            &input[..],
+            BytesMut::new(),
+            BodyReadMode::Bodyless,
+            ParseSlots::default(),
+        );
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(complete);
         assert_eq!(b"", slice);
@@ -762,7 +815,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::Chunk);
+        let mut br = BodyReader::new(
+            &input[..],
+            BytesMut::new(),
+            BodyReadMode::Chunk,
+            ParseSlots::default(),
+        );
         let (complete, slice) = br.peek(10).await.expect("peek works");
         assert!(complete);
         assert_eq!(b"0123012", slice);
@@ -778,7 +836,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::Chunk);
+        let mut br = BodyReader::new(
+            &input[..],
+            BytesMut::new(),
+            BodyReadMode::Chunk,
+            ParseSlots::default(),
+        );
 
         // The body bytes themselves are valid and should be readable.
         let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
@@ -798,7 +861,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(&input[..], BytesMut::new(), BodyReadMode::Chunk);
+        let mut br = BodyReader::new(
+            &input[..],
+            BytesMut::new(),
+            BodyReadMode::Chunk,
+            ParseSlots::default(),
+        );
 
         // The body bytes themselves are valid and should be readable.
         let chunk = br.read(4).await.expect("reading body bytes works").unwrap();

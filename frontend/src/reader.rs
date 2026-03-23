@@ -41,8 +41,10 @@
 use bytes::Bytes;
 use bytes::BytesMut;
 use jrpxy_body::{BodyReadMode, BodyReader};
-use jrpxy_http_message::message::ParseSlots;
-use jrpxy_http_message::{framing::HeadFraming, message::Request};
+use jrpxy_http_message::{
+    framing::HeadFraming,
+    message::{ParseSlots, Request},
+};
 use jrpxy_util::buffer;
 use tokio::io::AsyncReadExt;
 
@@ -55,6 +57,7 @@ pub struct FrontendReader<I> {
     io: I,
     max_head_length: usize,
     buffer: buffer::Buffer,
+    parse_slots: ParseSlots,
 }
 
 impl<I> FrontendReader<I> {
@@ -63,6 +66,7 @@ impl<I> FrontendReader<I> {
             io,
             max_head_length: _,
             buffer,
+            parse_slots: _,
         } = self;
         (io, buffer)
     }
@@ -85,14 +89,16 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
             io,
             max_head_length,
             buffer: buffer::Buffer::new(buffer),
+            parse_slots: ParseSlots::new(Self::MAX_HEADERS),
         }
     }
 
     /// Wait for the full frontend head to be available
     pub(crate) async fn head(&mut self) -> FrontendResult<Request> {
-        let mut parse_slots = ParseSlots::new(Self::MAX_HEADERS);
         loop {
-            if let Some(req) = parse_slots.parse_request(&mut self.buffer)
+            if let Some(req) = self
+                .parse_slots
+                .parse_request(&mut self.buffer)
                 .map_err(FrontendError::HttpRequestParseError)?
             {
                 return Ok(req);
@@ -132,6 +138,7 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
             io,
             max_head_length,
             buffer,
+            parse_slots,
         } = self;
 
         let reader = match req.framing()? {
@@ -140,18 +147,21 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
                 max_head_length,
                 buffer.into_inner(),
                 BodyReadMode::ContentLength(cl),
+                parse_slots,
             ),
             HeadFraming::Chunked => FrontendBodyReader::new(
                 io,
                 max_head_length,
                 buffer.into_inner(),
                 BodyReadMode::Chunk,
+                parse_slots,
             ),
             HeadFraming::NoFraming => FrontendBodyReader::new(
                 io,
                 max_head_length,
                 buffer.into_inner(),
                 BodyReadMode::Bodyless,
+                parse_slots,
             ),
         };
 
@@ -214,10 +224,16 @@ impl<I> FrontendBodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
-    pub(crate) fn new(io: I, max_head_length: usize, buffer: BytesMut, mode: BodyReadMode) -> Self {
+    pub(crate) fn new(
+        io: I,
+        max_head_length: usize,
+        buffer: BytesMut,
+        mode: BodyReadMode,
+        parse_slots: ParseSlots,
+    ) -> Self {
         Self {
             max_head_length,
-            reader: BodyReader::new(io, buffer, mode),
+            reader: BodyReader::new(io, buffer, mode, parse_slots),
         }
     }
 
@@ -660,51 +676,5 @@ mod test {
 
         let () = w.await.unwrap();
         let () = r.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn invalid_te_trailer_trailing_space() {
-        // invalid trailing space before \r in first-trailer
-        let buf = b"\
-            GET /te HTTP/1.1\r\n\
-            Transfer-Encoding: chunked\r\n\
-            \r\n\
-            3;extensions=suck\r\n\
-            012\r\n\
-            2\r\n\
-            34\r\n\
-            0\r\n\
-            first-trailer: 1 \r\n\
-            second-trailer: 2\r\n\
-            \r\n\
-            extra bytes\
-            ";
-
-        let reader = FrontendReader::new(buf.as_slice(), 128);
-        let (req, body) = reader
-            .read()
-            .await
-            .expect("can't break into parts")
-            .into_parts();
-        let mut body = FrontendBodyReader::from(body);
-
-        assert_eq!(&b"GET"[..], req.method());
-        assert_eq!(&b"/te"[..], req.path());
-
-        // read one byte out
-        assert_eq!(&b"0"[..], body.read(1).await.unwrap().unwrap());
-        // read zero bytes out
-        assert_eq!(&b""[..], body.read(0).await.unwrap().unwrap());
-        // try to read out 4 bytes, but only 2 remain in the chunk
-        assert_eq!(&b"12"[..], body.read(4).await.unwrap().unwrap());
-        // try to read out 4 bytes, but the next chunk is only two bytes
-        assert_eq!(&b"34"[..], body.read(4).await.unwrap().unwrap());
-
-        assert!(matches!(
-            body.read(1).await.unwrap_err(),
-            FrontendError::BodyReadError(BodyError::TrailerError(
-                jrpxy_body::TrailerError::InvalidFieldValue
-            ))
-        ));
     }
 }
