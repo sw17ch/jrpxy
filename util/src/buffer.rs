@@ -50,6 +50,12 @@ impl Buffer {
     }
 
     #[inline]
+    /// See [`bytes::BytesMut::get_u8`].
+    pub fn get_u8(&mut self) -> u8 {
+        self.0.get_u8()
+    }
+
+    #[inline]
     pub fn extend_from_slice(&mut self, buf: &[u8]) {
         self.0.extend_from_slice(buf);
     }
