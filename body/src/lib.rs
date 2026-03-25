@@ -206,10 +206,20 @@ impl ChunkedBodyWriter {
         Ok(())
     }
 
-    pub async fn finish<W: AsyncWriteExt + Unpin>(self, mut io: W) -> BodyResult<()> {
+    pub async fn finish_with_trailers<W: AsyncWriteExt + Unpin>(
+        self,
+        mut io: W,
+        trailers: &Headers,
+    ) -> BodyResult<()> {
+        // TODO: actually emit the trailers
+        let _ = trailers;
         io.write_all(b"0\r\n\r\n")
             .await
             .map_err(BodyError::BodyWriteError)
+    }
+
+    pub async fn finish<W: AsyncWriteExt + Unpin>(self, io: W) -> BodyResult<()> {
+        self.finish_with_trailers(io, &Default::default()).await
     }
 
     async fn abort<I: AsyncWriteExt + Unpin>(&self, mut io: I) -> BodyResult<()> {
