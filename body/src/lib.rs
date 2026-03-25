@@ -328,6 +328,11 @@ where
     fn as_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffer
     }
+
+    fn into_parts(self) -> (I, Buffer) {
+        let Self{ io, fill_len, buffer } = self;
+        (io, buffer)
+    }
 }
 
 /// The extensions attached to a chunk header. Currently opaque; full parsing
@@ -413,7 +418,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
         matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
     }
 
-    async fn drain(self) -> BodyResult<(I, Buffer)> {
+    async fn drain(self) -> BodyResult<(I, Buffer, Headers)> {
         let Self { inner } = self;
         let Some(mut inner) = inner else {
             return Err(BodyError::ReadAfterError);
@@ -438,10 +443,10 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
                     } = done_chunk_reader;
                     let BodyIo {
                         io,
-                        fill_len,
+                        fill_len: _,
                         buffer,
                     } = io;
-                    return Ok((io, buffer));
+                    return Ok((io, buffer, trailers));
                 }
             }
         }
@@ -780,7 +785,8 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
                 (io, buffer)
             }
             BodyReaderState::TE(te) => {
-                let (io, buffer) = te.drain().await?;
+                let (io, buffer, trailers) = te.drain().await?;
+                let _ignored_trailers = trailers;
                 (io, buffer)
             }
         };
