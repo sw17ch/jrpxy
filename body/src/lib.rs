@@ -1,4 +1,5 @@
 use bytes::{Bytes, BytesMut};
+use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::{MessageError, ParseSlots};
 use jrpxy_util::buffer::Buffer;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -38,11 +39,14 @@ pub enum BodyError {
     UnexpectedEOF,
     #[error("Invalid chunk footer: expected 0x{0:x} got 0x{1:x}")]
     InvalidChunkFooter(u8, u8),
+    #[error("Attempted to read after previous failure")]
+    ReadAfterError,
 }
 
 pub type BodyResult<T> = Result<T, BodyError>;
 
 const FRAMING_HEADERS: &[&[u8]] = &[b"content-length", b"transfer-encoding"];
+const DRAIN_SIZE: usize = 4096;
 
 pub fn is_framing_header(name: &[u8]) -> bool {
     FRAMING_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(name))
@@ -222,9 +226,10 @@ pub struct ContentLengthBodyReader<I> {
     length: u64,
     /// the amount of the body already read
     offset: u64,
-    /// the io assocaited with this body read
+    /// the io associated with this body read
     io: BodyIo<I>,
 }
+
 impl<I> ContentLengthBodyReader<I>
 where
     I: AsyncReadExt + Unpin,
@@ -264,157 +269,19 @@ where
 }
 
 #[derive(Debug)]
-enum ChunkedBodyReaderState {
-    InChunkHeader,
-    InChunkBody { remaining: u64 },
-    InChunkFooterNeedCR,
-    InChunkFooterNeedLF,
-    InTrailers,
-    Done,
-}
-
-pub struct ChunkedBodyReader<I> {
-    state: ChunkedBodyReaderState,
-    parse_slots: ParseSlots,
-    io: BodyIo<I>,
-}
-
-impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChunkedBodyReader")
-            .field("state", &self.state)
-            .finish_non_exhaustive()
-    }
-}
-
-impl<I> ChunkedBodyReader<I>
-where
-    I: AsyncReadExt + Unpin,
-{
-    pub async fn read(&mut self, max_len: usize) -> BodyResult<BodyReadResult> {
-        loop {
-            match &mut self.state {
-                ChunkedBodyReaderState::InChunkHeader => {
-                    self.io.ensure().await?;
-                    match httparse::parse_chunk_size(self.io.as_bytes())
-                        .map_err(BodyError::InvalidChunkHeader)?
-                    {
-                        httparse::Status::Complete((body_at, chunk_len)) => {
-                            let _chunk_header = self.io.split_to(body_at);
-                            if chunk_len == 0 {
-                                self.state = ChunkedBodyReaderState::InTrailers;
-                            } else {
-                                self.state = ChunkedBodyReaderState::InChunkBody {
-                                    remaining: chunk_len,
-                                };
-                            }
-                        }
-                        httparse::Status::Partial => {
-                            // The data we have isn't enough for us to consume
-                            // any of it. We need to extend.
-                            self.io.extend().await?;
-                            continue;
-                        }
-                    }
-                }
-                ChunkedBodyReaderState::InChunkBody { remaining } => {
-                    if *remaining == 0 {
-                        self.state = ChunkedBodyReaderState::InChunkFooterNeedCR;
-                    } else {
-                        self.io.ensure().await?;
-                        let at = (*remaining).min(self.io.len() as u64).min(max_len as u64);
-                        *remaining -= at;
-                        let body_buf = self.io.split_to(at as usize);
-                        return Ok(BodyReadResult::DidRead(body_buf));
-                    }
-                }
-                ChunkedBodyReaderState::InChunkFooterNeedCR => {
-                    self.io.ensure().await?;
-                    match self.io.get_u8() {
-                        b'\r' => {
-                            self.state = ChunkedBodyReaderState::InChunkFooterNeedLF;
-                        }
-                        unexpected => {
-                            return Err(BodyError::InvalidChunkFooter(b'\r', unexpected));
-                        }
-                    }
-                }
-                ChunkedBodyReaderState::InChunkFooterNeedLF => {
-                    self.io.ensure().await?;
-                    match self.io.get_u8() {
-                        b'\n' => {
-                            self.state = ChunkedBodyReaderState::InChunkHeader;
-                        }
-                        unexpected => {
-                            return Err(BodyError::InvalidChunkFooter(b'\n', unexpected));
-                        }
-                    }
-                }
-                ChunkedBodyReaderState::InTrailers => {
-                    self.io.ensure().await?;
-                    match self
-                        .parse_slots
-                        .parse_headers(self.io.as_buffer_mut())
-                        .map_err(map_trailer_error)?
-                    {
-                        None => {
-                            // The data we have isn't enough for us to consume
-                            // any of it. We need to extend.
-                            self.io.extend().await?;
-                            continue;
-                        }
-                        Some(_headers) => {
-                            // TODO: capture the trailers so they are available
-                            // to higher level systems
-                            self.state = ChunkedBodyReaderState::Done;
-                            return Ok(BodyReadResult::Complete);
-                        }
-                    }
-                }
-                ChunkedBodyReaderState::Done => return Ok(BodyReadResult::Complete),
-            }
-        }
-    }
-
-    fn drained(&self) -> bool {
-        matches!(self.state, ChunkedBodyReaderState::Done)
-    }
-
-    fn new(parse_slots: ParseSlots, io: BodyIo<I>) -> Self {
-        Self {
-            state: ChunkedBodyReaderState::InChunkHeader,
-            parse_slots,
-            io,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum BodyReadResult {
-    DidRead(Bytes),
-    Complete,
-}
-
-#[derive(Debug)]
-enum BodyReaderState<I> {
-    Bodyless(BodyIo<I>),
-    CL(ContentLengthBodyReader<I>),
-    TE(ChunkedBodyReader<I>),
-}
-
-#[derive(Debug)]
 struct BodyIo<I> {
     io: I,
     /// The attempted read size we use to fill the buffer.
     fill_len: usize,
     buffer: Buffer,
 }
+
 impl<I> BodyIo<I>
 where
     I: AsyncReadExt + Unpin,
 {
     /// Ensure there is at least one byte of data available in the buffer. If
-    /// there is no data in the buffer, attempt to read at least `read_len`
+    /// there is no data in the buffer, attempt to read at least `fill_len`
     /// bytes. If no bytes can be made available, we assume an unexpected EOF.
     async fn ensure(&mut self) -> BodyResult<()> {
         if !self.buffer.is_empty() {
@@ -446,10 +313,7 @@ where
         self.buffer.len()
     }
 
-    fn split_to(&mut self, at: usize) -> Bytes
-    where
-        I: AsyncReadExt + Unpin,
-    {
+    fn split_to(&mut self, at: usize) -> Bytes {
         self.buffer.split_to(at).freeze()
     }
 
@@ -464,6 +328,312 @@ where
     fn as_buffer_mut(&mut self) -> &mut Buffer {
         &mut self.buffer
     }
+}
+
+/// The extensions attached to a chunk header. Currently opaque; full parsing
+/// is a TODO.
+pub struct ChunkExtensions;
+
+/// Positioned at the start of the next chunk (or the terminal chunk). Owns
+/// the underlying IO for the duration of inter-chunk parsing.
+pub struct ChunkedBodyReader<I> {
+    inner: Option<ChunkedBodyChunkStream<I>>,
+}
+
+enum ChunkedBodyChunkStream<I> {
+    InChunk(InChunkReader<I>),
+    BetweenChunk(BetweenChunkReader<I>),
+    Done(DoneChunkReader<I>),
+}
+
+impl<I> From<InChunkReader<I>> for ChunkedBodyChunkStream<I> {
+    fn from(value: InChunkReader<I>) -> Self {
+        Self::InChunk(value)
+    }
+}
+impl<I> From<BetweenChunkReader<I>> for ChunkedBodyChunkStream<I> {
+    fn from(value: BetweenChunkReader<I>) -> Self {
+        Self::BetweenChunk(value)
+    }
+}
+impl<I> From<DoneChunkReader<I>> for ChunkedBodyChunkStream<I> {
+    fn from(value: DoneChunkReader<I>) -> Self {
+        Self::Done(value)
+    }
+}
+
+impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkedBodyReader").finish_non_exhaustive()
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
+    async fn read(&mut self, max_len: usize) -> BodyResult<BodyReadResult> {
+        loop {
+            let Some(current) = self.inner.take() else {
+                // We get left with a None after an error, which does not
+                // replace inner.
+                return Err(BodyError::ReadAfterError);
+            };
+
+            match current {
+                ChunkedBodyChunkStream::InChunk(mut in_chunk_reader) => {
+                    // We're in a chunk. Delegate to the current chunk reader.
+                    match in_chunk_reader.read(max_len).await? {
+                        Some(bytes) => {
+                            self.inner = Some(in_chunk_reader.into());
+                            return Ok(BodyReadResult::DidRead(bytes));
+                        }
+                        None => {
+                            let between_chunk_reader = in_chunk_reader.drain().await?;
+                            self.inner = Some(between_chunk_reader.into());
+                        }
+                    }
+                }
+                ChunkedBodyChunkStream::BetweenChunk(between_chunk_reader) => {
+                    match between_chunk_reader.read_chunk().await? {
+                        NextChunk::Data(in_chunk_reader) => {
+                            self.inner = Some(in_chunk_reader.into())
+                        }
+                        NextChunk::Final(done_chunk_reader) => {
+                            self.inner = Some(done_chunk_reader.into())
+                        }
+                    }
+                }
+                ChunkedBodyChunkStream::Done(done_chunk_reader) => {
+                    self.inner = Some(done_chunk_reader.into());
+                    return Ok(BodyReadResult::Complete);
+                }
+            }
+        }
+    }
+
+    fn drained(&self) -> bool {
+        matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
+    }
+
+    async fn drain(self) -> BodyResult<(I, Buffer)> {
+        let Self { inner } = self;
+        let Some(mut inner) = inner else {
+            return Err(BodyError::ReadAfterError);
+        };
+
+        loop {
+            inner = match inner {
+                ChunkedBodyChunkStream::InChunk(in_chunk_reader) => {
+                    in_chunk_reader.drain().await?.into()
+                }
+                ChunkedBodyChunkStream::BetweenChunk(between_chunk_reader) => {
+                    match between_chunk_reader.read_chunk().await? {
+                        NextChunk::Data(in_chunk_reader) => in_chunk_reader.into(),
+                        NextChunk::Final(done_chunk_reader) => done_chunk_reader.into(),
+                    }
+                }
+                ChunkedBodyChunkStream::Done(done_chunk_reader) => {
+                    let DoneChunkReader {
+                        io,
+                        parse_slots: _,
+                        trailers,
+                    } = done_chunk_reader;
+                    let BodyIo {
+                        io,
+                        fill_len,
+                        buffer,
+                    } = io;
+                    return Ok((io, buffer));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum ChunkBodyState {
+    InBody,
+    InFooterNeedCR,
+    InFooterNeedLF,
+    Done,
+}
+
+/// Positioned within a single chunk. Holds the chunk's declared size and any
+/// extensions. Owns the IO for the duration of reading this chunk.
+pub struct InChunkReader<I> {
+    io: BodyIo<I>,
+    parse_slots: ParseSlots,
+    size: u64,
+    extensions: ChunkExtensions,
+    remaining: u64,
+    state: ChunkBodyState,
+}
+
+impl<I> std::fmt::Debug for InChunkReader<I> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChunkReader")
+            .field("size", &self.size)
+            .field("remaining", &self.remaining)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<I> InChunkReader<I> {
+    /// The declared byte length of this chunk.
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The extensions attached to this chunk header, if any.
+    pub fn extensions(&self) -> &ChunkExtensions {
+        &self.extensions
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> InChunkReader<I> {
+    /// Read up to `max_len` bytes from this chunk's body. Returns `None` when
+    /// the chunk is fully drained and the chunk footer (`\r\n`) has been
+    /// consumed.
+    pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
+        loop {
+            match self.state {
+                ChunkBodyState::InBody => {
+                    if self.remaining == 0 {
+                        self.state = ChunkBodyState::InFooterNeedCR;
+                        continue;
+                    }
+                    self.io.ensure().await?;
+                    let at = self.remaining.min(self.io.len() as u64).min(max_len as u64) as usize;
+                    self.remaining -= at as u64;
+                    return Ok(Some(self.io.split_to(at)));
+                }
+                ChunkBodyState::InFooterNeedCR => {
+                    self.io.ensure().await?;
+                    match self.io.get_u8() {
+                        b'\r' => {
+                            self.state = ChunkBodyState::InFooterNeedLF;
+                        }
+                        unexpected => {
+                            return Err(BodyError::InvalidChunkFooter(b'\r', unexpected));
+                        }
+                    }
+                }
+                ChunkBodyState::InFooterNeedLF => {
+                    self.io.ensure().await?;
+                    match self.io.get_u8() {
+                        b'\n' => {
+                            self.state = ChunkBodyState::Done;
+                        }
+                        unexpected => {
+                            return Err(BodyError::InvalidChunkFooter(b'\n', unexpected));
+                        }
+                    }
+                }
+                ChunkBodyState::Done => return Ok(None),
+            }
+        }
+    }
+
+    pub async fn drain(mut self) -> BodyResult<BetweenChunkReader<I>> {
+        while let Some(_drained) = self.read(DRAIN_SIZE).await? {
+            // drain bytes until we get to the end of the chunk
+        }
+        let Self {
+            io,
+            parse_slots,
+            size: _,
+            extensions: _,
+            remaining: _,
+            state,
+        } = self;
+        debug_assert!(matches!(state, ChunkBodyState::Done));
+        Ok(BetweenChunkReader { io, parse_slots })
+    }
+}
+
+pub enum NextChunk<I> {
+    Data(InChunkReader<I>),
+    Final(DoneChunkReader<I>),
+}
+
+pub struct BetweenChunkReader<I> {
+    io: BodyIo<I>,
+    parse_slots: ParseSlots,
+}
+
+impl<I> BetweenChunkReader<I>
+where
+    I: AsyncReadExt + Unpin,
+{
+    pub async fn read_chunk(self) -> BodyResult<NextChunk<I>> {
+        let Self {
+            mut io,
+            mut parse_slots,
+        } = self;
+        io.ensure().await?;
+        loop {
+            match httparse::parse_chunk_size(io.as_bytes())
+                .map_err(BodyError::InvalidChunkHeader)?
+            {
+                httparse::Status::Partial => {
+                    io.extend().await?;
+                    continue;
+                }
+                httparse::Status::Complete((header_len, chunk_size)) => {
+                    // TODO: these ignored bytes contain the chunk extensions we
+                    // want to preserve eventually
+                    let _ignored_chunk_header_bytes = io.split_to(header_len);
+                    if chunk_size == 0 {
+                        // terminal chunk: drain the trailer section
+                        let trailers = loop {
+                            io.ensure().await?;
+                            match parse_slots
+                                .parse_headers(io.as_buffer_mut())
+                                .map_err(map_trailer_error)?
+                            {
+                                None => {
+                                    io.extend().await?;
+                                }
+                                Some(trailers) => break trailers,
+                            }
+                        };
+                        return Ok(NextChunk::Final(DoneChunkReader {
+                            io,
+                            parse_slots,
+                            trailers,
+                        }));
+                    } else {
+                        return Ok(NextChunk::Data(InChunkReader {
+                            io,
+                            parse_slots,
+                            size: chunk_size,
+                            extensions: ChunkExtensions,
+                            remaining: chunk_size,
+                            state: ChunkBodyState::InBody,
+                        }));
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub struct DoneChunkReader<I> {
+    io: BodyIo<I>,
+    parse_slots: ParseSlots,
+    trailers: Headers,
+}
+
+#[derive(Debug)]
+pub enum BodyReadResult {
+    DidRead(Bytes),
+    Complete,
+}
+
+#[derive(Debug)]
+enum BodyReaderState<I> {
+    Bodyless(BodyIo<I>),
+    CL(ContentLengthBodyReader<I>),
+    TE(ChunkedBodyReader<I>),
 }
 
 pub struct BodyReader<I> {
@@ -495,7 +665,12 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
         };
         let state = match mode {
             BodyReadMode::Bodyless => BodyReaderState::Bodyless(io),
-            BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader::new(parse_slots, io)),
+            BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader {
+                inner: Some(ChunkedBodyChunkStream::BetweenChunk(BetweenChunkReader {
+                    io,
+                    parse_slots,
+                })),
+            }),
             BodyReadMode::ContentLength(length) => {
                 BodyReaderState::CL(ContentLengthBodyReader::new(length, io))
             }
@@ -586,27 +761,29 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
 
         debug_assert!(peeked.is_empty());
 
-        let io = match state {
-            BodyReaderState::Bodyless(io) => io,
+        let (io, buffer) = match state {
+            BodyReaderState::Bodyless(bio) => {
+                let BodyIo {
+                    io,
+                    buffer,
+                    fill_len: _,
+                } = bio;
+                (io, buffer)
+            }
             BodyReaderState::CL(ContentLengthBodyReader { length, offset, io }) => {
                 debug_assert_eq!(offset, length);
-                io
+                let BodyIo {
+                    io,
+                    buffer,
+                    fill_len: _,
+                } = io;
+                (io, buffer)
             }
-            BodyReaderState::TE(ChunkedBodyReader {
-                state,
-                // TODO: pass the slots up so they can continue to be reused
-                parse_slots: _,
-                io,
-            }) => {
-                debug_assert!(matches!(state, ChunkedBodyReaderState::Done));
-                io
+            BodyReaderState::TE(te) => {
+                let (io, buffer) = te.drain().await?;
+                (io, buffer)
             }
         };
-        let BodyIo {
-            io,
-            fill_len: _,
-            buffer,
-        } = io;
 
         Ok((io, buffer))
     }

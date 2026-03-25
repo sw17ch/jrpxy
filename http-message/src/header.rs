@@ -45,7 +45,7 @@ impl<'s> Iterator for HeaderIter<'s> {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct Headers {
     headers: Vec<(Bytes, Bytes)>,
 }
