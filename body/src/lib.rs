@@ -2,6 +2,7 @@ use bytes::{Bytes, BytesMut};
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::{MessageError, ParseSlots};
 use jrpxy_util::buffer::Buffer;
+use jrpxy_util::io_buffer::{IoBuffer, IoBufferError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 fn map_trailer_error(e: MessageError) -> BodyError {
@@ -41,6 +42,15 @@ pub enum BodyError {
     InvalidChunkFooter(u8, u8),
     #[error("Attempted to read after previous failure")]
     ReadAfterError,
+}
+
+impl From<IoBufferError> for BodyError {
+    fn from(e: IoBufferError) -> Self {
+        match e {
+            IoBufferError::Io(e) => BodyError::BodyReadError(e),
+            IoBufferError::UnexpectedEOF => BodyError::UnexpectedEOF,
+        }
+    }
 }
 
 pub type BodyResult<T> = Result<T, BodyError>;
@@ -227,14 +237,14 @@ pub struct ContentLengthBodyReader<I> {
     /// the amount of the body already read
     offset: u64,
     /// the io associated with this body read
-    io: BodyIo<I>,
+    io: IoBuffer<I>,
 }
 
 impl<I> ContentLengthBodyReader<I>
 where
     I: AsyncReadExt + Unpin,
 {
-    fn new(length: u64, io: BodyIo<I>) -> Self {
+    fn new(length: u64, io: IoBuffer<I>) -> Self {
         Self {
             length,
             offset: 0,
@@ -265,73 +275,6 @@ where
     fn remaining(&self) -> u64 {
         debug_assert!(self.offset <= self.length);
         self.length - self.offset
-    }
-}
-
-#[derive(Debug)]
-struct BodyIo<I> {
-    io: I,
-    /// The attempted read size we use to fill the buffer.
-    fill_len: usize,
-    buffer: Buffer,
-}
-
-impl<I> BodyIo<I>
-where
-    I: AsyncReadExt + Unpin,
-{
-    /// Ensure there is at least one byte of data available in the buffer. If
-    /// there is no data in the buffer, attempt to read at least `fill_len`
-    /// bytes. If no bytes can be made available, we assume an unexpected EOF.
-    async fn ensure(&mut self) -> BodyResult<()> {
-        if !self.buffer.is_empty() {
-            return Ok(());
-        }
-        let r = self.extend().await?;
-        if r == 0 {
-            return Err(BodyError::UnexpectedEOF);
-        }
-        Ok(())
-    }
-
-    /// Extend the buffer with more data. Returns the new length of the buffer
-    /// after extension. If no more data is available, even if there is data in
-    /// the buffer already, we will return unexpected EOF.
-    async fn extend(&mut self) -> BodyResult<usize> {
-        let r = self
-            .buffer
-            .read_from(&mut self.io, self.fill_len)
-            .await
-            .map_err(BodyError::BodyReadError)?;
-        if r == 0 {
-            return Err(BodyError::UnexpectedEOF);
-        }
-        Ok(self.buffer.len())
-    }
-
-    fn len(&self) -> usize {
-        self.buffer.len()
-    }
-
-    fn split_to(&mut self, at: usize) -> Bytes {
-        self.buffer.split_to(at).freeze()
-    }
-
-    fn as_bytes(&self) -> &[u8] {
-        &self.buffer
-    }
-
-    fn get_u8(&mut self) -> u8 {
-        self.buffer.get_u8()
-    }
-
-    fn as_buffer_mut(&mut self) -> &mut Buffer {
-        &mut self.buffer
-    }
-
-    fn into_parts(self) -> (I, Buffer) {
-        let Self{ io, fill_len, buffer } = self;
-        (io, buffer)
     }
 }
 
@@ -436,16 +379,10 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
                     }
                 }
                 ChunkedBodyChunkStream::Done(done_chunk_reader) => {
-                    let DoneChunkReader {
-                        io,
-                        parse_slots: _,
-                        trailers,
-                    } = done_chunk_reader;
-                    let BodyIo {
-                        io,
-                        fill_len: _,
-                        buffer,
-                    } = io;
+                    let (io, parse_slots, trailers) = done_chunk_reader.into_parts();
+                    // TODO: pass these back up
+                    let _ignored_parse_slots = parse_slots;
+                    let (io, buffer) = io.into_parts();
                     return Ok((io, buffer, trailers));
                 }
             }
@@ -464,7 +401,7 @@ enum ChunkBodyState {
 /// Positioned within a single chunk. Holds the chunk's declared size and any
 /// extensions. Owns the IO for the duration of reading this chunk.
 pub struct InChunkReader<I> {
-    io: BodyIo<I>,
+    io: IoBuffer<I>,
     parse_slots: ParseSlots,
     size: u64,
     extensions: ChunkExtensions,
@@ -561,7 +498,7 @@ pub enum NextChunk<I> {
 }
 
 pub struct BetweenChunkReader<I> {
-    io: BodyIo<I>,
+    io: IoBuffer<I>,
     parse_slots: ParseSlots,
 }
 
@@ -623,9 +560,20 @@ where
 }
 
 pub struct DoneChunkReader<I> {
-    io: BodyIo<I>,
+    io: IoBuffer<I>,
     parse_slots: ParseSlots,
     trailers: Headers,
+}
+
+impl<I> DoneChunkReader<I> {
+    pub fn into_parts(self) -> (IoBuffer<I>, ParseSlots, Headers) {
+        let Self {
+            io,
+            parse_slots,
+            trailers,
+        } = self;
+        (io, parse_slots, trailers)
+    }
 }
 
 #[derive(Debug)]
@@ -636,7 +584,7 @@ pub enum BodyReadResult {
 
 #[derive(Debug)]
 enum BodyReaderState<I> {
-    Bodyless(BodyIo<I>),
+    Bodyless(IoBuffer<I>),
     CL(ContentLengthBodyReader<I>),
     TE(ChunkedBodyReader<I>),
 }
@@ -661,13 +609,8 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     const CHUNK_READ_LEN: usize = 8 * 1024;
 
     pub fn new(io: I, buffer: BytesMut, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
-        let buffer = Buffer::new(buffer);
         let peeked = Buffer::new(BytesMut::new());
-        let io = BodyIo {
-            io,
-            buffer,
-            fill_len: Self::CHUNK_READ_LEN,
-        };
+        let io = IoBuffer::new(io, buffer, Self::CHUNK_READ_LEN);
         let state = match mode {
             BodyReadMode::Bodyless => BodyReaderState::Bodyless(io),
             BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader {
@@ -767,22 +710,10 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
         debug_assert!(peeked.is_empty());
 
         let (io, buffer) = match state {
-            BodyReaderState::Bodyless(bio) => {
-                let BodyIo {
-                    io,
-                    buffer,
-                    fill_len: _,
-                } = bio;
-                (io, buffer)
-            }
+            BodyReaderState::Bodyless(bio) => bio.into_parts(),
             BodyReaderState::CL(ContentLengthBodyReader { length, offset, io }) => {
                 debug_assert_eq!(offset, length);
-                let BodyIo {
-                    io,
-                    buffer,
-                    fill_len: _,
-                } = io;
-                (io, buffer)
+                io.into_parts()
             }
             BodyReaderState::TE(te) => {
                 let (io, buffer, trailers) = te.drain().await?;

@@ -80,6 +80,7 @@ name = "jrpxy-util"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "thiserror",
  "tokio",
 ]
 
