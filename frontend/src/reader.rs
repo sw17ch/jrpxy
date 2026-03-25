@@ -39,13 +39,12 @@
 //! ```
 
 use bytes::Bytes;
-use bytes::BytesMut;
 use jrpxy_body::{BodyReadMode, BodyReader};
 use jrpxy_http_message::{
     framing::HeadFraming,
     message::{ParseSlots, Request},
 };
-use jrpxy_util::buffer;
+use jrpxy_util::io_buffer::IoBuffer;
 use tokio::io::AsyncReadExt;
 
 use crate::error::{FrontendError, FrontendResult};
@@ -54,41 +53,38 @@ use crate::error::{FrontendError, FrontendResult};
 /// is consumed, and a [`FrontendRequest`] is returned. This can be used to
 /// inspect the request and peek the body.
 pub struct FrontendReader<I> {
-    io: I,
+    io_buffer: IoBuffer<I>,
     max_head_length: usize,
-    buffer: buffer::Buffer,
     parse_slots: ParseSlots,
 }
 
 impl<I> FrontendReader<I> {
-    pub fn into_inner(self) -> (I, buffer::Buffer) {
+    pub fn into_inner(self) -> IoBuffer<I> {
         let Self {
-            io,
+            io_buffer,
             max_head_length: _,
-            buffer,
             parse_slots: _,
         } = self;
-        (io, buffer)
+        io_buffer
     }
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
-    pub(crate) const MAX_HEADERS: usize = 256;
+    const MAX_HEADERS: usize = 256;
+    const HEAD_FILL_LEN: usize = 4096;
 
     /// Createa a new [`FrontendReader`].
     pub fn new(io: I, max_head_length: usize) -> Self {
-        Self::new_with_buffer(io, max_head_length, BytesMut::new())
+        Self::new_with_buffer(
+            IoBuffer::new_with_fill_len(io, Self::HEAD_FILL_LEN),
+            max_head_length,
+        )
     }
 
-    pub(crate) fn new_with_buffer(
-        io: I,
-        max_head_length: usize,
-        buffer: BytesMut,
-    ) -> FrontendReader<I> {
+    pub(crate) fn new_with_buffer(io: IoBuffer<I>, max_head_length: usize) -> FrontendReader<I> {
         Self {
-            io,
+            io_buffer: io,
             max_head_length,
-            buffer: buffer::Buffer::new(buffer),
             parse_slots: ParseSlots::new(Self::MAX_HEADERS),
         }
     }
@@ -98,24 +94,24 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
         loop {
             if let Some(req) = self
                 .parse_slots
-                .parse_request(&mut self.buffer)
+                .parse_request(self.io_buffer.as_buffer_mut())
                 .map_err(FrontendError::HttpRequestParseError)?
             {
                 return Ok(req);
-            } else if self.buffer.len() >= self.max_head_length {
+            } else if self.io_buffer.len() >= self.max_head_length {
                 return Err(FrontendError::MaxHeadLenExceeded(
-                    self.buffer.len(),
+                    self.io_buffer.len(),
                     self.max_head_length,
                 ));
             }
 
-            let first_read = self.buffer.is_empty();
+            let first_read = self.io_buffer.is_empty();
 
             // read some data into the buffer
-            let target_read_len = self.max_head_length.saturating_sub(self.buffer.len());
+            let target_read_len = self.max_head_length.saturating_sub(self.io_buffer.len());
             let len = self
-                .buffer
-                .read_from(&mut self.io, target_read_len)
+                .io_buffer
+                .read_with_len(target_read_len)
                 .await
                 .map_err(FrontendError::ReadError)?;
             if 0 == len {
@@ -135,31 +131,27 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
     pub async fn read(mut self) -> FrontendResult<FrontendRequest<I>> {
         let req = self.head().await?;
         let Self {
-            io,
+            io_buffer,
             max_head_length,
-            buffer,
             parse_slots,
         } = self;
 
         let reader = match req.framing()? {
             HeadFraming::Length(cl) => FrontendBodyReader::new(
-                io,
+                io_buffer,
                 max_head_length,
-                buffer.into_inner(),
                 BodyReadMode::ContentLength(cl),
                 parse_slots,
             ),
             HeadFraming::Chunked => FrontendBodyReader::new(
-                io,
+                io_buffer,
                 max_head_length,
-                buffer.into_inner(),
                 BodyReadMode::Chunk,
                 parse_slots,
             ),
             HeadFraming::NoFraming => FrontendBodyReader::new(
-                io,
+                io_buffer,
                 max_head_length,
-                buffer.into_inner(),
                 BodyReadMode::Bodyless,
                 parse_slots,
             ),
@@ -225,15 +217,14 @@ impl<I> FrontendBodyReader<I> {
 
 impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
     pub(crate) fn new(
-        io: I,
+        io: IoBuffer<I>,
         max_head_length: usize,
-        buffer: BytesMut,
         mode: BodyReadMode,
         parse_slots: ParseSlots,
     ) -> Self {
         Self {
             max_head_length,
-            reader: BodyReader::new(io, buffer, mode, parse_slots),
+            reader: BodyReader::new(io, mode, parse_slots),
         }
     }
 
@@ -265,16 +256,12 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
     /// [`FrontendReader`] ready to read the next request in the pipeline.
     pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
         let max_head_len = self.max_head_length;
-        let (io, buffer) = self
+        let io = self
             .reader
             .drain()
             .await
             .map_err(FrontendError::BodyReadError)?;
-        Ok(FrontendReader::new_with_buffer(
-            io,
-            max_head_len,
-            buffer.into_inner(),
-        ))
+        Ok(FrontendReader::new_with_buffer(io, max_head_len))
     }
 }
 

@@ -21,11 +21,17 @@ pub struct IoBuffer<I> {
 }
 
 impl<I> IoBuffer<I> {
-    pub fn new(io: I, buffer: BytesMut, fill_len: usize) -> Self {
+    const EXTEND_READ_LEN: usize = 8 * 1024;
+
+    pub fn new(io: I) -> Self {
+        Self::new_with_fill_len(io, Self::EXTEND_READ_LEN)
+    }
+
+    pub fn new_with_fill_len(io: I, fill_len: usize) -> Self {
         Self {
             io,
             fill_len,
-            buffer: Buffer::new(buffer),
+            buffer: Buffer::new(BytesMut::new()),
         }
     }
 
@@ -84,5 +90,11 @@ impl<I: AsyncReadExt + Unpin> IoBuffer<I> {
             return Err(IoBufferError::UnexpectedEOF);
         }
         Ok(self.buffer.len())
+    }
+
+    /// Read up to `len` bytes from IO into the buffer. Returns the number of
+    /// bytes read, or `0` on EOF.
+    pub async fn read_with_len(&mut self, len: usize) -> std::io::Result<usize> {
+        self.buffer.read_from(&mut self.io, len).await
     }
 }

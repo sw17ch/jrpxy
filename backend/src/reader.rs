@@ -1,18 +1,17 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use jrpxy_body::{BodyReadMode, BodyReader};
 use jrpxy_http_message::{
     framing::HeadFraming,
     message::{ParseSlots, Response},
 };
-use jrpxy_util::buffer;
+use jrpxy_util::io_buffer::IoBuffer;
 use tokio::io::AsyncReadExt;
 
 use crate::error::{BackendError, BackendResult};
 
 #[derive(Debug)]
 pub struct BackendReader<I> {
-    io: I,
-    buffer: buffer::Buffer,
+    io_buffer: IoBuffer<I>,
     parse_slots: ParseSlots,
 }
 
@@ -20,13 +19,12 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     const MAX_HEADERS: usize = 256;
 
     pub fn new(io: I) -> Self {
-        Self::new_with_buffer(io, BytesMut::new())
+        Self::new_with_iobuffer(IoBuffer::new(io))
     }
 
-    fn new_with_buffer(io: I, buffer: BytesMut) -> BackendReader<I> {
+    pub fn new_with_iobuffer(io_buffer: IoBuffer<I>) -> Self {
         Self {
-            io,
-            buffer: buffer::Buffer::new(buffer),
+            io_buffer,
             parse_slots: ParseSlots::new(Self::MAX_HEADERS),
         }
     }
@@ -35,24 +33,24 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         loop {
             if let Some(res) = self
                 .parse_slots
-                .parse_response(&mut self.buffer)
+                .parse_response(self.io_buffer.as_buffer_mut())
                 .map_err(BackendError::HttpResponseParseError)?
             {
                 return Ok(res);
-            } else if self.buffer.len() >= max_head_length {
+            } else if self.io_buffer.len() >= max_head_length {
                 return Err(BackendError::MaxHeadLenExceeded(
-                    self.buffer.len(),
+                    self.io_buffer.len(),
                     max_head_length,
                 ));
             }
 
-            let first_read = self.buffer.is_empty();
+            let first_read = self.io_buffer.is_empty();
 
             // read some data into the buffer
-            let target_read_len = max_head_length.saturating_sub(self.buffer.len());
+            let target_read_len = max_head_length.saturating_sub(self.io_buffer.len());
             let len = self
-                .buffer
-                .read_from(&mut self.io, target_read_len)
+                .io_buffer
+                .read_with_len(target_read_len)
                 .await
                 .map_err(BackendError::ReadError)?;
             if 0 == len {
@@ -78,8 +76,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     ) -> BackendResult<ResponseStream<I>> {
         let res = self.head(max_head_length).await?;
         let Self {
-            io,
-            buffer,
+            io_buffer,
             parse_slots,
         } = self;
 
@@ -115,8 +112,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
                         allow_body,
                         max_head_length,
                         reader: Self {
-                            io,
-                            buffer,
+                            io_buffer,
                             parse_slots,
                         },
                     },
@@ -129,8 +125,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
                         allow_body,
                         max_head_length,
                         reader: Self {
-                            io,
-                            buffer,
+                            io_buffer,
                             parse_slots,
                         },
                     },
@@ -140,40 +135,30 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         }
 
         let reader = if !expect_body {
-            BackendBodyReader::new(io, buffer.into_inner(), BodyReadMode::Bodyless, parse_slots)
+            BackendBodyReader::new(io_buffer, BodyReadMode::Bodyless, parse_slots)
         } else {
             match framing {
-                HeadFraming::Length(cl) => BackendBodyReader::new(
-                    io,
-                    buffer.into_inner(),
-                    BodyReadMode::ContentLength(cl),
-                    parse_slots,
-                ),
-                HeadFraming::Chunked => BackendBodyReader::new(
-                    io,
-                    buffer.into_inner(),
-                    BodyReadMode::Chunk,
-                    parse_slots,
-                ),
-                HeadFraming::NoFraming => BackendBodyReader::new(
-                    io,
-                    buffer.into_inner(),
-                    BodyReadMode::Bodyless,
-                    parse_slots,
-                ),
+                HeadFraming::Length(cl) => {
+                    BackendBodyReader::new(io_buffer, BodyReadMode::ContentLength(cl), parse_slots)
+                }
+                HeadFraming::Chunked => {
+                    BackendBodyReader::new(io_buffer, BodyReadMode::Chunk, parse_slots)
+                }
+                HeadFraming::NoFraming => {
+                    BackendBodyReader::new(io_buffer, BodyReadMode::Bodyless, parse_slots)
+                }
             }
         };
 
         Ok(ResponseStream::Response(BackendResponse { res, reader }))
     }
 
-    pub fn into_parts(self) -> (I, BytesMut) {
+    pub fn into_parts(self) -> IoBuffer<I> {
         let Self {
-            io,
-            buffer,
+            io_buffer,
             parse_slots: _,
         } = self;
-        (io, buffer.into_inner())
+        io_buffer
     }
 }
 
@@ -268,9 +253,9 @@ impl<I> BackendBodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
-    fn new(io: I, buffer: BytesMut, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
+    fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         Self {
-            reader: BodyReader::new(io, buffer, mode, parse_slots),
+            reader: BodyReader::new(io, mode, parse_slots),
         }
     }
 
@@ -293,12 +278,12 @@ impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
     }
 
     pub async fn drain(self) -> BackendResult<BackendReader<I>> {
-        let (io, buffer) = self
+        let io = self
             .reader
             .drain()
             .await
             .map_err(BackendError::BodyReadError)?;
-        Ok(BackendReader::new_with_buffer(io, buffer.into_inner()))
+        Ok(BackendReader::new_with_iobuffer(io))
     }
 }
 
@@ -340,7 +325,8 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let (rest_unread, rest_buffered) = reader.into_parts();
+        let io_buffer = reader.into_parts();
+        let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
     }
@@ -387,7 +373,8 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let (rest_unread, rest_buffered) = reader.into_parts();
+        let io_buffer = reader.into_parts();
+        let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
     }
@@ -428,7 +415,8 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let (rest_unread, rest_buffered) = reader.into_parts();
+        let io_buffer = reader.into_parts();
+        let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
     }
@@ -481,7 +469,8 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let (rest_unread, rest_buffered) = reader.into_parts();
+        let io_buffer = reader.into_parts();
+        let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
     }
@@ -511,7 +500,8 @@ mod test {
         assert!(br.read(5).await.expect("can read").is_none());
         let reader = br.drain().await.expect("failed to drian");
 
-        let (rest_unread, rest_buffered) = reader.into_parts();
+        let io_buffer = reader.into_parts();
+        let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
     }
@@ -541,7 +531,8 @@ mod test {
         assert!(br.read(5).await.expect("can read").is_none());
         let reader = br.drain().await.expect("failed to drian");
 
-        let (rest_unread, rest_buffered) = reader.into_parts();
+        let io_buffer = reader.into_parts();
+        let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
     }
@@ -680,7 +671,8 @@ mod test {
         assert!(body.is_none());
         let reader = body_reader.drain().await.expect("failed to drain");
 
-        let (rest_unread, rest_buffered) = reader.into_parts();
+        let io_buffer = reader.into_parts();
+        let (rest_unread, rest_buffered) = io_buffer.into_parts();
         let rest = rest_unread
             .iter()
             .chain(rest_buffered.as_ref().iter())

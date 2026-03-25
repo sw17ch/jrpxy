@@ -361,7 +361,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
         matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
     }
 
-    async fn drain(self) -> BodyResult<(I, Buffer, Headers)> {
+    async fn drain(self) -> BodyResult<(IoBuffer<I>, Headers)> {
         let Self { inner } = self;
         let Some(mut inner) = inner else {
             return Err(BodyError::ReadAfterError);
@@ -382,8 +382,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
                     let (io, parse_slots, trailers) = done_chunk_reader.into_parts();
                     // TODO: pass these back up
                     let _ignored_parse_slots = parse_slots;
-                    let (io, buffer) = io.into_parts();
-                    return Ok((io, buffer, trailers));
+                    return Ok((io, trailers));
                 }
             }
         }
@@ -606,11 +605,8 @@ impl<I> BodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> BodyReader<I> {
-    const CHUNK_READ_LEN: usize = 8 * 1024;
-
-    pub fn new(io: I, buffer: BytesMut, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
+    pub fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         let peeked = Buffer::new(BytesMut::new());
-        let io = IoBuffer::new(io, buffer, Self::CHUNK_READ_LEN);
         let state = match mode {
             BodyReadMode::Bodyless => BodyReaderState::Bodyless(io),
             BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader {
@@ -693,7 +689,7 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     }
 
     /// Ensure the body is fully drained from the socket
-    pub async fn drain(mut self) -> BodyResult<(I, Buffer)> {
+    pub async fn drain(mut self) -> BodyResult<IoBuffer<I>> {
         const DRAIN_SIZE: usize = 2 * 4096;
 
         while let Some(_buf) = self.read(DRAIN_SIZE).await? {
@@ -709,20 +705,20 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
 
         debug_assert!(peeked.is_empty());
 
-        let (io, buffer) = match state {
-            BodyReaderState::Bodyless(bio) => bio.into_parts(),
+        let io = match state {
+            BodyReaderState::Bodyless(io) => io,
             BodyReaderState::CL(ContentLengthBodyReader { length, offset, io }) => {
                 debug_assert_eq!(offset, length);
-                io.into_parts()
+                io
             }
             BodyReaderState::TE(te) => {
-                let (io, buffer, trailers) = te.drain().await?;
+                let (io, trailers) = te.drain().await?;
                 let _ignored_trailers = trailers;
-                (io, buffer)
+                io
             }
         };
 
-        Ok((io, buffer))
+        Ok(io)
     }
 }
 
@@ -730,8 +726,8 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
 mod test {
     use std::time::Duration;
 
-    use bytes::BytesMut;
     use jrpxy_http_message::message::ParseSlots;
+    use jrpxy_util::io_buffer::IoBuffer;
     use tokio::io::AsyncWriteExt;
 
     use crate::{BodyError, BodyReadMode, BodyReader, ChunkedBodyWriter};
@@ -743,8 +739,7 @@ mod test {
             ";
 
         let mut br = BodyReader::new(
-            &input[..],
-            BytesMut::new(),
+            IoBuffer::new(&input[..]),
             BodyReadMode::ContentLength(10),
             ParseSlots::default(),
         );
@@ -776,8 +771,7 @@ mod test {
             ";
 
         let mut br = BodyReader::new(
-            &input[..],
-            BytesMut::new(),
+            IoBuffer::new(&input[..]),
             BodyReadMode::ContentLength(10),
             ParseSlots::default(),
         );
@@ -837,8 +831,7 @@ mod test {
 
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
             let mut reader = BodyReader::new(
-                right,
-                BytesMut::new(),
+                IoBuffer::new(right),
                 BodyReadMode::ContentLength(10),
                 ParseSlots::default(),
             );
@@ -873,8 +866,7 @@ mod test {
             ";
 
         let mut br = BodyReader::new(
-            &input[..],
-            BytesMut::new(),
+            IoBuffer::new(&input[..]),
             BodyReadMode::Chunk,
             ParseSlots::default(),
         );
@@ -907,8 +899,7 @@ mod test {
         let input = b"";
 
         let mut br = BodyReader::new(
-            &input[..],
-            BytesMut::new(),
+            IoBuffer::new(&input[..]),
             BodyReadMode::Bodyless,
             ParseSlots::default(),
         );
@@ -932,8 +923,7 @@ mod test {
             ";
 
         let mut br = BodyReader::new(
-            &input[..],
-            BytesMut::new(),
+            IoBuffer::new(&input[..]),
             BodyReadMode::Chunk,
             ParseSlots::default(),
         );
@@ -953,8 +943,7 @@ mod test {
             ";
 
         let mut br = BodyReader::new(
-            &input[..],
-            BytesMut::new(),
+            IoBuffer::new(&input[..]),
             BodyReadMode::Chunk,
             ParseSlots::default(),
         );
@@ -978,8 +967,7 @@ mod test {
             ";
 
         let mut br = BodyReader::new(
-            &input[..],
-            BytesMut::new(),
+            IoBuffer::new(&input[..]),
             BodyReadMode::Chunk,
             ParseSlots::default(),
         );
