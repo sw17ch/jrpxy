@@ -18,8 +18,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
-            io,
-            state: BodyWriterKind::TE(ChunkedBodyWriter::new()),
+            kind: BodyWriterKind::TE(ChunkedBodyWriter::new(io)),
         })
     }
 
@@ -33,8 +32,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
-            io,
-            state: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len)),
+            kind: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len), io),
         })
     }
 
@@ -50,8 +48,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
-            io,
-            state: BodyWriterKind::Bodyless,
+            kind: BodyWriterKind::Bodyless(io),
         })
     }
 

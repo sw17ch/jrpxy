@@ -63,55 +63,51 @@ pub fn is_framing_header(name: &[u8]) -> bool {
 }
 
 #[derive(Debug)]
-pub enum BodyWriterKind {
-    Bodyless,
-    CL(ContentLengthBodyWriter),
-    TE(ChunkedBodyWriter),
+pub enum BodyWriterKind<I> {
+    Bodyless(I),
+    CL(ContentLengthBodyWriter, I),
+    TE(ChunkedBodyWriter<I>),
 }
 
-impl BodyWriterKind {
-    pub async fn write<I: AsyncWriteExt + Unpin>(
-        &mut self,
-        mut io: I,
-        buf: &[u8],
-    ) -> BodyResult<()> {
+impl<I: AsyncWriteExt + Unpin> BodyWriterKind<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> BodyResult<()> {
         match self {
-            BodyWriterKind::Bodyless => {
-                return Err(BodyError::BodyOverflow(buf.len() as u64));
-            }
-            BodyWriterKind::CL(w) => w.write(&mut io, buf).await,
-            BodyWriterKind::TE(w) => w.write(&mut io, buf).await,
+            BodyWriterKind::Bodyless(_) => Err(BodyError::BodyOverflow(buf.len() as u64)),
+            BodyWriterKind::CL(w, io) => w.write(&mut *io, buf).await,
+            BodyWriterKind::TE(w) => w.write(buf).await,
         }
     }
 
-    pub async fn finish<I: AsyncWriteExt + Unpin>(self, mut io: I) -> BodyResult<()> {
+    pub async fn finish(self) -> BodyResult<I> {
         match self {
-            BodyWriterKind::Bodyless => {}
-            BodyWriterKind::CL(w) => w.finish(&mut io).await?,
-            BodyWriterKind::TE(w) => w.finish(&mut io).await?,
+            BodyWriterKind::Bodyless(mut io) => {
+                io.flush().await.map_err(BodyError::BodyWriteError)?;
+                Ok(io)
+            }
+            BodyWriterKind::CL(w, mut io) => {
+                w.finish(&mut io).await?;
+                io.flush().await.map_err(BodyError::BodyWriteError)?;
+                Ok(io)
+            }
+            BodyWriterKind::TE(w) => w.finish().await,
         }
-        io.flush().await.map_err(BodyError::BodyWriteError)?;
-        Ok(())
     }
 
     /// Explicitly abort a body write. This will, for certain transfer types,
     /// perform an invalid write which may help prevent insufficiently strict
     /// body readers from considering the body complete.
-    pub async fn abort<I: AsyncWriteExt + Unpin>(self, mut io: I) -> BodyResult<()> {
+    pub async fn abort(self) -> BodyResult<()> {
         match self {
-            BodyWriterKind::Bodyless => {
-                // nothing to do when aborting. we can't even break framing. the
-                // only thing we can do is drop the connection.
-            }
-            BodyWriterKind::CL(_w) => {
-                // do nothing when aborting a content-length body. just drop the
-                // connection.
+            BodyWriterKind::Bodyless(_) | BodyWriterKind::CL(_, _) => {
+                // drop the connection — nothing else we can do
+                Ok(())
             }
             BodyWriterKind::TE(w) => {
                 // there are chunked body readers out there that don't wait
                 // around for the empty chunk to consider a body complete, so we
                 // do something special.
-                w.abort(&mut io).await?
+                let _io = w.abort().await?;
+                Ok(())
             }
         }
         io.flush().await.map_err(BodyError::BodyWriteError)?;
@@ -177,19 +173,21 @@ impl ContentLengthBodyWriter {
     }
 }
 
-#[derive(Debug, Default)]
-pub struct ChunkedBodyWriter {}
+#[derive(Debug)]
+pub struct ChunkedBodyWriter<I> {
+    io: I,
+}
 
-impl ChunkedBodyWriter {
-    pub fn new() -> Self {
-        Self::default()
+impl<I> ChunkedBodyWriter<I> {
+    pub fn new(io: I) -> Self {
+        Self { io }
     }
+}
 
-    pub async fn write<W: AsyncWriteExt + Unpin>(
-        &mut self,
-        mut io: W,
-        buffer: &[u8],
-    ) -> BodyResult<()> {
+impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
+    // TODO: add a flush method so that we can force out writes
+
+    pub async fn write(&mut self, buffer: &[u8]) -> BodyResult<()> {
         // TODO: use vectored writes
 
         if buffer.is_empty() {
@@ -215,12 +213,8 @@ impl ChunkedBodyWriter {
         Ok(())
     }
 
-    pub async fn finish_with_trailers<W: AsyncWriteExt + Unpin>(
-        self,
-        mut io: W,
-        trailers: &Headers,
-    ) -> BodyResult<()> {
-        // TODO: write vectored
+    pub async fn finish_with_trailers(self, trailers: &Headers) -> BodyResult<I> {
+        let Self { mut io } = self;
 
         io.write_all(b"0\r\n")
             .await
@@ -241,21 +235,28 @@ impl ChunkedBodyWriter {
         }
         io.write_all(b"\r\n")
             .await
-            .map_err(BodyError::BodyWriteError)
+            .map_err(BodyError::BodyWriteError)?;
+        io.flush().await.map_err(BodyError::BodyWriteError)?;
+        Ok(io)
     }
 
-    pub async fn finish<W: AsyncWriteExt + Unpin>(self, io: W) -> BodyResult<()> {
-        self.finish_with_trailers(io, &Default::default()).await
+    pub async fn finish(self) -> BodyResult<I> {
+        self.finish_with_trailers(&Default::default()).await
     }
 
-    async fn abort<I: AsyncWriteExt + Unpin>(&self, mut io: I) -> BodyResult<()> {
+    pub async fn abort(self) -> BodyResult<I> {
+        let Self { mut io } = self;
         // we allow users to explicitly abandon a transfer-encoding:chunked
         // write by emitting a bad chunk header. this should be a little more
         // durable when badly-configured body readers don't wait for the
         // terminating empty chunk to consider a body complete.
         //
         // we write an 'x' because it is not a valid hexadecimal character
-        io.write_all(b"x").await.map_err(BodyError::BodyWriteError)
+        io.write_all(b"x")
+            .await
+            .map_err(BodyError::BodyWriteError)?;
+        io.flush().await.map_err(BodyError::BodyWriteError)?;
+        Ok(io)
     }
 }
 
@@ -601,6 +602,10 @@ pub struct FinalChunkReader<I> {
 }
 
 impl<I> FinalChunkReader<I> {
+    pub fn trailers(&self) -> &Headers {
+        &self.trailers
+    }
+
     pub fn into_parts(self) -> (IoBuffer<I>, ParseSlots, Headers) {
         let Self {
             io,
