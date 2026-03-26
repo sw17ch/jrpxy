@@ -299,23 +299,23 @@ pub struct ChunkedBodyReader<I> {
 }
 
 enum ChunkedBodyChunkStream<I> {
-    InChunk(InChunkReader<I>),
-    BetweenChunk(BetweenChunkReader<I>),
-    Done(DoneChunkReader<I>),
+    InChunk(ChunkBodyReader<I>),
+    BetweenChunk(ChunkHeadReader<I>),
+    Done(FinalChunkReader<I>),
 }
 
-impl<I> From<InChunkReader<I>> for ChunkedBodyChunkStream<I> {
-    fn from(value: InChunkReader<I>) -> Self {
+impl<I> From<ChunkBodyReader<I>> for ChunkedBodyChunkStream<I> {
+    fn from(value: ChunkBodyReader<I>) -> Self {
         Self::InChunk(value)
     }
 }
-impl<I> From<BetweenChunkReader<I>> for ChunkedBodyChunkStream<I> {
-    fn from(value: BetweenChunkReader<I>) -> Self {
+impl<I> From<ChunkHeadReader<I>> for ChunkedBodyChunkStream<I> {
+    fn from(value: ChunkHeadReader<I>) -> Self {
         Self::BetweenChunk(value)
     }
 }
-impl<I> From<DoneChunkReader<I>> for ChunkedBodyChunkStream<I> {
-    fn from(value: DoneChunkReader<I>) -> Self {
+impl<I> From<FinalChunkReader<I>> for ChunkedBodyChunkStream<I> {
+    fn from(value: FinalChunkReader<I>) -> Self {
         Self::Done(value)
     }
 }
@@ -409,7 +409,7 @@ enum ChunkBodyState {
 
 /// Positioned within a single chunk. Holds the chunk's declared size and any
 /// extensions. Owns the IO for the duration of reading this chunk.
-pub struct InChunkReader<I> {
+pub struct ChunkBodyReader<I> {
     io: IoBuffer<I>,
     parse_slots: ParseSlots,
     size: u64,
@@ -418,7 +418,7 @@ pub struct InChunkReader<I> {
     state: ChunkBodyState,
 }
 
-impl<I> std::fmt::Debug for InChunkReader<I> {
+impl<I> std::fmt::Debug for ChunkBodyReader<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChunkReader")
             .field("size", &self.size)
@@ -428,7 +428,7 @@ impl<I> std::fmt::Debug for InChunkReader<I> {
     }
 }
 
-impl<I> InChunkReader<I> {
+impl<I> ChunkBodyReader<I> {
     /// The declared byte length of this chunk.
     pub fn size(&self) -> u64 {
         self.size
@@ -440,7 +440,7 @@ impl<I> InChunkReader<I> {
     }
 }
 
-impl<I: AsyncReadExt + Unpin> InChunkReader<I> {
+impl<I: AsyncReadExt + Unpin> ChunkBodyReader<I> {
     /// Read up to `max_len` bytes from this chunk's body. Returns `None` when
     /// the chunk is fully drained and the chunk footer (`\r\n`) has been
     /// consumed.
@@ -484,7 +484,7 @@ impl<I: AsyncReadExt + Unpin> InChunkReader<I> {
         }
     }
 
-    pub async fn drain(mut self) -> BodyResult<BetweenChunkReader<I>> {
+    pub async fn drain(mut self) -> BodyResult<ChunkHeadReader<I>> {
         while let Some(_drained) = self.read(DRAIN_SIZE).await? {
             // drain bytes until we get to the end of the chunk
         }
@@ -497,21 +497,21 @@ impl<I: AsyncReadExt + Unpin> InChunkReader<I> {
             state,
         } = self;
         debug_assert!(matches!(state, ChunkBodyState::Done));
-        Ok(BetweenChunkReader { io, parse_slots })
+        Ok(ChunkHeadReader { io, parse_slots })
     }
 }
 
 pub enum NextChunk<I> {
-    Data(InChunkReader<I>),
-    Final(DoneChunkReader<I>),
+    Data(ChunkBodyReader<I>),
+    Final(FinalChunkReader<I>),
 }
 
-pub struct BetweenChunkReader<I> {
+pub struct ChunkHeadReader<I> {
     io: IoBuffer<I>,
     parse_slots: ParseSlots,
 }
 
-impl<I> BetweenChunkReader<I>
+impl<I> ChunkHeadReader<I>
 where
     I: AsyncReadExt + Unpin,
 {
@@ -547,13 +547,13 @@ where
                                 Some(trailers) => break trailers,
                             }
                         };
-                        return Ok(NextChunk::Final(DoneChunkReader {
+                        return Ok(NextChunk::Final(FinalChunkReader {
                             io,
                             parse_slots,
                             trailers,
                         }));
                     } else {
-                        return Ok(NextChunk::Data(InChunkReader {
+                        return Ok(NextChunk::Data(ChunkBodyReader {
                             io,
                             parse_slots,
                             size: chunk_size,
@@ -568,13 +568,13 @@ where
     }
 }
 
-pub struct DoneChunkReader<I> {
+pub struct FinalChunkReader<I> {
     io: IoBuffer<I>,
     parse_slots: ParseSlots,
     trailers: Headers,
 }
 
-impl<I> DoneChunkReader<I> {
+impl<I> FinalChunkReader<I> {
     pub fn into_parts(self) -> (IoBuffer<I>, ParseSlots, Headers) {
         let Self {
             io,
@@ -621,7 +621,7 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
         let state = match mode {
             BodyReadMode::Bodyless => BodyReaderState::Bodyless(io),
             BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader {
-                inner: Some(ChunkedBodyChunkStream::BetweenChunk(BetweenChunkReader {
+                inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader {
                     io,
                     parse_slots,
                 })),
