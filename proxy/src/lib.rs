@@ -9,7 +9,7 @@ use jrpxy_backend::{
     },
     writer::{BackendBodyWriter, BackendWriter},
 };
-use jrpxy_body::BodyReadMode;
+use jrpxy_body::{BodyReadMode, BodyReader, BodyReaderKind, BodyWriterKind};
 use jrpxy_frontend::{
     error::FrontendError,
     reader::{FrontendBodyReader, FrontendReader, FrontendRequest},
