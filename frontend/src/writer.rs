@@ -214,8 +214,8 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
 
 /// A frontend response body writer.
 pub struct FrontendBodyWriter<I> {
-    pub(crate) io: I,
-    pub(crate) state: BodyWriterState,
+    io: I,
+    state: BodyWriterState,
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
