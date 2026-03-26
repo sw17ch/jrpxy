@@ -263,10 +263,10 @@ where
     }
 
     /// Read bytes and return them as a [`Bytes`].
-    pub async fn read(&mut self, max_len: usize) -> BodyResult<BodyReadResult> {
+    pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         let remaining = self.remaining();
         if remaining == 0 {
-            return Ok(BodyReadResult::Complete);
+            return Ok(None);
         }
 
         self.io.ensure().await?;
@@ -279,7 +279,7 @@ where
 
         self.offset += at as u64;
 
-        Ok(BodyReadResult::DidRead(self.io.split_to(at)))
+        Ok(Some(self.io.split_to(at)))
     }
 
     fn remaining(&self) -> u64 {
@@ -327,7 +327,7 @@ impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
-    async fn read(&mut self, max_len: usize) -> BodyResult<BodyReadResult> {
+    async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         loop {
             let Some(current) = self.inner.take() else {
                 // We get left with a None after an error, which does not
@@ -341,7 +341,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
                     match in_chunk_reader.read(max_len).await? {
                         Some(bytes) => {
                             self.inner = Some(in_chunk_reader.into());
-                            return Ok(BodyReadResult::DidRead(bytes));
+                            return Ok(Some(bytes));
                         }
                         None => {
                             let between_chunk_reader = in_chunk_reader.drain().await?;
@@ -361,7 +361,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
                 }
                 ChunkedBodyChunkStream::Done(done_chunk_reader) => {
                     self.inner = Some(done_chunk_reader.into());
-                    return Ok(BodyReadResult::Complete);
+                    return Ok(None);
                 }
             }
         }
@@ -586,12 +586,6 @@ impl<I> FinalChunkReader<I> {
 }
 
 #[derive(Debug)]
-pub enum BodyReadResult {
-    DidRead(Bytes),
-    Complete,
-}
-
-#[derive(Debug)]
 enum BodyReaderState<I> {
     Bodyless(BodylessBodyReader<I>),
     CL(ContentLengthBodyReader<I>),
@@ -637,14 +631,10 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     }
 
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
-        let res = match &mut self.state {
-            BodyReaderState::Bodyless(_io) => return Ok(None),
-            BodyReaderState::CL(cl) => cl.read(max_len).await?,
-            BodyReaderState::TE(te) => te.read(max_len).await?,
-        };
-        match res {
-            BodyReadResult::DidRead(bytes) => Ok(Some(bytes)),
-            BodyReadResult::Complete => Ok(None),
+        match &mut self.state {
+            BodyReaderState::Bodyless(_io) => Ok(None),
+            BodyReaderState::CL(cl) => Ok(cl.read(max_len).await?),
+            BodyReaderState::TE(te) => Ok(te.read(max_len).await?),
         }
     }
 
