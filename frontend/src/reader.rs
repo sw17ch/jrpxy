@@ -39,7 +39,7 @@
 //! ```
 
 use bytes::Bytes;
-use jrpxy_body::{BodyReadMode, BodyReader};
+use jrpxy_body::{BodyReadMode, PeekableBodyReader};
 use jrpxy_http_message::{
     framing::HeadFraming,
     message::{ParseSlots, Request},
@@ -206,7 +206,7 @@ impl<I: AsyncReadExt + Unpin> FrontendRequest<I> {
 /// A frontend request body reader.
 pub struct FrontendBodyReader<I> {
     pub(crate) max_head_length: usize,
-    pub(crate) reader: BodyReader<I>,
+    pub(crate) reader: PeekableBodyReader<I>,
 }
 
 impl<I> FrontendBodyReader<I> {
@@ -224,7 +224,7 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
     ) -> Self {
         Self {
             max_head_length,
-            reader: BodyReader::new(io, mode, parse_slots),
+            reader: PeekableBodyReader::new(io, mode, parse_slots),
         }
     }
 

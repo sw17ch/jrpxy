@@ -599,8 +599,6 @@ enum BodyReaderState<I> {
 }
 
 pub struct BodyReader<I> {
-    /// a buffer in which we store data peeked off the socket, but not yet read
-    peeked: Buffer,
     state: BodyReaderState<I>,
 }
 
@@ -616,7 +614,6 @@ impl<I> BodyReader<I> {
 
 impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     pub fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
-        let peeked = Buffer::new(BytesMut::new());
         let state = match mode {
             BodyReadMode::Bodyless => BodyReaderState::Bodyless(io),
             BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader {
@@ -629,56 +626,10 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
                 BodyReaderState::CL(ContentLengthBodyReader::new(length, io))
             }
         };
-        Self { peeked, state }
-    }
-
-    /// Peek data from the body, and allow it to be observed, but do not remove
-    /// it from the read buffer. Always returns data starting from the first
-    /// byte not yet read. That is, repeated calls to this method with the same
-    /// length will always yield the same result unless read calls are
-    /// interspersed with peek calls.
-    pub async fn peek(&mut self, target_len: usize) -> BodyResult<(bool, &[u8])> {
-        let mut remaining_len = target_len.saturating_sub(self.peeked.len());
-        loop {
-            let complete = match &mut self.state {
-                BodyReaderState::Bodyless(_io) => true,
-                BodyReaderState::CL(cl) => {
-                    match cl.read(remaining_len).await? {
-                        BodyReadResult::DidRead(bytes) => {
-                            self.peeked.extend_from_slice(&bytes);
-                        }
-                        BodyReadResult::Complete => {}
-                    }
-                    cl.remaining() == 0
-                }
-                BodyReaderState::TE(te) => {
-                    match te.read(remaining_len).await? {
-                        BodyReadResult::DidRead(bytes) => {
-                            self.peeked.extend_from_slice(&bytes);
-                        }
-                        BodyReadResult::Complete => {}
-                    }
-                    te.drained()
-                }
-            };
-
-            remaining_len = target_len.saturating_sub(self.peeked.len());
-            if !complete && remaining_len > 0 {
-                continue;
-            }
-
-            let len = self.peeked.len().min(target_len);
-            return Ok((complete, &self.peeked[0..len]));
-        }
+        Self { state }
     }
 
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
-        if !self.peeked.is_empty() {
-            // If there's already data in the peek buffer, return that first.
-            let at = self.peeked.len().min(max_len);
-            return Ok(Some(self.peeked.split_to(at).freeze()));
-        }
-
         let res = match &mut self.state {
             BodyReaderState::Bodyless(_io) => return Ok(None),
             BodyReaderState::CL(cl) => cl.read(max_len).await?,
@@ -711,9 +662,7 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
             "in spite of our best attempts, we failed to drain"
         );
 
-        let Self { peeked, state } = self;
-
-        debug_assert!(peeked.is_empty());
+        let Self { state } = self;
 
         let io = match state {
             BodyReaderState::Bodyless(io) => io,
@@ -732,6 +681,73 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     }
 }
 
+pub struct PeekableBodyReader<I> {
+    /// a buffer in which we store data peeked off the socket, but not yet read
+    peeked: Buffer,
+    inner: BodyReader<I>,
+}
+
+impl<I> PeekableBodyReader<I> {
+    pub fn mode(&self) -> BodyReadMode {
+        self.inner.mode()
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> PeekableBodyReader<I> {
+    pub fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
+        Self {
+            peeked: Buffer::new(BytesMut::new()),
+            inner: BodyReader::new(io, mode, parse_slots),
+        }
+    }
+
+    /// Peek data from the body, and allow it to be observed, but do not remove
+    /// it from the read buffer. Always returns data starting from the first
+    /// byte not yet read. That is, repeated calls to this method with the same
+    /// length will always yield the same result unless read calls are
+    /// interspersed with peek calls.
+    pub async fn peek(&mut self, target_len: usize) -> BodyResult<(bool, &[u8])> {
+        let mut remaining_len = target_len.saturating_sub(self.peeked.len());
+        loop {
+            let complete = match self.inner.read(remaining_len).await? {
+                None => true,
+                Some(bytes) => {
+                    self.peeked.extend_from_slice(&bytes);
+                    self.inner.drained()
+                }
+            };
+
+            remaining_len = target_len.saturating_sub(self.peeked.len());
+            if !complete && remaining_len > 0 {
+                continue;
+            }
+
+            let len = self.peeked.len().min(target_len);
+            return Ok((complete, &self.peeked[0..len]));
+        }
+    }
+
+    pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
+        if !self.peeked.is_empty() {
+            // If there's already data in the peek buffer, return that first.
+            let at = self.peeked.len().min(max_len);
+            return Ok(Some(self.peeked.split_to(at).freeze()));
+        }
+        self.inner.read(max_len).await
+    }
+
+    pub fn drained(&self) -> bool {
+        self.inner.drained()
+    }
+
+    /// Ensure the body is fully drained from the socket
+    pub async fn drain(self) -> BodyResult<IoBuffer<I>> {
+        // peeked bytes have already been consumed from the underlying IO,
+        // so we just need to drain the inner reader
+        self.inner.drain().await
+    }
+}
+
 #[cfg(test)]
 mod test {
     use std::time::Duration;
@@ -740,7 +756,7 @@ mod test {
     use jrpxy_util::io_buffer::IoBuffer;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{BodyError, BodyReadMode, BodyReader, ChunkedBodyWriter};
+    use crate::{BodyError, BodyReadMode, BodyReader, ChunkedBodyWriter, PeekableBodyReader};
 
     #[tokio::test]
     async fn cl_peek_full() {
@@ -748,7 +764,7 @@ mod test {
             0123456789
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::ContentLength(10),
             ParseSlots::default(),
@@ -774,13 +790,51 @@ mod test {
         assert_eq!(&b"0123456789"[..], buf);
     }
 
+
+    #[tokio::test]
+    async fn cl_peek_full_then_partial() {
+        let input = b"\
+            0123456789
+            ";
+
+        let mut br = PeekableBodyReader::new(
+            IoBuffer::new(&input[..]),
+            BodyReadMode::ContentLength(10),
+            ParseSlots::default(),
+        );
+        let (complete, slice) = br.peek(5).await.expect("peek works");
+        assert!(!complete);
+        assert_eq!(b"01234", slice);
+
+        let (complete, slice) = br.peek(10).await.expect("peek works");
+        assert!(complete);
+        assert_eq!(b"0123456789", slice);
+
+        // peek again, but with a value longer than the total IO
+        let (complete, slice) = br.peek(11).await.expect("peek works");
+        assert!(complete);
+        assert_eq!(b"0123456789", slice);
+
+        // peek one more time, but smaller than the previous peek
+        let (complete, slice) = br.peek(1).await.expect("peek works");
+        assert!(complete);
+        assert_eq!(b"0", slice);
+
+        let buf = br
+            .read(10)
+            .await
+            .expect("peek works")
+            .expect("didn't get buf");
+        assert_eq!(&b"0123456789"[..], buf);
+    }
+
     #[tokio::test]
     async fn cl_peek_partial() {
         let input = b"\
             0123456789
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::ContentLength(10),
             ParseSlots::default(),
@@ -840,7 +894,7 @@ mod test {
         });
 
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
-            let mut reader = BodyReader::new(
+            let mut reader = PeekableBodyReader::new(
                 IoBuffer::new(right),
                 BodyReadMode::ContentLength(10),
                 ParseSlots::default(),
@@ -875,7 +929,7 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::Chunk,
             ParseSlots::default(),
@@ -908,7 +962,7 @@ mod test {
     async fn bodyless_peek() {
         let input = b"";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::Bodyless,
             ParseSlots::default(),
@@ -932,7 +986,7 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::Chunk,
             ParseSlots::default(),

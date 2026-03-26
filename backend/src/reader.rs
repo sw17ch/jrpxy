@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use jrpxy_body::{BodyReadMode, BodyReader};
+use jrpxy_body::{BodyReadMode, PeekableBodyReader};
 use jrpxy_http_message::{
     framing::HeadFraming,
     message::{ParseSlots, Response},
@@ -243,7 +243,7 @@ impl<I: AsyncReadExt + Unpin> BackendResponse<I> {
 }
 
 pub struct BackendBodyReader<I> {
-    reader: BodyReader<I>,
+    reader: PeekableBodyReader<I>,
 }
 
 impl<I> BackendBodyReader<I> {
@@ -255,7 +255,7 @@ impl<I> BackendBodyReader<I> {
 impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
     fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         Self {
-            reader: BodyReader::new(io, mode, parse_slots),
+            reader: PeekableBodyReader::new(io, mode, parse_slots),
         }
     }
 
