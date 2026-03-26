@@ -63,27 +63,32 @@ pub fn is_framing_header(name: &[u8]) -> bool {
 }
 
 #[derive(Debug)]
-pub enum BodyWriterState {
+pub enum BodyWriterKind {
+    Bodyless,
     CL(ContentLengthBodyWriter),
     TE(ChunkedBodyWriter),
 }
 
-impl BodyWriterState {
+impl BodyWriterKind {
     pub async fn write<I: AsyncWriteExt + Unpin>(
         &mut self,
         mut io: I,
         buf: &[u8],
     ) -> BodyResult<()> {
         match self {
-            BodyWriterState::CL(w) => w.write(&mut io, buf).await,
-            BodyWriterState::TE(w) => w.write(&mut io, buf).await,
+            BodyWriterKind::Bodyless => {
+                return Err(BodyError::BodyOverflow(buf.len() as u64));
+            }
+            BodyWriterKind::CL(w) => w.write(&mut io, buf).await,
+            BodyWriterKind::TE(w) => w.write(&mut io, buf).await,
         }
     }
 
     pub async fn finish<I: AsyncWriteExt + Unpin>(self, mut io: I) -> BodyResult<()> {
         match self {
-            BodyWriterState::CL(w) => w.finish(&mut io).await?,
-            BodyWriterState::TE(w) => w.finish(&mut io).await?,
+            BodyWriterKind::Bodyless => {}
+            BodyWriterKind::CL(w) => w.finish(&mut io).await?,
+            BodyWriterKind::TE(w) => w.finish(&mut io).await?,
         }
         io.flush().await.map_err(BodyError::BodyWriteError)?;
         Ok(())
@@ -94,11 +99,15 @@ impl BodyWriterState {
     /// body readers from considering the body complete.
     pub async fn abort<I: AsyncWriteExt + Unpin>(self, mut io: I) -> BodyResult<()> {
         match self {
-            BodyWriterState::CL(_w) => {
+            BodyWriterKind::Bodyless => {
+                // nothing to do when aborting. we can't even break framing. the
+                // only thing we can do is drop the connection.
+            }
+            BodyWriterKind::CL(_w) => {
                 // do nothing when aborting a content-length body. just drop the
                 // connection.
             }
-            BodyWriterState::TE(w) => {
+            BodyWriterKind::TE(w) => {
                 // there are chunked body readers out there that don't wait
                 // around for the empty chunk to consider a body complete, so we
                 // do something special.

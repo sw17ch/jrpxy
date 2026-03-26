@@ -1,4 +1,4 @@
-use jrpxy_body::{BodyWriterState, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header};
+use jrpxy_body::{BodyWriterKind, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header};
 use jrpxy_http_message::{framing::HeadFraming, message::Request};
 use tokio::io::{self, AsyncWriteExt};
 
@@ -19,7 +19,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
             io,
-            state: BodyWriterState::TE(ChunkedBodyWriter::new()),
+            state: BodyWriterKind::TE(ChunkedBodyWriter::new()),
         })
     }
 
@@ -34,7 +34,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
             io,
-            state: BodyWriterState::CL(ContentLengthBodyWriter::new(body_len)),
+            state: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len)),
         })
     }
 
@@ -51,7 +51,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
             io,
-            state: BodyWriterState::CL(ContentLengthBodyWriter::new(0)),
+            state: BodyWriterKind::Bodyless,
         })
     }
 
@@ -116,7 +116,7 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
 
 pub struct BackendBodyWriter<I> {
     io: I,
-    state: BodyWriterState,
+    state: BodyWriterKind,
 }
 
 impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {

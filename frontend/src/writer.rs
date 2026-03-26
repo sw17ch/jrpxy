@@ -64,7 +64,7 @@
 //! }
 //! ```
 
-use jrpxy_body::BodyWriterState;
+use jrpxy_body::BodyWriterKind;
 use jrpxy_body::ChunkedBodyWriter;
 use jrpxy_body::ContentLengthBodyWriter;
 use jrpxy_body::is_framing_header;
@@ -107,7 +107,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
             io,
-            state: BodyWriterState::TE(ChunkedBodyWriter::new()),
+            state: BodyWriterKind::TE(ChunkedBodyWriter::new()),
         })
     }
 
@@ -125,7 +125,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
             io,
-            state: BodyWriterState::CL(ContentLengthBodyWriter::new(body_len)),
+            state: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len)),
         })
     }
 
@@ -148,7 +148,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
             io,
-            state: BodyWriterState::CL(ContentLengthBodyWriter::new(0)),
+            state: BodyWriterKind::CL(ContentLengthBodyWriter::new(0)),
         })
     }
 }
@@ -215,7 +215,7 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
 /// A frontend response body writer.
 pub struct FrontendBodyWriter<I> {
     io: I,
-    state: BodyWriterState,
+    state: BodyWriterKind,
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
