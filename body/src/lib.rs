@@ -220,6 +220,8 @@ impl ChunkedBodyWriter {
         mut io: W,
         trailers: &Headers,
     ) -> BodyResult<()> {
+        // TODO: write vectored
+
         io.write_all(b"0\r\n")
             .await
             .map_err(BodyError::BodyWriteError)?;
