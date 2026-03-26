@@ -220,9 +220,24 @@ impl ChunkedBodyWriter {
         mut io: W,
         trailers: &Headers,
     ) -> BodyResult<()> {
-        // TODO: actually emit the trailers
-        let _ = trailers;
-        io.write_all(b"0\r\n\r\n")
+        io.write_all(b"0\r\n")
+            .await
+            .map_err(BodyError::BodyWriteError)?;
+        for (name, value) in trailers.iter() {
+            io.write_all(name)
+                .await
+                .map_err(BodyError::BodyWriteError)?;
+            io.write_all(b": ")
+                .await
+                .map_err(BodyError::BodyWriteError)?;
+            io.write_all(value)
+                .await
+                .map_err(BodyError::BodyWriteError)?;
+            io.write_all(b"\r\n")
+                .await
+                .map_err(BodyError::BodyWriteError)?;
+        }
+        io.write_all(b"\r\n")
             .await
             .map_err(BodyError::BodyWriteError)
     }
