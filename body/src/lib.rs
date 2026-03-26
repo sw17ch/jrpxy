@@ -610,6 +610,10 @@ impl<I> BodyReader<I> {
             BodyReaderState::TE(_) => BodyReadMode::Chunk,
         }
     }
+
+    pub fn peekable(self) -> PeekableBodyReader<I> {
+        PeekableBodyReader::new(self)
+    }
 }
 
 impl<I: AsyncReadExt + Unpin> BodyReader<I> {
@@ -688,19 +692,19 @@ pub struct PeekableBodyReader<I> {
 }
 
 impl<I> PeekableBodyReader<I> {
+    pub fn new(reader: BodyReader<I>) -> Self {
+        Self {
+            peeked: Buffer::new(BytesMut::new()),
+            inner: reader,
+        }
+    }
+
     pub fn mode(&self) -> BodyReadMode {
         self.inner.mode()
     }
 }
 
 impl<I: AsyncReadExt + Unpin> PeekableBodyReader<I> {
-    pub fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
-        Self {
-            peeked: Buffer::new(BytesMut::new()),
-            inner: BodyReader::new(io, mode, parse_slots),
-        }
-    }
-
     /// Peek data from the body, and allow it to be observed, but do not remove
     /// it from the read buffer. Always returns data starting from the first
     /// byte not yet read. That is, repeated calls to this method with the same
@@ -756,7 +760,7 @@ mod test {
     use jrpxy_util::io_buffer::IoBuffer;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{BodyError, BodyReadMode, BodyReader, ChunkedBodyWriter, PeekableBodyReader};
+    use crate::{BodyError, BodyReadMode, BodyReader, ChunkedBodyWriter};
 
     #[tokio::test]
     async fn cl_peek_full() {
@@ -764,11 +768,12 @@ mod test {
             0123456789
             ";
 
-        let mut br = PeekableBodyReader::new(
+        let mut br = BodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::ContentLength(10),
             ParseSlots::default(),
-        );
+        )
+        .peekable();
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(!complete);
         assert_eq!(b"01234", slice);
@@ -790,18 +795,18 @@ mod test {
         assert_eq!(&b"0123456789"[..], buf);
     }
 
-
     #[tokio::test]
     async fn cl_peek_full_then_partial() {
         let input = b"\
             0123456789
             ";
 
-        let mut br = PeekableBodyReader::new(
+        let mut br = BodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::ContentLength(10),
             ParseSlots::default(),
-        );
+        )
+        .peekable();
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(!complete);
         assert_eq!(b"01234", slice);
@@ -834,11 +839,12 @@ mod test {
             0123456789
             ";
 
-        let mut br = PeekableBodyReader::new(
+        let mut br = BodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::ContentLength(10),
             ParseSlots::default(),
-        );
+        )
+        .peekable();
 
         // read one byte
         let buf = br
@@ -894,11 +900,12 @@ mod test {
         });
 
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
-            let mut reader = PeekableBodyReader::new(
+            let mut reader = BodyReader::new(
                 IoBuffer::new(right),
                 BodyReadMode::ContentLength(10),
                 ParseSlots::default(),
-            );
+            )
+            .peekable();
             let (complete, buf) = reader.peek(9).await.expect("can't break into parts");
 
             assert!(!complete);
@@ -929,11 +936,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = PeekableBodyReader::new(
+        let mut br = BodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::Chunk,
             ParseSlots::default(),
-        );
+        )
+        .peekable();
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(!complete);
         assert_eq!(b"01234", slice);
@@ -962,11 +970,12 @@ mod test {
     async fn bodyless_peek() {
         let input = b"";
 
-        let mut br = PeekableBodyReader::new(
+        let mut br = BodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::Bodyless,
             ParseSlots::default(),
-        );
+        )
+        .peekable();
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(complete);
         assert_eq!(b"", slice);
@@ -986,11 +995,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = PeekableBodyReader::new(
+        let mut br = BodyReader::new(
             IoBuffer::new(&input[..]),
             BodyReadMode::Chunk,
             ParseSlots::default(),
-        );
+        )
+        .peekable();
         let (complete, slice) = br.peek(10).await.expect("peek works");
         assert!(complete);
         assert_eq!(b"0123012", slice);

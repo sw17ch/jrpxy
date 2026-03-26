@@ -242,20 +242,6 @@ impl<FR, FW, BP> ReadFrontendRequest<FR, FW, BP> {
     }
 }
 
-impl<FR, FW, BP> ReadFrontendRequest<FR, FW, BP>
-where
-    FR: AsyncReadExt + Unpin,
-    FW: AsyncWriteExt + Unpin,
-{
-    pub async fn peek_body(&mut self, length: usize) -> ProxyResult<(bool, &[u8])> {
-        self.proxy_request
-            .frontend
-            .peek_body(length)
-            .await
-            .map_err(|e| e.into())
-    }
-}
-
 impl<FR, FW, BR, BW, BP> ReadFrontendRequest<FR, FW, BP>
 where
     BR: AsyncReadExt + Unpin,
@@ -876,12 +862,6 @@ impl<I> ProxyResponse<I> {
         // can now break the backend into parts and return them as a frontend
         // response
         backend.into_parts()
-    }
-}
-
-impl<I: AsyncReadExt + Unpin> ProxyResponse<I> {
-    pub async fn peek_body(&mut self, len: usize) -> BackendResult<(bool, &[u8])> {
-        self.backend.peek_body(len).await
     }
 }
 

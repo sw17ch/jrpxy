@@ -39,7 +39,7 @@
 //! ```
 
 use bytes::Bytes;
-use jrpxy_body::{BodyReadMode, PeekableBodyReader};
+use jrpxy_body::{BodyReadMode, BodyReader, PeekableBodyReader};
 use jrpxy_http_message::{
     framing::HeadFraming,
     message::{ParseSlots, Request},
@@ -166,10 +166,10 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
 /// consumed or drained.
 ///
 /// Use [`FrontendRequest::into_parts`] to retrieve the [`Request`] and
-/// [`FrontendRequestBody`].
+/// [`FrontendBodyReader`].
 pub struct FrontendRequest<I> {
-    pub(crate) req: Request,
-    pub(crate) reader: FrontendBodyReader<I>,
+    req: Request,
+    reader: FrontendBodyReader<I>,
 }
 
 impl<I> FrontendRequest<I> {
@@ -183,7 +183,7 @@ impl<I> FrontendRequest<I> {
         &mut self.req
     }
 
-    /// Split into the [`Request`] and [`FrontendRequestBody`].
+    /// Split into the [`Request`] and [`FrontendBodyReader`].
     pub fn into_parts(self) -> (Request, FrontendBodyReader<I>) {
         let Self { req, reader } = self;
         (req, reader)
@@ -195,18 +195,10 @@ impl<I> FrontendRequest<I> {
     }
 }
 
-impl<I: AsyncReadExt + Unpin> FrontendRequest<I> {
-    /// Peek bytes of the body, but do not drain them. Peek always starts from
-    /// the beginning of the body.
-    pub async fn peek_body(&mut self, len: usize) -> Result<(bool, &[u8]), FrontendError> {
-        self.reader.peek(len).await
-    }
-}
-
 /// A frontend request body reader.
 pub struct FrontendBodyReader<I> {
-    pub(crate) max_head_length: usize,
-    pub(crate) reader: PeekableBodyReader<I>,
+    max_head_length: usize,
+    reader: BodyReader<I>,
 }
 
 impl<I> FrontendBodyReader<I> {
@@ -216,7 +208,7 @@ impl<I> FrontendBodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
-    pub(crate) fn new(
+    fn new(
         io: IoBuffer<I>,
         max_head_length: usize,
         mode: BodyReadMode,
@@ -224,10 +216,63 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
     ) -> Self {
         Self {
             max_head_length,
-            reader: PeekableBodyReader::new(io, mode, parse_slots),
+            reader: BodyReader::new(io, mode, parse_slots),
         }
     }
 
+    /// Read up to `max_len` bytes from the body. Returns `None` when the body
+    /// is complete.
+    pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
+        self.reader
+            .read(max_len)
+            .await
+            .map_err(FrontendError::BodyReadError)
+    }
+
+    /// Returns true when the body is fully drained.
+    pub fn drained(&self) -> bool {
+        self.reader.drained()
+    }
+
+    /// Convert this reader into a [`FrontendPeekableBodyReader`] that supports
+    /// peeking at body bytes without consuming them.
+    pub fn peekable(self) -> FrontendPeekableBodyReader<I> {
+        FrontendPeekableBodyReader::new(self)
+    }
+
+    /// Drain all remaining bytes from the body and return a new
+    /// [`FrontendReader`] ready to read the next request in the pipeline.
+    pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
+        let max_head_len = self.max_head_length;
+        let io = self
+            .reader
+            .drain()
+            .await
+            .map_err(FrontendError::BodyReadError)?;
+        Ok(FrontendReader::new_with_buffer(io, max_head_len))
+    }
+}
+
+/// A frontend request body reader with peek support.
+pub struct FrontendPeekableBodyReader<I> {
+    max_head_length: usize,
+    reader: PeekableBodyReader<I>,
+}
+
+impl<I> FrontendPeekableBodyReader<I> {
+    pub fn new(reader: FrontendBodyReader<I>) -> Self {
+        Self {
+            max_head_length: reader.max_head_length,
+            reader: reader.reader.peekable(),
+        }
+    }
+
+    pub fn mode(&self) -> BodyReadMode {
+        self.reader.mode()
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> FrontendPeekableBodyReader<I> {
     /// Peek bytes from the body. Repeated calls to peek will start from the
     /// same offset until the bytes are read from the body. That is, peek always
     /// starts with the same data until that data is read out.
@@ -273,10 +318,7 @@ mod test {
     use jrpxy_body::BodyError;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{
-        error::FrontendError,
-        reader::{FrontendBodyReader, FrontendReader},
-    };
+    use crate::{error::FrontendError, reader::FrontendReader};
 
     #[tokio::test]
     async fn read_cl_frontend() {
@@ -289,12 +331,11 @@ mod test {
             ";
 
         let reader = FrontendReader::new(buf.as_slice(), 128);
-        let (req, body) = reader
+        let (req, mut body) = reader
             .read()
             .await
             .expect("can't break into parts")
             .into_parts();
-        let mut body = FrontendBodyReader::from(body);
 
         assert_eq!(&b"GET"[..], req.method());
         assert_eq!(&b"/cl"[..], req.path());
@@ -324,7 +365,7 @@ mod test {
             .await
             .expect("can't break into parts")
             .into_parts();
-        let mut body = FrontendBodyReader::from(body);
+        let mut body = body.peekable();
 
         assert_eq!(&b"GET"[..], req.method());
         assert_eq!(&b"/cl"[..], req.path());
@@ -367,12 +408,11 @@ mod test {
             ";
 
         let reader = FrontendReader::new(buf.as_slice(), 128);
-        let (req, body) = reader
+        let (req, mut body) = reader
             .read()
             .await
             .expect("can't break into parts")
             .into_parts();
-        let mut body = FrontendBodyReader::from(body);
 
         assert_eq!(&b"GET"[..], req.method());
         assert_eq!(&b"/te"[..], req.path());
@@ -417,19 +457,16 @@ mod test {
             .await
             .expect("can't break into parts")
             .into_parts();
-        let body = FrontendBodyReader::from(body);
-
         assert_eq!(&b"GET"[..], req.method());
         assert_eq!(&b"/te"[..], req.path());
 
         // first request finished. get another reader out for the following request
         let reader = body.drain().await.unwrap();
-        let (req, body) = reader
+        let (req, mut body) = reader
             .read()
             .await
             .expect("can't break into parts")
             .into_parts();
-        let mut body = FrontendBodyReader::from(body);
         assert_eq!(&b"POST"[..], req.method());
         assert_eq!(&b"/cl"[..], req.path());
         let buf = body.read(128).await.unwrap().unwrap();
@@ -462,12 +499,11 @@ mod test {
             ";
 
         let reader = FrontendReader::new(buf.as_slice(), 128);
-        let (req, body) = reader
+        let (req, mut body) = reader
             .read()
             .await
             .expect("can't break into parts")
             .into_parts();
-        let mut body = FrontendBodyReader::from(body);
 
         assert_eq!(&b"GET"[..], req.method());
         assert_eq!(&b"/cl"[..], req.path());
@@ -493,12 +529,11 @@ mod test {
             ";
 
         let reader = FrontendReader::new(buf.as_slice(), 128);
-        let (_req, body) = reader
+        let (_req, mut body) = reader
             .read()
             .await
             .expect("can't break into parts")
             .into_parts();
-        let mut body = FrontendBodyReader::from(body);
 
         assert!(matches!(
             body.read(128).await,
@@ -520,7 +555,7 @@ mod test {
             .await
             .expect("can't break into parts")
             .into_parts();
-        let mut body = FrontendBodyReader::from(body);
+        let mut body = body;
 
         assert_eq!(&b"01"[..], body.read(128).await.unwrap().unwrap());
         assert!(matches!(
@@ -547,7 +582,7 @@ mod test {
             .await
             .expect("can't break into parts")
             .into_parts();
-        let mut body = FrontendBodyReader::from(body);
+        let mut body = body;
 
         assert_eq!(&b"GET"[..], req.method());
         assert_eq!(&b"/te"[..], req.path());
@@ -595,7 +630,7 @@ mod test {
                 .await
                 .expect("can't break into parts")
                 .into_parts();
-            let mut body = FrontendBodyReader::from(body);
+            let mut body = body;
 
             assert_eq!(&b"GET"[..], req.method());
             assert_eq!(&b"/cl"[..], req.path());
@@ -648,7 +683,7 @@ mod test {
                 .await
                 .expect("can't break into parts")
                 .into_parts();
-            let mut body = FrontendBodyReader::from(body);
+            let mut body = body;
 
             assert_eq!(&b"GET"[..], req.method());
             assert_eq!(&b"/te"[..], req.path());

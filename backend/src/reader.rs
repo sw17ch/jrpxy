@@ -1,5 +1,5 @@
 use bytes::Bytes;
-use jrpxy_body::{BodyReadMode, PeekableBodyReader};
+use jrpxy_body::{BodyReadMode, BodyReader, PeekableBodyReader};
 use jrpxy_http_message::{
     framing::HeadFraming,
     message::{ParseSlots, Response},
@@ -236,14 +236,9 @@ impl<I> BackendResponse<I> {
     }
 }
 
-impl<I: AsyncReadExt + Unpin> BackendResponse<I> {
-    pub async fn peek_body(&mut self, len: usize) -> BackendResult<(bool, &[u8])> {
-        self.reader.peek(len).await
-    }
-}
-
+/// A backend response body reader.
 pub struct BackendBodyReader<I> {
-    reader: PeekableBodyReader<I>,
+    reader: BodyReader<I>,
 }
 
 impl<I> BackendBodyReader<I> {
@@ -255,10 +250,53 @@ impl<I> BackendBodyReader<I> {
 impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
     fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         Self {
-            reader: PeekableBodyReader::new(io, mode, parse_slots),
+            reader: BodyReader::new(io, mode, parse_slots),
         }
     }
 
+    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
+        self.reader
+            .read(max_len)
+            .await
+            .map_err(BackendError::BodyReadError)
+    }
+
+    pub fn drained(&self) -> bool {
+        self.reader.drained()
+    }
+
+    pub fn peekable(self) -> BackendPeekableBodyReader<I> {
+        BackendPeekableBodyReader::new(self)
+    }
+
+    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+        let io = self
+            .reader
+            .drain()
+            .await
+            .map_err(BackendError::BodyReadError)?;
+        Ok(BackendReader::new_with_iobuffer(io))
+    }
+}
+
+/// A backend response body reader with peek support.
+pub struct BackendPeekableBodyReader<I> {
+    reader: PeekableBodyReader<I>,
+}
+
+impl<I> BackendPeekableBodyReader<I> {
+    pub fn new(reader: BackendBodyReader<I>) -> Self {
+        Self {
+            reader: reader.reader.peekable(),
+        }
+    }
+
+    pub fn mode(&self) -> BodyReadMode {
+        self.reader.mode()
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> BackendPeekableBodyReader<I> {
     pub async fn peek(&mut self, len: usize) -> BackendResult<(bool, &[u8])> {
         self.reader
             .peek(len)
@@ -292,7 +330,7 @@ mod test {
     use bytes::Bytes;
     use jrpxy_http_message::version::HttpVersion;
 
-    use crate::reader::{BackendBodyReader, BackendReader};
+    use crate::reader::BackendReader;
 
     #[tokio::test]
     async fn read_cl_backend() {
@@ -305,14 +343,13 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice());
-        let (res, br) = reader
+        let (res, mut br) = reader
             .read(true, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
             .unwrap()
             .into_parts();
-        let mut br = BackendBodyReader::from(br);
 
         assert_eq!(HttpVersion::Http11, res.version());
         assert_eq!(200, res.code());
@@ -349,7 +386,7 @@ mod test {
             .try_into_response()
             .unwrap()
             .into_parts();
-        let mut br = BackendBodyReader::from(br);
+        let mut br = br.peekable();
 
         assert_eq!(HttpVersion::Http11, res.version());
         assert_eq!(200, res.code());
@@ -395,14 +432,13 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice());
-        let (res, br) = reader
+        let (res, mut br) = reader
             .read(true, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
             .unwrap()
             .into_parts();
-        let mut br = BackendBodyReader::from(br);
 
         assert_eq!(HttpVersion::Http11, res.version());
         assert_eq!(200, res.code());
@@ -444,7 +480,7 @@ mod test {
             .try_into_response()
             .unwrap()
             .into_parts();
-        let mut br = BackendBodyReader::from(br);
+        let mut br = br.peekable();
 
         assert_eq!(HttpVersion::Http11, res.version());
         assert_eq!(200, res.code());
@@ -484,14 +520,13 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice());
-        let (res, br) = reader
+        let (res, mut br) = reader
             .read(false, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
             .unwrap()
             .into_parts();
-        let mut br = BackendBodyReader::from(br);
 
         assert_eq!(HttpVersion::Http11, res.version());
         assert_eq!(200, res.code());
@@ -515,14 +550,13 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice());
-        let (res, br) = reader
+        let (res, mut br) = reader
             .read(false, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
             .unwrap()
             .into_parts();
-        let mut br = BackendBodyReader::from(br);
 
         assert_eq!(HttpVersion::Http11, res.version());
         assert_eq!(200, res.code());
@@ -545,14 +579,13 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice());
-        let (_res, br) = reader
+        let (_res, mut br) = reader
             .read(true, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
             .unwrap()
             .into_parts();
-        let mut br = BackendBodyReader::from(br);
         let body = br.read(1024).await.expect("can read");
         assert!(body.is_none());
     }
