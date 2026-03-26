@@ -63,8 +63,17 @@ pub fn is_framing_header(name: &[u8]) -> bool {
 }
 
 #[derive(Debug)]
+pub struct BodylessBodyWriter<I>(I);
+
+impl<I> BodylessBodyWriter<I> {
+    pub fn new(io: I) -> Self {
+        Self(io)
+    }
+}
+
+#[derive(Debug)]
 pub enum BodyWriterKind<I> {
-    Bodyless(I),
+    Bodyless(BodylessBodyWriter<I>),
     CL(ContentLengthBodyWriter, I),
     TE(ChunkedBodyWriter<I>),
 }
@@ -80,7 +89,7 @@ impl<I: AsyncWriteExt + Unpin> BodyWriterKind<I> {
 
     pub async fn finish(self) -> BodyResult<I> {
         match self {
-            BodyWriterKind::Bodyless(mut io) => {
+            BodyWriterKind::Bodyless(BodylessBodyWriter(mut io)) => {
                 io.flush().await.map_err(BodyError::BodyWriteError)?;
                 Ok(io)
             }

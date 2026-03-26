@@ -65,6 +65,7 @@
 //! ```
 
 use jrpxy_body::BodyWriterKind;
+use jrpxy_body::BodylessBodyWriter;
 use jrpxy_body::ChunkedBodyWriter;
 use jrpxy_body::ContentLengthBodyWriter;
 use jrpxy_body::is_framing_header;
@@ -145,7 +146,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
-            kind: BodyWriterKind::Bodyless(io),
+            kind: BodyWriterKind::Bodyless(BodylessBodyWriter::new(io)),
         })
     }
 }

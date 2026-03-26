@@ -1,5 +1,5 @@
 pub use jrpxy_body::BodyWriterKind;
-use jrpxy_body::{ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header};
+use jrpxy_body::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header};
 use jrpxy_http_message::{framing::HeadFraming, message::Request};
 use tokio::io::{self, AsyncWriteExt};
 
@@ -49,7 +49,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
-            kind: BodyWriterKind::Bodyless(io),
+            kind: BodyWriterKind::Bodyless(BodylessBodyWriter::new(io)),
         })
     }
 
