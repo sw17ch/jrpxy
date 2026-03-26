@@ -586,7 +586,7 @@ impl<I> FinalChunkReader<I> {
 }
 
 #[derive(Debug)]
-enum BodyReaderState<I> {
+enum BodyReaderKind<I> {
     Bodyless(BodylessBodyReader<I>),
     CL(ContentLengthBodyReader<I>),
     TE(ChunkedBodyReader<I>),
@@ -596,15 +596,15 @@ enum BodyReaderState<I> {
 pub struct BodylessBodyReader<I>(IoBuffer<I>);
 
 pub struct BodyReader<I> {
-    state: BodyReaderState<I>,
+    state: BodyReaderKind<I>,
 }
 
 impl<I> BodyReader<I> {
     pub fn mode(&self) -> BodyReadMode {
         match &self.state {
-            BodyReaderState::Bodyless(_) => BodyReadMode::Bodyless,
-            BodyReaderState::CL(r) => BodyReadMode::ContentLength(r.length),
-            BodyReaderState::TE(_) => BodyReadMode::Chunk,
+            BodyReaderKind::Bodyless(_) => BodyReadMode::Bodyless,
+            BodyReaderKind::CL(r) => BodyReadMode::ContentLength(r.length),
+            BodyReaderKind::TE(_) => BodyReadMode::Chunk,
         }
     }
 
@@ -616,15 +616,15 @@ impl<I> BodyReader<I> {
 impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     pub fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         let state = match mode {
-            BodyReadMode::Bodyless => BodyReaderState::Bodyless(BodylessBodyReader(io)),
-            BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader {
+            BodyReadMode::Bodyless => BodyReaderKind::Bodyless(BodylessBodyReader(io)),
+            BodyReadMode::Chunk => BodyReaderKind::TE(ChunkedBodyReader {
                 inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader {
                     io,
                     parse_slots,
                 })),
             }),
             BodyReadMode::ContentLength(length) => {
-                BodyReaderState::CL(ContentLengthBodyReader::new(length, io))
+                BodyReaderKind::CL(ContentLengthBodyReader::new(length, io))
             }
         };
         Self { state }
@@ -632,17 +632,17 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
 
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         match &mut self.state {
-            BodyReaderState::Bodyless(_io) => Ok(None),
-            BodyReaderState::CL(cl) => Ok(cl.read(max_len).await?),
-            BodyReaderState::TE(te) => Ok(te.read(max_len).await?),
+            BodyReaderKind::Bodyless(_io) => Ok(None),
+            BodyReaderKind::CL(cl) => Ok(cl.read(max_len).await?),
+            BodyReaderKind::TE(te) => Ok(te.read(max_len).await?),
         }
     }
 
     pub fn drained(&self) -> bool {
         match &self.state {
-            BodyReaderState::Bodyless(_io) => true,
-            BodyReaderState::CL(cl) => cl.remaining() == 0,
-            BodyReaderState::TE(te) => te.drained(),
+            BodyReaderKind::Bodyless(_io) => true,
+            BodyReaderKind::CL(cl) => cl.remaining() == 0,
+            BodyReaderKind::TE(te) => te.drained(),
         }
     }
 
@@ -662,12 +662,12 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
         let Self { state } = self;
 
         let io = match state {
-            BodyReaderState::Bodyless(BodylessBodyReader(io)) => io,
-            BodyReaderState::CL(ContentLengthBodyReader { length, offset, io }) => {
+            BodyReaderKind::Bodyless(BodylessBodyReader(io)) => io,
+            BodyReaderKind::CL(ContentLengthBodyReader { length, offset, io }) => {
                 debug_assert_eq!(offset, length);
                 io
             }
-            BodyReaderState::TE(te) => {
+            BodyReaderKind::TE(te) => {
                 let (io, trailers) = te.drain().await?;
                 let _ignored_trailers = trailers;
                 io
