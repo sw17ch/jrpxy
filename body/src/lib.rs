@@ -593,10 +593,13 @@ pub enum BodyReadResult {
 
 #[derive(Debug)]
 enum BodyReaderState<I> {
-    Bodyless(IoBuffer<I>),
+    Bodyless(BodylessBodyReader<I>),
     CL(ContentLengthBodyReader<I>),
     TE(ChunkedBodyReader<I>),
 }
+
+#[derive(Debug)]
+pub struct BodylessBodyReader<I>(IoBuffer<I>);
 
 pub struct BodyReader<I> {
     state: BodyReaderState<I>,
@@ -619,7 +622,7 @@ impl<I> BodyReader<I> {
 impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     pub fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         let state = match mode {
-            BodyReadMode::Bodyless => BodyReaderState::Bodyless(io),
+            BodyReadMode::Bodyless => BodyReaderState::Bodyless(BodylessBodyReader(io)),
             BodyReadMode::Chunk => BodyReaderState::TE(ChunkedBodyReader {
                 inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader {
                     io,
@@ -669,7 +672,7 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
         let Self { state } = self;
 
         let io = match state {
-            BodyReaderState::Bodyless(io) => io,
+            BodyReaderState::Bodyless(BodylessBodyReader(io)) => io,
             BodyReaderState::CL(ContentLengthBodyReader { length, offset, io }) => {
                 debug_assert_eq!(offset, length);
                 io
