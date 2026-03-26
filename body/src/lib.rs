@@ -353,6 +353,12 @@ impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
     }
 }
 
+impl<I> ChunkedBodyReader<I> {
+    fn drained(&self) -> bool {
+        matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
+    }
+}
+
 impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
     async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         loop {
@@ -394,11 +400,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
         }
     }
 
-    fn drained(&self) -> bool {
-        matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
-    }
-
-    async fn drain(self) -> BodyResult<(IoBuffer<I>, Headers)> {
+    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, Headers)> {
         let Self { inner } = self;
         let Some(mut inner) = inner else {
             return Err(BodyError::ReadAfterError);
@@ -617,7 +619,7 @@ impl<I> FinalChunkReader<I> {
 }
 
 #[derive(Debug)]
-enum BodyReaderKind<I> {
+pub enum BodyReaderKind<I> {
     Bodyless(BodylessBodyReader<I>),
     CL(ContentLengthBodyReader<I>),
     TE(ChunkedBodyReader<I>),
@@ -641,6 +643,14 @@ impl<I> BodyReader<I> {
 
     pub fn peekable(self) -> PeekableBodyReader<I> {
         PeekableBodyReader::new(self)
+    }
+
+    pub fn into_kind(self) -> BodyReaderKind<I> {
+        self.state
+    }
+
+    pub fn from_kind(state: BodyReaderKind<I>) -> Self {
+        Self { state }
     }
 }
 

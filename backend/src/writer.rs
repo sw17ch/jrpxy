@@ -1,4 +1,5 @@
-use jrpxy_body::{BodyWriterKind, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header};
+pub use jrpxy_body::BodyWriterKind;
+use jrpxy_body::{ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header};
 use jrpxy_http_message::{framing::HeadFraming, message::Request};
 use tokio::io::{self, AsyncWriteExt};
 
@@ -132,6 +133,11 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
         let Self { kind } = self;
         let io = kind.finish().await.map_err(BackendError::BodyWriteError)?;
         Ok(BackendWriter { io })
+    }
+
+    pub fn into_kind(self) -> BodyWriterKind<I> {
+        let Self { kind } = self;
+        kind
     }
 }
 

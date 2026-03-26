@@ -513,7 +513,22 @@ where
                 let buf = match frontend_body_reader.read(options.body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
-                        match backend_body_writer.finish().await {
+                        let finish_result = match backend_body_writer.into_kind() {
+                            BodyWriterKind::TE(w) => {
+                                let empty = Headers::default();
+                                let trailers = frontend_body_reader.trailers().unwrap_or(&empty);
+                                w.finish_with_trailers(trailers)
+                                    .await
+                                    .map_err(BackendError::BodyWriteError)
+                                    .map(BackendWriter::new)
+                            }
+                            other => other
+                                .finish()
+                                .await
+                                .map_err(BackendError::BodyWriteError)
+                                .map(BackendWriter::new),
+                        };
+                        match finish_result {
                             Ok(w) => match frontend_body_reader.drain().await {
                                 Ok(r) => {
                                     ret = Ok((r, w));
