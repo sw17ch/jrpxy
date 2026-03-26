@@ -110,8 +110,6 @@ impl<I: AsyncWriteExt + Unpin> BodyWriterKind<I> {
                 Ok(())
             }
         }
-        io.flush().await.map_err(BodyError::BodyWriteError)?;
-        Ok(())
     }
 }
 
@@ -198,15 +196,17 @@ impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
 
         // TODO: we can avoid this heap allocation
         let chunk_header = format!("{:x}\r\n", buffer.len());
-        let chunk_footer = "\r\n";
 
-        io.write_all(chunk_header.as_bytes())
+        self.io
+            .write_all(chunk_header.as_bytes())
             .await
             .map_err(BodyError::BodyWriteError)?;
-        io.write_all(buffer)
+        self.io
+            .write_all(buffer)
             .await
             .map_err(BodyError::BodyWriteError)?;
-        io.write_all(chunk_footer.as_bytes())
+        self.io
+            .write_all(b"\r\n")
             .await
             .map_err(BodyError::BodyWriteError)?;
 
@@ -1083,11 +1083,10 @@ mod test {
 
     #[tokio::test]
     async fn chunked_write_abort() {
-        let mut write_buf = Vec::new();
-        let mut bw = ChunkedBodyWriter::new();
-        bw.write(&mut write_buf, b"hello").await.unwrap();
-        bw.write(&mut write_buf, b"there").await.unwrap();
-        bw.abort(&mut write_buf).await.unwrap();
+        let mut bw = ChunkedBodyWriter::new(Vec::new());
+        bw.write(b"hello").await.unwrap();
+        bw.write(b"there").await.unwrap();
+        let write_buf = bw.abort().await.unwrap();
 
         assert_eq!(
             "\
@@ -1102,11 +1101,10 @@ mod test {
 
     #[tokio::test]
     async fn chunked_write() {
-        let mut write_buf = Vec::new();
-        let mut bw = ChunkedBodyWriter::new();
-        bw.write(&mut write_buf, b"hello").await.unwrap();
-        bw.write(&mut write_buf, b"there").await.unwrap();
-        bw.finish(&mut write_buf).await.unwrap();
+        let mut bw = ChunkedBodyWriter::new(Vec::new());
+        bw.write(b"hello").await.unwrap();
+        bw.write(b"there").await.unwrap();
+        let write_buf = bw.finish().await.unwrap();
 
         assert_eq!(
             "\

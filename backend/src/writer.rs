@@ -112,33 +112,25 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
 }
 
 pub struct BackendBodyWriter<I> {
-    io: I,
-    state: BodyWriterKind,
+    kind: BodyWriterKind<I>,
 }
 
 impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
     pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
-        self.state
-            .write(&mut self.io, buf)
+        self.kind
+            .write(buf)
             .await
             .map_err(BackendError::BodyWriteError)
     }
 
     pub async fn abort(self) -> BackendResult<()> {
-        let Self { mut io, state } = self;
-        state
-            .abort(&mut io)
-            .await
-            .map_err(BackendError::BodyWriteError)?;
-        Ok(())
+        let Self { kind } = self;
+        kind.abort().await.map_err(BackendError::BodyWriteError)
     }
 
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
-        let Self { mut io, state } = self;
-        state
-            .finish(&mut io)
-            .await
-            .map_err(BackendError::BodyWriteError)?;
+        let Self { kind } = self;
+        let io = kind.finish().await.map_err(BackendError::BodyWriteError)?;
         Ok(BackendWriter { io })
     }
 }

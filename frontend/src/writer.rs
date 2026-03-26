@@ -106,8 +106,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
-            io,
-            state: BodyWriterKind::TE(ChunkedBodyWriter::new()),
+            kind: BodyWriterKind::TE(ChunkedBodyWriter::new(io)),
         })
     }
 
@@ -124,8 +123,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
-            io,
-            state: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len)),
+            kind: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len), io),
         })
     }
 
@@ -147,8 +145,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
-            io,
-            state: BodyWriterKind::CL(ContentLengthBodyWriter::new(0)),
+            kind: BodyWriterKind::Bodyless(io),
         })
     }
 }
@@ -214,24 +211,20 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
 
 /// A frontend response body writer.
 pub struct FrontendBodyWriter<I> {
-    io: I,
-    state: BodyWriterKind,
+    kind: BodyWriterKind<I>,
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
     pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
-        self.state
-            .write(&mut self.io, buf)
+        self.kind
+            .write(buf)
             .await
             .map_err(FrontendError::BodyWriteError)
     }
 
     pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
-        let Self { mut io, state } = self;
-        state
-            .finish(&mut io)
-            .await
-            .map_err(FrontendError::BodyWriteError)?;
+        let Self { kind } = self;
+        let io = kind.finish().await.map_err(FrontendError::BodyWriteError)?;
         Ok(FrontendWriter { io })
     }
 }
