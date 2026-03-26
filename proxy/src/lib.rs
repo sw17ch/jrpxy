@@ -513,32 +513,60 @@ where
                 let buf = match frontend_body_reader.read(options.body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
-                        let finish_result = match backend_body_writer.into_kind() {
-                            BodyWriterKind::TE(w) => {
-                                let empty = Headers::default();
-                                let trailers = frontend_body_reader.trailers().unwrap_or(&empty);
-                                w.finish_with_trailers(trailers)
-                                    .await
-                                    .map_err(BackendError::BodyWriteError)
-                                    .map(BackendWriter::new)
-                            }
-                            other => other
-                                .finish()
-                                .await
-                                .map_err(BackendError::BodyWriteError)
-                                .map(BackendWriter::new),
-                        };
-                        match finish_result {
-                            Ok(w) => match frontend_body_reader.drain().await {
-                                Ok(r) => {
-                                    ret = Ok((r, w));
+                        let (frontend_kind, max_head_len) = frontend_body_reader.into_kind();
+                        let backend_kind = backend_body_writer.into_kind();
+
+                        ret = async {
+                            let (frontend_io, backend_writer) = match (frontend_kind, backend_kind)
+                            {
+                                // Chunked to Chunked
+                                (BodyReaderKind::TE(fr), BodyWriterKind::TE(bw)) => {
+                                    let (io, trailers) =
+                                        fr.drain().await.map_err(FrontendError::BodyReadError)?;
+                                    let bw = bw
+                                        .finish_with_trailers(&trailers)
+                                        .await
+                                        .map_err(BackendError::BodyWriteError)?;
+                                    (io, BackendWriter::new(bw))
                                 }
-                                Err(e) => {
-                                    ret = Err(ProxyCopyError::from(e));
+                                // Chunked to Other
+                                (BodyReaderKind::TE(fr), other_bw) => {
+                                    let (io, _) =
+                                        fr.drain().await.map_err(FrontendError::BodyReadError)?;
+                                    let bw = other_bw
+                                        .finish()
+                                        .await
+                                        .map_err(BackendError::BodyWriteError)?;
+                                    (io, BackendWriter::new(bw))
                                 }
-                            },
-                            Err(e) => ret = Err(ProxyCopyError::from(e)),
+                                // Other to Chunked
+                                (other_fr, BodyWriterKind::TE(bw)) => {
+                                    let io = BodyReader::from_kind(other_fr)
+                                        .drain()
+                                        .await
+                                        .map_err(FrontendError::BodyReadError)?;
+                                    let bw =
+                                        bw.finish().await.map_err(BackendError::BodyWriteError)?;
+                                    (io, BackendWriter::new(bw))
+                                }
+                                // Other to Other
+                                (other_fr, other_bw) => {
+                                    let io = BodyReader::from_kind(other_fr)
+                                        .drain()
+                                        .await
+                                        .map_err(FrontendError::BodyReadError)?;
+                                    let bw = other_bw
+                                        .finish()
+                                        .await
+                                        .map_err(BackendError::BodyWriteError)?;
+                                    (io, BackendWriter::new(bw))
+                                }
+                            };
+                            let next_reader =
+                                FrontendReader::new_with_buffer(frontend_io, max_head_len);
+                            Ok((next_reader, backend_writer))
                         }
+                        .await;
                         break;
                     }
                     Err(e) => {
