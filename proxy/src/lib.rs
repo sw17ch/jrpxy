@@ -256,6 +256,10 @@ where
     BW: AsyncWriteExt + Unpin,
     BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
+    // TODO: could we have the backend reader/writer passed here instead of at
+    // the top? that would allow the user to inspect the request and generate a
+    // backend connection on-demand based on the hostname or some other property
+    // of the request.
     pub async fn write_backend_request(
         self,
     ) -> ProxyResult<WroteBackendRequest<FR, FW, BR, BW, BP>> {
