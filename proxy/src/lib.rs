@@ -35,7 +35,7 @@ pub enum ProxyError {
     InvalidRequestFraming(HeaderError),
     #[error("Body copy error: {0}")]
     CopyError(#[from] ProxyCopyError),
-    #[error("Error copying the fronend body to the backend, but response completed: {0}")]
+    #[error("Error copying the frontend body to the backend, but response completed: {0}")]
     FrontendCopyError(ProxyCopyError),
     #[error("Failed to completely copy the frontend body to the backend, but response completed")]
     FrontendCopyIncomplete,
@@ -59,10 +59,15 @@ pub trait BackendProxyProvider {
     /// The backend writer inner type
     type BW;
 
+    /// Get a connection from the provider. If a clean, established connection
+    /// is not available, one can be created, or an error is returned.
     fn get_connection(
         &mut self,
     ) -> impl Future<Output = ProxyResult<BackendConnection<Self::BR, Self::BW>>>;
 
+    /// Return a connection to the provider. The connection *must* be clean.
+    /// That is, the connection must be fully drained, and should remain idle
+    /// until another request is sent.
     fn give_connection(&mut self, reader: BackendReader<Self::BR>, writer: BackendWriter<Self::BW>);
 }
 
@@ -211,6 +216,10 @@ where
         let proxy_request = ProxyRequest::new(req, &options.received_by);
         let is_head = proxy_request.req().method() == b"HEAD".as_slice();
 
+        // TODO: detect CONNECT and TRACE methods. RFC 9110 section 9.3.6 says
+        // we must reject CONNECT methods if they are not supported. Typically
+        // this is done by sending a '400 Bad Request'.
+
         Ok(ReadFrontendRequest {
             options,
             client_options: ClientOptions {
@@ -236,7 +245,7 @@ impl<FR, FW, BP> ReadFrontendRequest<FR, FW, BP> {
     pub fn as_proxy_request(&self) -> &ProxyRequest<FR> {
         &self.proxy_request
     }
-    pub fn as_proxy_request_mut(&mut self) -> &ProxyRequest<FR> {
+    pub fn as_proxy_request_mut(&mut self) -> &mut ProxyRequest<FR> {
         &mut self.proxy_request
     }
 }
@@ -595,9 +604,9 @@ where
         let mut f2b_fut_pinned = std::pin::pin!(f2b_fut);
         let mut b2f_fut_pinned = std::pin::pin!(b2f_fut);
 
+        let mut f2b_res = None;
         // Poll both futures in a loop until the backend-to-frontend future
         // resolves.
-        let mut f2b_res = None;
         let b2f_res = loop {
             tokio::select! {
                 f2b = &mut f2b_fut_pinned, if f2b_res.is_none() => f2b_res = Some(f2b),
@@ -607,7 +616,8 @@ where
 
         // If polling both didn't result in the frontend-to-backend copy
         // completing, let's poll it once more to make sure it wasn't just about
-        // to be finished (this can happen for short requests).
+        // to be finished (this can happen for short requests where we've sent
+        // the write, but haven't yet allowed the future to resolve).
         if f2b_res.is_none() {
             match std::future::poll_fn(|cx| match f2b_fut_pinned.as_mut().poll(cx) {
                 Poll::Ready(r) => Poll::Ready(Some(r)),
