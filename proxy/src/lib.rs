@@ -665,9 +665,9 @@ const HOP_BY_HOP_HEADERS: &[&[u8]] = &[
     b"te",
     b"transfer-encoding",
     b"upgrade",
-    // TODO: should this list contain Trailer?
-    // https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Connection
-    // seems to think so.
+    // `trailer is intentionally absent: the proxy forwards chunked trailer
+    // fields end-to-end, so the `trailer` announcement header remains accurate
+    // and should be preserved.
 ];
 
 fn is_standard_hop_by_hop(name: &[u8]) -> bool {
