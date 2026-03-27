@@ -67,6 +67,11 @@ impl<I> IoBuffer<I> {
         } = self;
         (io, buffer)
     }
+
+    /// An immutable reference to the inner IO type.
+    pub fn as_io(&self) -> &I {
+        &self.io
+    }
 }
 
 impl<I: AsyncReadExt + Unpin> IoBuffer<I> {

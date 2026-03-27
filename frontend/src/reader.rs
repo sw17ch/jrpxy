@@ -56,6 +56,7 @@ use crate::error::{FrontendError, FrontendResult};
 /// Reads a request from a frontend reader. When `read()` is called, this type
 /// is consumed, and a [`FrontendRequest`] is returned. This can be used to
 /// inspect the request and peek the body.
+#[derive(Debug)]
 pub struct FrontendReader<I> {
     io_buffer: IoBuffer<I>,
     max_head_length: usize,
@@ -70,6 +71,15 @@ impl<I> FrontendReader<I> {
             parse_slots: _,
         } = self;
         io_buffer
+    }
+    /// An immutable slice of the internal buffer already read from the IO type,
+    /// but not yet consumed.
+    pub fn as_buf_slice(&self) -> &[u8] {
+        self.io_buffer.as_bytes()
+    }
+    /// An immutable reference to the underlying IO type.
+    pub fn as_inner(&self) -> &I {
+        self.io_buffer.as_io()
     }
 }
 

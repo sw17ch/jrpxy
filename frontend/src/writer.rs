@@ -89,6 +89,10 @@ impl<I> FrontendWriter<I> {
         let Self { io } = self;
         io
     }
+
+    pub fn as_inner(&self) -> &I {
+        &self.io
+    }
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
@@ -314,6 +318,11 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
         let Self { kind } = self;
         let io = kind.finish().await.map_err(FrontendError::BodyWriteError)?;
         Ok(FrontendWriter { io })
+    }
+
+    pub async fn abort(self) -> FrontendResult<()> {
+        let Self { kind } = self;
+        kind.abort().await.map_err(FrontendError::BodyWriteError)
     }
 
     pub fn into_kind(self) -> FrontendBodyWriterKind<I> {

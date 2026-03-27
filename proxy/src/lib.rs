@@ -139,7 +139,7 @@ impl<BR: Unpin, BW: Unpin> BackendProxyProvider for OneshotBackend<BR, BW> {
 }
 
 pub struct ProxyOptions {
-    pub max_head_length: usize,
+    pub max_backend_head_length: usize,
     pub body_chunk_size: usize,
     pub received_by: Cow<'static, str>,
 }
@@ -152,7 +152,7 @@ struct ClientOptions {
 impl Default for ProxyOptions {
     fn default() -> Self {
         Self {
-            max_head_length: 8192,
+            max_backend_head_length: 8192,
             body_chunk_size: 8192,
             received_by: Cow::Borrowed("jrpxy"),
         }
@@ -187,13 +187,11 @@ where
     BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
     pub fn new(
-        frontend_reader: FR,
-        frontend_writer: FW,
+        frontend_reader: FrontendReader<FR>,
+        frontend_writer: FrontendWriter<FW>,
         backend_provider: BP,
         options: ProxyOptions,
     ) -> Self {
-        let frontend_reader = FrontendReader::new(frontend_reader, options.max_head_length);
-        let frontend_writer = FrontendWriter::new(frontend_writer);
         Self {
             frontend_reader,
             frontend_writer,
@@ -321,7 +319,7 @@ where
         } = self;
 
         let response_stream = backend_reader
-            .read(!client_options.is_head, options.max_head_length)
+            .read(!client_options.is_head, options.max_backend_head_length)
             .await?;
         let response_stream = ProxyResponseStream::new(response_stream, &options.received_by);
         Ok(match response_stream {
@@ -1017,7 +1015,7 @@ impl<I: std::fmt::Debug> std::fmt::Debug for ProxyResponseStream<I> {
 #[cfg(test)]
 mod test {
     use jrpxy_backend::reader::BackendReader;
-    use jrpxy_frontend::reader::FrontendReader;
+    use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
 
     use crate::{BackendResponseStream, OneshotBackend, ProxyClient, ProxyOptions};
 
@@ -1081,8 +1079,8 @@ mod test {
         let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
 
         let proxy_client = ProxyClient::new(
-            frontend_reader.as_ref(),
-            &mut frontend_writer,
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
             bp,
             ProxyOptions::default(),
         );
@@ -1259,8 +1257,8 @@ mod test {
         let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
 
         let proxy_client = ProxyClient::new(
-            frontend_reader.as_ref(),
-            &mut frontend_writer,
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
             bp,
             ProxyOptions::default(),
         );
@@ -1341,8 +1339,8 @@ mod test {
 
         let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            frontend_reader.as_ref(),
-            &mut frontend_writer,
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
             bp,
             ProxyOptions::default(),
         );
@@ -1401,8 +1399,8 @@ mod test {
 
         let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            frontend_reader.as_ref(),
-            &mut frontend_writer,
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
             bp,
             ProxyOptions::default(),
         );
@@ -1466,8 +1464,8 @@ mod test {
 
         let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            frontend_reader.as_ref(),
-            &mut frontend_writer,
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
             bp,
             ProxyOptions::default(),
         );
@@ -1535,8 +1533,8 @@ mod test {
 
         let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            frontend_reader.as_ref(),
-            &mut frontend_writer,
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
             bp,
             ProxyOptions::default(),
         );
@@ -1606,8 +1604,8 @@ mod test {
 
         let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            frontend_reader.as_ref(),
-            &mut frontend_writer,
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
             bp,
             ProxyOptions::default(),
         );
@@ -1673,8 +1671,8 @@ mod test {
 
         let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            frontend_reader.as_ref(),
-            &mut frontend_writer,
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
             bp,
             ProxyOptions::default(),
         );
@@ -1715,6 +1713,127 @@ mod test {
             0\r\n\
             x-trailer: somevalue\r\n\
             \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
+    }
+
+    /// A HEAD request must receive a bodyless response. The origin correctly
+    /// sends no body but includes a `content-length` header indicating the size
+    /// of the representation. The proxy must forward the header (so the client
+    /// knows the body size) without writing any body bytes.
+    ///
+    /// To be sure framing is handled correctly, we pipeline a request with a
+    /// GET request that is otherwise identical to the first HEAD request.
+    #[tokio::test]
+    async fn head_request_response_forwarded_without_body() {
+        let frontend_reader = b"\
+            HEAD / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            \r\n\
+            GET / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        // Origin correctly omits the body but includes content-length.
+        let backend_reader = b"\
+            HTTP/1.1 200 Ok\r\n\
+            content-length: 5\r\n\
+            \r\n\
+            HTTP/1.1 200 Ok\r\n\
+            content-length: 5\r\n\
+            \r\n\
+            01234";
+        let mut backend_writer = Vec::new();
+
+        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let proxy_client = ProxyClient::new(
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
+            bp,
+            ProxyOptions::default(),
+        );
+
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .write_backend_request()
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let client = rbr
+            .forward_response()
+            .await
+            .expect("failed to forward response");
+
+        let (frontend_reader, frontend_writer, bp) = client.into_parts();
+
+        // The content-length header must be preserved (the client needs to
+        // know the representation size) but no body bytes must follow.
+        let expected_frontend_writer = b"\
+            HTTP/1.1 200 Ok\r\n\
+            content-length: 5\r\n\
+            Via: 1.1 jrpxy\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(frontend_writer.as_inner())
+        );
+
+        // now run another ProxyClient; this time we expect a response body. We
+        // make a new frontend writer so we can distinguish the previous
+        // response from the next response.
+        let mut frontend_writer = Vec::new();
+        let proxy_client = ProxyClient::new(
+            frontend_reader,
+            FrontendWriter::new(&mut frontend_writer),
+            bp,
+            ProxyOptions::default(),
+        );
+
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .write_backend_request()
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let client = rbr
+            .forward_response()
+            .await
+            .expect("failed to forward response");
+
+        let (_frontend_reader, frontend_writer, _bp) = client.into_parts();
+        let frontend_writer = frontend_writer.into_inner();
+
+        // The content-length header must be preserved (the client needs to
+        // know the representation size) but no body bytes must follow.
+        let expected_frontend_writer = b"\
+            HTTP/1.1 200 Ok\r\n\
+            Via: 1.1 jrpxy\r\n\
+            content-length: 5\r\n\
+            \r\n\
+            01234";
         assert_eq!(
             jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
             jrpxy_util::debug::AsciiDebug(&frontend_writer)
