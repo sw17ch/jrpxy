@@ -1,7 +1,6 @@
 use bytes::{Bytes, BytesMut};
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::{MessageError, ParseSlots};
-use jrpxy_util::buffer::Buffer;
 use jrpxy_util::io_buffer::{IoBuffer, IoBufferError};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -728,14 +727,14 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
 
 pub struct PeekableBodyReader<I> {
     /// a buffer in which we store data peeked off the socket, but not yet read
-    peeked: Buffer,
+    peeked: BytesMut,
     inner: BodyReader<I>,
 }
 
 impl<I> PeekableBodyReader<I> {
     pub fn new(reader: BodyReader<I>) -> Self {
         Self {
-            peeked: Buffer::new(BytesMut::new()),
+            peeked: BytesMut::new(),
             inner: reader,
         }
     }
