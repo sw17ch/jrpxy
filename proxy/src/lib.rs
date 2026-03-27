@@ -5,7 +5,8 @@ use bytes::Bytes;
 use jrpxy_backend::{
     error::{BackendError, BackendResult},
     reader::{
-        BackendBodyReader, BackendReader, BackendResponse, BackendStreamReader, ResponseStream,
+        BackendBodyReader, BackendBodyReaderKind, BackendReader, BackendResponse,
+        BackendStreamReader, ResponseStream,
     },
     writer::{BackendBodyWriter, BackendBodyWriterKind, BackendWriter},
 };
@@ -13,7 +14,7 @@ use jrpxy_body::BodyReadMode;
 use jrpxy_frontend::{
     error::FrontendError,
     reader::{FrontendBodyReader, FrontendBodyReaderKind, FrontendReader, FrontendRequest},
-    writer::FrontendWriter,
+    writer::{FrontendBodyWriterKind, FrontendWriter},
 };
 use jrpxy_http_message::{
     header::{HeaderError, Headers},
@@ -557,19 +558,24 @@ where
                 let buf = match backend_body_reader.read(options.body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
-                        match frontend_body_writer.finish().await {
-                            Ok(w) => match backend_body_reader.drain().await {
-                                Ok(r) => {
-                                    ret = Ok((r, w));
+                        let backend_kind = backend_body_reader.into_kind();
+                        let frontend_kind = frontend_body_writer.into_kind();
+
+                        ret = async {
+                            match (backend_kind, frontend_kind) {
+                                (BackendBodyReaderKind::TE(br), FrontendBodyWriterKind::TE(fw)) => {
+                                    let (next_backend, trailers) = br.drain().await?;
+                                    let next_frontend = fw.finish_with_trailers(&trailers).await?;
+                                    Ok((next_backend, next_frontend))
                                 }
-                                Err(e) => {
-                                    ret = Err(ProxyCopyError::from(e));
+                                (br, fw) => {
+                                    let next_backend = br.drain().await?;
+                                    let next_frontend = fw.finish().await?;
+                                    Ok((next_backend, next_frontend))
                                 }
-                            },
-                            Err(e) => {
-                                ret = Err(ProxyCopyError::from(e));
                             }
                         }
+                        .await;
                         break;
                     }
                     Err(e) => {

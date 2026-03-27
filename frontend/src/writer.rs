@@ -70,6 +70,7 @@ use jrpxy_body::ChunkedBodyWriter;
 use jrpxy_body::ContentLengthBodyWriter;
 use jrpxy_body::is_framing_header;
 use jrpxy_http_message::framing::HeadFraming;
+use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::Response;
 use tokio::io;
 use tokio::io::AsyncWriteExt;
@@ -210,6 +211,92 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Frontend wrapper for [`BodylessBodyWriter`].
+pub struct FrontendBodylessBodyWriter<I> {
+    inner: BodylessBodyWriter<I>,
+}
+
+impl<I: AsyncWriteExt + Unpin> FrontendBodylessBodyWriter<I> {
+    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
+        let Self { inner } = self;
+        Ok(FrontendWriter { io: inner.finish() })
+    }
+}
+
+/// Frontend wrapper for [`ContentLengthBodyWriter`].
+pub struct FrontendContentLengthBodyWriter<I> {
+    inner: ContentLengthBodyWriter<I>,
+}
+
+impl<I: AsyncWriteExt + Unpin> FrontendContentLengthBodyWriter<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
+        let Self { inner } = self;
+        inner
+            .write(buf)
+            .await
+            .map_err(FrontendError::BodyWriteError)
+    }
+
+    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
+        let Self { inner } = self;
+        let io = inner
+            .finish()
+            .await
+            .map_err(FrontendError::BodyWriteError)?;
+        Ok(FrontendWriter { io })
+    }
+}
+
+/// Frontend wrapper for [`ChunkedBodyWriter`]. Finishing it with trailers
+/// forwards them to the frontend as chunked trailer fields.
+pub struct FrontendChunkedBodyWriter<I> {
+    inner: ChunkedBodyWriter<I>,
+}
+
+impl<I: AsyncWriteExt + Unpin> FrontendChunkedBodyWriter<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
+        let Self { inner } = self;
+        inner
+            .write(buf)
+            .await
+            .map_err(FrontendError::BodyWriteError)
+    }
+
+    pub async fn finish_with_trailers(
+        self,
+        trailers: &Headers,
+    ) -> FrontendResult<FrontendWriter<I>> {
+        let Self { inner } = self;
+        let io = inner
+            .finish_with_trailers(trailers)
+            .await
+            .map_err(FrontendError::BodyWriteError)?;
+        Ok(FrontendWriter { io })
+    }
+
+    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
+        self.finish_with_trailers(&Default::default()).await
+    }
+}
+
+/// The body writer kind for a frontend connection, typed so that finishing
+/// always produces a [`FrontendWriter`] without exposing raw IO.
+pub enum FrontendBodyWriterKind<I> {
+    Bodyless(FrontendBodylessBodyWriter<I>),
+    CL(FrontendContentLengthBodyWriter<I>),
+    TE(FrontendChunkedBodyWriter<I>),
+}
+
+impl<I: AsyncWriteExt + Unpin> FrontendBodyWriterKind<I> {
+    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
+        match self {
+            FrontendBodyWriterKind::Bodyless(w) => w.finish().await,
+            FrontendBodyWriterKind::CL(w) => w.finish().await,
+            FrontendBodyWriterKind::TE(w) => w.finish().await,
+        }
+    }
+}
+
 /// A frontend response body writer.
 pub struct FrontendBodyWriter<I> {
     kind: BodyWriterKind<I>,
@@ -227,6 +314,21 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
         let Self { kind } = self;
         let io = kind.finish().await.map_err(FrontendError::BodyWriteError)?;
         Ok(FrontendWriter { io })
+    }
+
+    pub fn into_kind(self) -> FrontendBodyWriterKind<I> {
+        let Self { kind } = self;
+        match kind {
+            BodyWriterKind::Bodyless(inner) => {
+                FrontendBodyWriterKind::Bodyless(FrontendBodylessBodyWriter { inner })
+            }
+            BodyWriterKind::CL(inner) => {
+                FrontendBodyWriterKind::CL(FrontendContentLengthBodyWriter { inner })
+            }
+            BodyWriterKind::TE(inner) => {
+                FrontendBodyWriterKind::TE(FrontendChunkedBodyWriter { inner })
+            }
+        }
     }
 }
 
