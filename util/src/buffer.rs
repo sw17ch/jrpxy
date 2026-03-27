@@ -97,8 +97,15 @@ unsafe impl<'b> bytes::BufMut for ReadLimitedBytes<'b> {
     }
 
     fn chunk_mut(&mut self) -> &mut bytes::buf::UninitSlice {
+        // how many bytes until the limit
         let rem = self.remaining_mut();
-        &mut self.buf.chunk_mut()[0..rem]
+        // the inner buf chunk we're going to slice
+        let inner_chunk = self.buf.chunk_mut();
+        // the length we're going to slice. we use whichever is smallest of the
+        // chunk length or our remaining size
+        let slice_len = inner_chunk.len().min(rem);
+
+        &mut inner_chunk[..slice_len]
     }
 }
 
@@ -134,6 +141,30 @@ mod test {
         assert_eq!(7, l);
         let l = b.read_from(&input[..], 1).await.expect("read failed");
         assert_eq!(1, l);
+    }
+
+    #[test]
+    fn chunk_mut_does_not_exceed_buf_spare_capacity() {
+        let mut buf = BytesMut::new();
+        let mut r = ReadLimitedBytes::new(&mut buf, 4);
+        // BytesMut::reserve may allocate more than requested (e.g. rounding
+        // to an internal minimum). Read the actual spare capacity after new().
+        let actual_spare = r.buf.chunk_mut().len();
+        assert!(actual_spare >= 4);
+        // adjust our max read to one more byte than buf has. this means
+        // remaining_mut() will exceed the actual capacity forcing the check to
+        // operate.
+        r.max_read = actual_spare + 1;
+        assert_eq!(r.remaining_mut(), actual_spare + 1);
+        // chunk_mut() attempts &mut buf.chunk_mut()[0..actual_spare+1] on a
+        // actual_spare-byte UninitSlice. With the current code this panics
+        // with an opaque index-out-of-bounds; with an explicit assertion it
+        // should panic with a clear message.
+        let chunk = r.chunk_mut();
+        assert_eq!(
+            chunk.len(),
+            actual_spare,
+        );
     }
 
     #[test]
