@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::future::Future;
 use std::task::Poll;
 
 use bytes::Bytes;
@@ -21,7 +22,7 @@ use jrpxy_http_message::{
     message::{Request, Response},
     version::HttpVersion,
 };
-use tokio::io::{AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(thiserror::Error, Debug)]
 pub enum ProxyError {
@@ -53,96 +54,6 @@ pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
 
 type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 
-pub trait BackendProxyProvider {
-    /// The backend reader inner type
-    type BR;
-    /// The backend writer inner type
-    type BW;
-
-    /// Get a connection from the provider. If a clean, established connection
-    /// is not available, one can be created, or an error is returned.
-    fn get_connection(
-        &mut self,
-    ) -> impl Future<Output = ProxyResult<BackendConnection<Self::BR, Self::BW>>>;
-
-    /// Return a connection to the provider. The connection *must* be clean.
-    /// That is, the connection must be fully drained, and should remain idle
-    /// until another request is sent.
-    fn give_connection(&mut self, reader: BackendReader<Self::BR>, writer: BackendWriter<Self::BW>);
-}
-
-pub struct OneshotBackend<BR, BW> {
-    inner: Option<(BackendReader<BR>, BackendWriter<BW>)>,
-}
-
-pin_project_lite::pin_project! {
-    pub struct OneshotConnector<BR,BW> {
-        #[pin]
-        inner: Option<(BR,BW)>,
-    }
-}
-
-impl<BR, BW> OneshotBackend<BR, BW>
-where
-    BR: AsyncReadExt + Unpin,
-    BW: AsyncWrite + Unpin,
-{
-    pub fn new(backend_reader: BR, backend_writer: BW) -> Self {
-        Self {
-            inner: Some((
-                BackendReader::new(backend_reader),
-                BackendWriter::new(backend_writer),
-            )),
-        }
-    }
-}
-
-impl<BR: Unpin, BW: Unpin> Future for OneshotConnector<BR, BW> {
-    type Output = ProxyResult<(BR, BW)>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        _cx: &mut std::task::Context<'_>,
-    ) -> Poll<Self::Output> {
-        let proj = self.project();
-        let mut inner = proj.inner;
-        if let Some(bp) = inner.take() {
-            Poll::Ready(Ok(bp))
-        } else {
-            Poll::Ready(Err(ProxyError::NoBackendConnection))
-        }
-    }
-}
-
-impl<BR: Unpin, BW: Unpin> BackendProxyProvider for OneshotBackend<BR, BW> {
-    type BR = BR;
-    type BW = BW;
-
-    fn get_connection(
-        &mut self,
-    ) -> impl Future<
-        Output = Result<
-            (
-                BackendReader<<Self as BackendProxyProvider>::BR>,
-                BackendWriter<<Self as BackendProxyProvider>::BW>,
-            ),
-            ProxyError,
-        >,
-    > {
-        OneshotConnector {
-            inner: self.inner.take(),
-        }
-    }
-
-    fn give_connection(
-        &mut self,
-        reader: BackendReader<Self::BR>,
-        writer: BackendWriter<Self::BW>,
-    ) {
-        self.inner = Some((reader, writer));
-    }
-}
-
 pub struct ProxyOptions {
     pub max_backend_head_length: usize,
     pub body_chunk_size: usize,
@@ -164,52 +75,44 @@ impl Default for ProxyOptions {
     }
 }
 
-pub struct ProxyClient<FR, FW, BP> {
+pub struct ProxyClient<FR, FW> {
     frontend_reader: FrontendReader<FR>,
     frontend_writer: FrontendWriter<FW>,
-    backend_provider: BP,
     options: ProxyOptions,
 }
 
-impl<FR, FW, BP> ProxyClient<FR, FW, BP> {
-    pub fn into_parts(self) -> (FrontendReader<FR>, FrontendWriter<FW>, BP) {
+impl<FR, FW> ProxyClient<FR, FW> {
+    pub fn into_parts(self) -> (FrontendReader<FR>, FrontendWriter<FW>) {
         let Self {
             frontend_reader,
             frontend_writer,
-            backend_provider,
             options: _,
         } = self;
-        (frontend_reader, frontend_writer, backend_provider)
+        (frontend_reader, frontend_writer)
     }
 }
 
-impl<FR, FW, BR, BW, BP> ProxyClient<FR, FW, BP>
+impl<FR, FW> ProxyClient<FR, FW>
 where
     FR: AsyncReadExt + Unpin,
     FW: AsyncWriteExt + Unpin,
-    BR: AsyncReadExt + Unpin,
-    BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
     pub fn new(
         frontend_reader: FrontendReader<FR>,
         frontend_writer: FrontendWriter<FW>,
-        backend_provider: BP,
         options: ProxyOptions,
     ) -> Self {
         Self {
             frontend_reader,
             frontend_writer,
-            backend_provider,
             options,
         }
     }
 
-    pub async fn start(self) -> ProxyResult<ReadFrontendRequest<FR, FW, BP>> {
+    pub async fn start(self) -> ProxyResult<ReadFrontendRequest<FR, FW>> {
         let Self {
             frontend_reader,
             frontend_writer,
-            backend_provider,
             options,
         } = self;
         let req = frontend_reader.read().await?;
@@ -228,20 +131,18 @@ where
             },
             proxy_request,
             frontend_writer,
-            backend_provider,
         })
     }
 }
 
-pub struct ReadFrontendRequest<FR, FW, BP> {
+pub struct ReadFrontendRequest<FR, FW> {
     proxy_request: ProxyRequest<FR>,
     frontend_writer: FrontendWriter<FW>,
-    backend_provider: BP,
     options: ProxyOptions,
     client_options: ClientOptions,
 }
 
-impl<FR, FW, BP> ReadFrontendRequest<FR, FW, BP> {
+impl<FR, FW> ReadFrontendRequest<FR, FW> {
     pub fn as_proxy_request(&self) -> &ProxyRequest<FR> {
         &self.proxy_request
     }
@@ -250,29 +151,31 @@ impl<FR, FW, BP> ReadFrontendRequest<FR, FW, BP> {
     }
 }
 
-impl<FR, FW, BR, BW, BP> ReadFrontendRequest<FR, FW, BP>
+impl<FR, FW> ReadFrontendRequest<FR, FW>
 where
-    BR: AsyncReadExt + Unpin,
-    BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BR = BR, BW = BW>,
+    FW: AsyncWriteExt + Unpin,
 {
-    // TODO: could we have the backend reader/writer passed here instead of at
-    // the top? that would allow the user to inspect the request and generate a
-    // backend connection on-demand based on the hostname or some other property
-    // of the request.
-    pub async fn write_backend_request(
+    /// Write the request to the backend connection.
+    ///
+    /// The backend reader and writer are taken here, allowing the caller to
+    /// select the backend based on the request (e.g. by hostname or path)
+    /// after inspecting the request via [`as_proxy_request`].
+    pub async fn write_backend_request<BR, BW>(
         self,
-    ) -> ProxyResult<WroteBackendRequest<FR, FW, BR, BW, BP>> {
+        backend_connection: BackendConnection<BR, BW>,
+    ) -> ProxyResult<WroteBackendRequest<FR, FW, BR, BW>>
+    where
+        BR: AsyncReadExt + Unpin,
+        BW: AsyncWriteExt + Unpin,
+    {
         let Self {
             options,
             client_options,
             proxy_request,
             frontend_writer,
-            mut backend_provider,
         } = self;
 
-        let (backend_reader, backend_writer) = backend_provider.get_connection().await?;
-
+        let (backend_reader, backend_writer) = backend_connection;
         let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
 
         let backend_body_writer = match frontend_body_reader.mode() {
@@ -292,35 +195,30 @@ where
             frontend_writer,
             backend_reader,
             backend_body_writer,
-            backend_provider,
         })
     }
 }
 
-pub struct WroteBackendRequest<FR, FW, BR, BW, BP> {
+pub struct WroteBackendRequest<FR, FW, BR, BW> {
     options: ProxyOptions,
     client_options: ClientOptions,
     frontend_body_reader: FrontendBodyReader<FR>,
     frontend_writer: FrontendWriter<FW>,
     backend_reader: BackendReader<BR>,
     backend_body_writer: BackendBodyWriter<BW>,
-    backend_provider: BP,
 }
 
-pub enum BackendResponseStream<FR, FW, BR, BW, BP> {
-    Informational(ReadBackendInformationalResponse<FR, FW, BR, BW, BP>),
-    Response(ReadBackendResponse<FR, FW, BR, BW, BP>),
+pub enum BackendResponseStream<FR, FW, BR, BW> {
+    Informational(ReadBackendInformationalResponse<FR, FW, BR, BW>),
+    Response(ReadBackendResponse<FR, FW, BR, BW>),
 }
 
-impl<FR, FW, BR, BW, BP> WroteBackendRequest<FR, FW, BR, BW, BP>
+impl<FR, FW, BR, BW> WroteBackendRequest<FR, FW, BR, BW>
 where
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
-    pub async fn read_backend_response(
-        self,
-    ) -> ProxyResult<BackendResponseStream<FR, FW, BR, BW, BP>> {
+    pub async fn read_backend_response(self) -> ProxyResult<BackendResponseStream<FR, FW, BR, BW>> {
         let Self {
             options,
             client_options,
@@ -328,7 +226,6 @@ where
             frontend_writer,
             backend_reader,
             backend_body_writer,
-            backend_provider,
         } = self;
 
         let response_stream = backend_reader
@@ -344,7 +241,6 @@ where
                     frontend_writer,
                     proxy_response,
                     backend_body_writer,
-                    backend_provider,
                 })
             }
             ProxyResponseStream::Informational(
@@ -358,19 +254,18 @@ where
                 frontend_writer,
                 proxy_stream_reader,
                 backend_body_writer,
-                backend_provider,
             }),
         })
     }
 }
 
-pub enum InformationalForwardResult<FR, FW, BR, BW, BP> {
-    Forwarded(BackendResponseStream<FR, FW, BR, BW, BP>),
-    Dropped(BackendResponseStream<FR, FW, BR, BW, BP>),
+pub enum InformationalForwardResult<FR, FW, BR, BW> {
+    Forwarded(BackendResponseStream<FR, FW, BR, BW>),
+    Dropped(BackendResponseStream<FR, FW, BR, BW>),
 }
 
-impl<FR, FW, BR, BW, BP> InformationalForwardResult<FR, FW, BR, BW, BP> {
-    pub fn into_inner(self) -> BackendResponseStream<FR, FW, BR, BW, BP> {
+impl<FR, FW, BR, BW> InformationalForwardResult<FR, FW, BR, BW> {
+    pub fn into_inner(self) -> BackendResponseStream<FR, FW, BR, BW> {
         match self {
             InformationalForwardResult::Forwarded(r) => r,
             InformationalForwardResult::Dropped(r) => r,
@@ -378,23 +273,21 @@ impl<FR, FW, BR, BW, BP> InformationalForwardResult<FR, FW, BR, BW, BP> {
     }
 }
 
-pub struct ReadBackendInformationalResponse<FR, FW, BR, BW, BP> {
+pub struct ReadBackendInformationalResponse<FR, FW, BR, BW> {
     proxy_informational_response: ProxyInformationalResponse,
     frontend_body_reader: FrontendBodyReader<FR>,
     frontend_writer: FrontendWriter<FW>,
     proxy_stream_reader: ProxyStreamReader<BR>,
     backend_body_writer: BackendBodyWriter<BW>,
-    backend_provider: BP,
     options: ProxyOptions,
     client_options: ClientOptions,
 }
 
-impl<FR, FW, BR, BW, BP> ReadBackendInformationalResponse<FR, FW, BR, BW, BP>
+impl<FR, FW, BR, BW> ReadBackendInformationalResponse<FR, FW, BR, BW>
 where
     FW: AsyncWriteExt + Unpin,
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BR = BR, BW = BW>,
 {
     pub fn as_response(&self) -> &ProxyInformationalResponse {
         &self.proxy_informational_response
@@ -406,14 +299,13 @@ where
 
     pub async fn forward_informational_response(
         self,
-    ) -> ProxyResult<InformationalForwardResult<FR, FW, BR, BW, BP>> {
+    ) -> ProxyResult<InformationalForwardResult<FR, FW, BR, BW>> {
         let Self {
             proxy_informational_response,
             frontend_body_reader,
             mut frontend_writer,
             proxy_stream_reader,
             backend_body_writer,
-            backend_provider,
             options,
             client_options,
         } = self;
@@ -437,7 +329,6 @@ where
                     frontend_writer,
                     proxy_response,
                     backend_body_writer,
-                    backend_provider,
                     options,
                     client_options,
                 })
@@ -451,7 +342,6 @@ where
                 frontend_writer,
                 proxy_stream_reader,
                 backend_body_writer,
-                backend_provider,
                 options,
                 client_options,
             }),
@@ -465,23 +355,21 @@ where
     }
 }
 
-pub struct ReadBackendResponse<FR, FW, BR, BW, BP> {
+pub struct ReadBackendResponse<FR, FW, BR, BW> {
     frontend_body_reader: FrontendBodyReader<FR>,
     frontend_writer: FrontendWriter<FW>,
     proxy_response: ProxyResponse<BR>,
     backend_body_writer: BackendBodyWriter<BW>,
-    backend_provider: BP,
     options: ProxyOptions,
     client_options: ClientOptions,
 }
 
-impl<FR, FW, BR, BW, BP> ReadBackendResponse<FR, FW, BR, BW, BP>
+impl<FR, FW, BR, BW> ReadBackendResponse<FR, FW, BR, BW>
 where
     FR: AsyncReadExt + Unpin,
     FW: AsyncWriteExt + Unpin,
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
-    BP: BackendProxyProvider<BR = BR, BW = BW> + Unpin,
 {
     pub fn as_response(&self) -> &ProxyResponse<BR> {
         &self.proxy_response
@@ -491,13 +379,14 @@ where
         &mut self.proxy_response
     }
 
-    pub async fn forward_response(self) -> ProxyResult<ProxyClient<FR, FW, BP>> {
+    pub async fn forward_response(
+        self,
+    ) -> ProxyResult<(ProxyClient<FR, FW>, BackendConnection<BR, BW>)> {
         let Self {
             mut frontend_body_reader,
             frontend_writer,
             proxy_response,
             mut backend_body_writer,
-            mut backend_provider,
             options,
             client_options,
         } = self;
@@ -648,14 +537,14 @@ where
             None => return Err(ProxyError::FrontendCopyIncomplete),
         };
 
-        backend_provider.give_connection(backend_reader, backend_writer);
-
-        Ok(ProxyClient {
-            frontend_reader,
-            frontend_writer,
-            backend_provider,
-            options,
-        })
+        Ok((
+            ProxyClient {
+                frontend_reader,
+                frontend_writer,
+                options,
+            },
+            (backend_reader, backend_writer),
+        ))
     }
 }
 
@@ -1030,8 +919,9 @@ impl<I: std::fmt::Debug> std::fmt::Debug for ProxyResponseStream<I> {
 mod test {
     use jrpxy_backend::reader::BackendReader;
     use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
+    use jrpxy_pool::{BackendProxyProvider, OneshotBackend};
 
-    use crate::{BackendResponseStream, OneshotBackend, ProxyClient, ProxyOptions};
+    use crate::{BackendResponseStream, ProxyClient, ProxyOptions};
 
     use super::{
         ProxyInformationalResponse, ProxyRequest, ProxyResponse, ProxyResponseStream,
@@ -1090,19 +980,20 @@ mod test {
 
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
 
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
         let did_fe_read = proxy_client.start().await.expect("client start failed");
 
+        let backend_connection =
+            bp.get_connection().await.expect("no backend connection");
         let did_be_write = did_fe_read
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed");
 
@@ -1210,16 +1101,17 @@ mod test {
                 .is_none()
         );
 
-        let client = rbr
+        let (client, (backend_reader, backend_writer)) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
+        bp.give_connection(backend_reader, backend_writer);
 
         // split up the client into pieces, and make sure they all reflect
         // what's expected.
-        let (_frontend_reader, frontend_writer, backend_provider) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
-        let (_backend_reader, backend_writer) = backend_provider.inner.unwrap();
+        let (_backend_reader, backend_writer) = bp.inner.unwrap();
         let backend_writer = backend_writer.into_inner();
 
         let expected_backend_writer = b"\
@@ -1268,19 +1160,20 @@ mod test {
 
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
 
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
         let did_fe_read = proxy_client.start().await.expect("client start failed");
 
+        let backend_connection =
+            bp.get_connection().await.expect("no backend connection");
         let did_be_write = did_fe_read
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed");
 
@@ -1315,12 +1208,12 @@ mod test {
         };
 
         // Normal responses can be forwarded to HTTP/1.0 clients.
-        let client = rbr
+        let (client, _backend_connection) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
 
-        let (_frontend_reader, frontend_writer, _backend_provider) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
 
         // The 1xx informational response must NOT be forwarded to an HTTP/1.0 client.
@@ -1351,19 +1244,19 @@ mod test {
             hello";
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1375,12 +1268,12 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let client = rbr
+        let (client, _backend_connection) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
 
-        let (_frontend_reader, frontend_writer, _backend_provider) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
 
         let expected_frontend_writer = b"\
@@ -1411,19 +1304,19 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1435,13 +1328,11 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let client = rbr
+        let (client, (_backend_reader, backend_writer)) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
-
-        let (_frontend_reader, _frontend_writer, backend_provider) = client.into_parts();
-        let (_backend_reader, backend_writer) = backend_provider.inner.unwrap();
+        let _ = client;
         let backend_writer = backend_writer.into_inner();
 
         let expected_backend_writer = b"\
@@ -1476,19 +1367,19 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1500,13 +1391,10 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let client = rbr
+        let (_client, (_backend_reader, backend_writer)) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
-
-        let (_frontend_reader, _frontend_writer, backend_provider) = client.into_parts();
-        let (_backend_reader, backend_writer) = backend_provider.inner.unwrap();
         let backend_writer = backend_writer.into_inner();
 
         let expected_backend_writer = b"\
@@ -1545,19 +1433,19 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1569,13 +1457,10 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let client = rbr
+        let (_client, (_backend_reader, backend_writer)) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
-
-        let (_frontend_reader, _frontend_writer, backend_provider) = client.into_parts();
-        let (_backend_reader, backend_writer) = backend_provider.inner.unwrap();
         let backend_writer = backend_writer.into_inner();
 
         let expected_backend_writer = b"\
@@ -1616,19 +1501,19 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1640,12 +1525,12 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let client = rbr
+        let (client, _backend_connection) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
 
-        let (_frontend_reader, frontend_writer, _backend_provider) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
 
         let expected_frontend_writer = b"\
@@ -1683,19 +1568,19 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1707,12 +1592,12 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let client = rbr
+        let (client, _backend_connection) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
 
-        let (_frontend_reader, frontend_writer, _backend_provider) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
 
         // The trailer field must appear between the terminal chunk and the
@@ -1762,19 +1647,19 @@ mod test {
             01234";
         let mut backend_writer = Vec::new();
 
-        let bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 8192),
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1786,12 +1671,12 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let client = rbr
+        let (client, backend_connection) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
 
-        let (frontend_reader, frontend_writer, bp) = client.into_parts();
+        let (frontend_reader, frontend_writer) = client.into_parts();
 
         // The content-length header must be preserved (the client needs to
         // know the representation size) but no body bytes must follow.
@@ -1807,12 +1692,12 @@ mod test {
 
         // now run another ProxyClient; this time we expect a response body. We
         // make a new frontend writer so we can distinguish the previous
-        // response from the next response.
+        // response from the next response. The backend connection is reused
+        // directly from the first cycle's return value.
         let mut frontend_writer = Vec::new();
         let proxy_client = ProxyClient::new(
             frontend_reader,
             FrontendWriter::new(&mut frontend_writer),
-            bp,
             ProxyOptions::default(),
         );
 
@@ -1820,7 +1705,7 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request()
+            .write_backend_request(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1832,12 +1717,12 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let client = rbr
+        let (client, _backend_connection) = rbr
             .forward_response()
             .await
             .expect("failed to forward response");
 
-        let (_frontend_reader, frontend_writer, _bp) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
 
         // The content-length header must be preserved (the client needs to

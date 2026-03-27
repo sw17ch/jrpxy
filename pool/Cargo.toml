@@ -1,0 +1,11 @@
+[package]
+name = "jrpxy-pool"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+jrpxy-backend = { workspace = true }
+jrpxy-proxy = { workspace = true }
+
+tokio = { workspace = true }
+pin-project-lite = { workspace = true }
