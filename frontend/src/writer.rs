@@ -124,7 +124,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
-            kind: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len), io),
+            kind: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len, io)),
         })
     }
 

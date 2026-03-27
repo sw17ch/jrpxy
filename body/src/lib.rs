@@ -69,12 +69,17 @@ impl<I> BodylessBodyWriter<I> {
     pub fn new(io: I) -> Self {
         Self(io)
     }
+
+    pub fn finish(self) -> I {
+        let Self(io) = self;
+        io
+    }
 }
 
 #[derive(Debug)]
 pub enum BodyWriterKind<I> {
     Bodyless(BodylessBodyWriter<I>),
-    CL(ContentLengthBodyWriter, I),
+    CL(ContentLengthBodyWriter<I>),
     TE(ChunkedBodyWriter<I>),
 }
 
@@ -82,7 +87,7 @@ impl<I: AsyncWriteExt + Unpin> BodyWriterKind<I> {
     pub async fn write(&mut self, buf: &[u8]) -> BodyResult<()> {
         match self {
             BodyWriterKind::Bodyless(_) => Err(BodyError::BodyOverflow(buf.len() as u64)),
-            BodyWriterKind::CL(w, io) => w.write(&mut *io, buf).await,
+            BodyWriterKind::CL(w) => w.write(buf).await,
             BodyWriterKind::TE(w) => w.write(buf).await,
         }
     }
@@ -93,11 +98,7 @@ impl<I: AsyncWriteExt + Unpin> BodyWriterKind<I> {
                 io.flush().await.map_err(BodyError::BodyWriteError)?;
                 Ok(io)
             }
-            BodyWriterKind::CL(w, mut io) => {
-                w.finish(&mut io).await?;
-                io.flush().await.map_err(BodyError::BodyWriteError)?;
-                Ok(io)
-            }
+            BodyWriterKind::CL(w) => w.finish().await,
             BodyWriterKind::TE(w) => w.finish().await,
         }
     }
@@ -107,7 +108,7 @@ impl<I: AsyncWriteExt + Unpin> BodyWriterKind<I> {
     /// body readers from considering the body complete.
     pub async fn abort(self) -> BodyResult<()> {
         match self {
-            BodyWriterKind::Bodyless(_) | BodyWriterKind::CL(_, _) => {
+            BodyWriterKind::Bodyless(_) | BodyWriterKind::CL(_) => {
                 // drop the connection — nothing else we can do
                 Ok(())
             }
@@ -123,24 +124,27 @@ impl<I: AsyncWriteExt + Unpin> BodyWriterKind<I> {
 }
 
 #[derive(Debug)]
-pub struct ContentLengthBodyWriter {
+pub struct ContentLengthBodyWriter<I> {
     /// the total body length specified by the content-length header.
     length: u64,
     /// the amount of the body already written
     offset: u64,
+    io: I,
 }
 
-impl ContentLengthBodyWriter {
-    pub fn new(length: u64) -> Self {
-        Self { length, offset: 0 }
+impl<I> ContentLengthBodyWriter<I> {
+    pub fn new(length: u64, io: I) -> Self {
+        Self {
+            length,
+            offset: 0,
+            io,
+        }
     }
+}
 
-    pub async fn write<W: AsyncWriteExt + Unpin>(
-        &mut self,
-        mut io: W,
-        buffer: &[u8],
-    ) -> BodyResult<()> {
-        let Self { length, offset } = self;
+impl<I: AsyncWriteExt + Unpin> ContentLengthBodyWriter<I> {
+    pub async fn write(&mut self, buffer: &[u8]) -> BodyResult<()> {
+        let Self { length, offset, io } = self;
 
         let Some(next_offset) = offset.checked_add(buffer.len() as u64) else {
             return Err(BodyError::BodyOverflow(*length));
@@ -150,8 +154,7 @@ impl ContentLengthBodyWriter {
             return Err(BodyError::BodyOverflow(*length));
         }
 
-        let () = io
-            .write_all(buffer)
+        io.write_all(buffer)
             .await
             .map_err(BodyError::BodyWriteError)?;
 
@@ -160,15 +163,12 @@ impl ContentLengthBodyWriter {
         Ok(())
     }
 
-    pub fn empty() -> ContentLengthBodyWriter {
-        Self {
-            length: 0,
-            offset: 0,
-        }
-    }
-
-    pub async fn finish<W: AsyncWriteExt + Unpin>(self, _io: W) -> BodyResult<()> {
-        let Self { length, offset } = self;
+    pub async fn finish(self) -> BodyResult<I> {
+        let Self {
+            length,
+            offset,
+            mut io,
+        } = self;
         debug_assert!(offset <= length, "offset exceeds length");
         if offset < length {
             return Err(BodyError::IncompleteBody {
@@ -176,7 +176,8 @@ impl ContentLengthBodyWriter {
                 actual: offset,
             });
         }
-        Ok(())
+        io.flush().await.map_err(BodyError::BodyWriteError)?;
+        Ok(io)
     }
 }
 
@@ -322,6 +323,17 @@ where
         debug_assert!(self.offset <= self.length);
         self.length - self.offset
     }
+
+    /// Drain the [`ContentLengthBodyReader`] and return the inner
+    /// [`IoBuffer`].`
+    pub async fn drain(mut self) -> BodyResult<IoBuffer<I>> {
+        while let Some(_buf) = self.read(DRAIN_SIZE).await? {
+            // drop buffers until we get to the end of the body
+        }
+        let Self { length, offset, io } = self;
+        debug_assert_eq!(offset, length);
+        Ok(io)
+    }
 }
 
 /// The extensions attached to a chunk header. Currently opaque; full parsing
@@ -363,13 +375,13 @@ impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
 }
 
 impl<I> ChunkedBodyReader<I> {
-    fn drained(&self) -> bool {
+    pub fn drained(&self) -> bool {
         matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
     }
 }
 
 impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
-    async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
+    pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         loop {
             let Some(current) = self.inner.take() else {
                 // We get left with a None after an error, which does not
@@ -637,6 +649,13 @@ pub enum BodyReaderKind<I> {
 #[derive(Debug)]
 pub struct BodylessBodyReader<I>(IoBuffer<I>);
 
+impl<I> BodylessBodyReader<I> {
+    pub fn drain(self) -> IoBuffer<I> {
+        let Self(inner) = self;
+        inner
+    }
+}
+
 pub struct BodyReader<I> {
     state: BodyReaderKind<I>,
 }
@@ -656,10 +675,6 @@ impl<I> BodyReader<I> {
 
     pub fn into_kind(self) -> BodyReaderKind<I> {
         self.state
-    }
-
-    pub fn from_kind(state: BodyReaderKind<I>) -> Self {
-        Self { state }
     }
 }
 
@@ -697,33 +712,16 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     }
 
     /// Ensure the body is fully drained from the socket
-    pub async fn drain(mut self) -> BodyResult<IoBuffer<I>> {
-        const DRAIN_SIZE: usize = 2 * 4096;
-
-        while let Some(_buf) = self.read(DRAIN_SIZE).await? {
-            // drop buffers until we get to the end of the body
-        }
-
-        debug_assert!(
-            self.drained(),
-            "in spite of our best attempts, we failed to drain"
-        );
-
+    pub async fn drain(self) -> BodyResult<IoBuffer<I>> {
         let Self { state } = self;
-
         let io = match state {
-            BodyReaderKind::Bodyless(BodylessBodyReader(io)) => io,
-            BodyReaderKind::CL(ContentLengthBodyReader { length, offset, io }) => {
-                debug_assert_eq!(offset, length);
-                io
-            }
-            BodyReaderKind::TE(te) => {
-                let (io, trailers) = te.drain().await?;
-                let _ignored_trailers = trailers;
+            BodyReaderKind::Bodyless(r) => r.drain(),
+            BodyReaderKind::CL(r) => r.drain().await?,
+            BodyReaderKind::TE(r) => {
+                let (io, _trailers) = r.drain().await?;
                 io
             }
         };
-
         Ok(io)
     }
 }

@@ -1,5 +1,9 @@
 use bytes::Bytes;
-use jrpxy_body::{BodyReadMode, BodyReader, PeekableBodyReader};
+use jrpxy_body::{
+    BodyReadMode, BodyReader, BodyReaderKind, BodylessBodyReader, ChunkedBodyReader,
+    ContentLengthBodyReader, PeekableBodyReader,
+};
+use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::{
     framing::HeadFraming,
     message::{ParseSlots, Response},
@@ -237,6 +241,97 @@ impl<I> BackendResponse<I> {
 }
 
 /// A backend response body reader.
+/// Backend wrapper for [`BodylessBodyReader`].
+pub struct BackendBodylessBodyReader<I> {
+    inner: BodylessBodyReader<I>,
+}
+
+impl<I: AsyncReadExt + Unpin> BackendBodylessBodyReader<I> {
+    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+        let Self { inner } = self;
+        Ok(BackendReader::new_with_iobuffer(inner.drain()))
+    }
+}
+
+/// Backend wrapper for [`ContentLengthBodyReader`].
+pub struct BackendContentLengthBodyReader<I> {
+    inner: ContentLengthBodyReader<I>,
+}
+
+impl<I: AsyncReadExt + Unpin> BackendContentLengthBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
+        self.inner
+            .read(max_len)
+            .await
+            .map_err(BackendError::BodyReadError)
+    }
+
+    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+        let Self { inner } = self;
+        Ok(BackendReader::new_with_iobuffer(
+            inner.drain().await.map_err(BackendError::BodyReadError)?,
+        ))
+    }
+}
+
+/// Backend wrapper for [`ChunkedBodyReader`]. Draining it returns both a
+/// new [`BackendReader`] and the trailers from the chunked body.
+pub struct BackendChunkedBodyReader<I> {
+    inner: ChunkedBodyReader<I>,
+}
+
+impl<I> BackendChunkedBodyReader<I> {
+    pub fn drained(&self) -> bool {
+        self.inner.drained()
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> BackendChunkedBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
+        self.inner
+            .read(max_len)
+            .await
+            .map_err(BackendError::BodyReadError)
+    }
+
+    pub async fn drain(self) -> BackendResult<(BackendReader<I>, Headers)> {
+        let Self { inner } = self;
+        let (io, trailers) = inner.drain().await.map_err(BackendError::BodyReadError)?;
+        Ok((BackendReader::new_with_iobuffer(io), trailers))
+    }
+}
+
+/// The body reader kind for a backend response, typed so that draining
+/// always produces a [`BackendReader`] without exposing raw IO.
+pub enum BackendBodyReaderKind<I> {
+    Bodyless(BackendBodylessBodyReader<I>),
+    CL(BackendContentLengthBodyReader<I>),
+    TE(BackendChunkedBodyReader<I>),
+}
+
+impl<I: AsyncReadExt + Unpin> BackendBodyReaderKind<I> {
+    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
+        match self {
+            BackendBodyReaderKind::Bodyless(_) => Ok(None),
+            BackendBodyReaderKind::CL(r) => r.read(max_len).await,
+            BackendBodyReaderKind::TE(r) => r.read(max_len).await,
+        }
+    }
+
+    /// Drain the body and return the next [`BackendReader`], discarding
+    /// any trailers. Use the `TE` variant directly to access trailers.
+    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+        match self {
+            BackendBodyReaderKind::Bodyless(r) => r.drain().await,
+            BackendBodyReaderKind::CL(r) => r.drain().await,
+            BackendBodyReaderKind::TE(r) => {
+                let (reader, _trailers) = r.drain().await?;
+                Ok(reader)
+            }
+        }
+    }
+}
+
 pub struct BackendBodyReader<I> {
     reader: BodyReader<I>,
 }
@@ -244,6 +339,21 @@ pub struct BackendBodyReader<I> {
 impl<I> BackendBodyReader<I> {
     pub fn mode(&self) -> BodyReadMode {
         self.reader.mode()
+    }
+
+    pub fn into_kind(self) -> BackendBodyReaderKind<I> {
+        let Self { reader } = self;
+        match reader.into_kind() {
+            BodyReaderKind::Bodyless(inner) => {
+                BackendBodyReaderKind::Bodyless(BackendBodylessBodyReader { inner })
+            }
+            BodyReaderKind::CL(inner) => {
+                BackendBodyReaderKind::CL(BackendContentLengthBodyReader { inner })
+            }
+            BodyReaderKind::TE(inner) => {
+                BackendBodyReaderKind::TE(BackendChunkedBodyReader { inner })
+            }
+        }
     }
 }
 

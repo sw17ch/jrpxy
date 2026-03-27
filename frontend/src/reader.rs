@@ -39,9 +39,13 @@
 //! ```
 
 use bytes::Bytes;
-use jrpxy_body::{BodyReadMode, BodyReader, BodyReaderKind, PeekableBodyReader};
+use jrpxy_body::{
+    BodyReadMode, BodyReader, BodyReaderKind, BodylessBodyReader, ChunkedBodyReader,
+    ContentLengthBodyReader, PeekableBodyReader,
+};
 use jrpxy_http_message::{
     framing::HeadFraming,
+    header::Headers,
     message::{ParseSlots, Request},
 };
 use jrpxy_util::io_buffer::IoBuffer;
@@ -195,6 +199,114 @@ impl<I> FrontendRequest<I> {
     }
 }
 
+/// Frontend wrapper for [`BodylessBodyReader`].
+pub struct FrontendBodylessBodyReader<I> {
+    inner: BodylessBodyReader<I>,
+    max_head_length: usize,
+}
+
+impl<I: AsyncReadExt + Unpin> FrontendBodylessBodyReader<I> {
+    pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
+        let Self {
+            inner,
+            max_head_length,
+        } = self;
+        Ok(FrontendReader::new_with_buffer(
+            inner.drain(),
+            max_head_length,
+        ))
+    }
+}
+
+/// Frontend wrapper for [`ContentLengthBodyReader`].
+pub struct FrontendContentLengthBodyReader<I> {
+    inner: ContentLengthBodyReader<I>,
+    max_head_length: usize,
+}
+
+impl<I: AsyncReadExt + Unpin> FrontendContentLengthBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
+        self.inner
+            .read(max_len)
+            .await
+            .map_err(FrontendError::BodyReadError)
+    }
+
+    pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
+        let Self {
+            inner,
+            max_head_length,
+        } = self;
+        let io = inner.drain().await.map_err(FrontendError::BodyReadError)?;
+        Ok(FrontendReader::new_with_buffer(io, max_head_length))
+    }
+}
+
+/// Frontend wrapper for [`ChunkedBodyReader`]. Draining it returns both a
+/// new [`FrontendReader`] and the trailers from the chunked body.
+pub struct FrontendChunkedBodyReader<I> {
+    inner: ChunkedBodyReader<I>,
+    max_head_length: usize,
+}
+
+impl<I> FrontendChunkedBodyReader<I> {
+    pub fn drained(&self) -> bool {
+        self.inner.drained()
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> FrontendChunkedBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
+        self.inner
+            .read(max_len)
+            .await
+            .map_err(FrontendError::BodyReadError)
+    }
+
+    pub async fn drain(self) -> FrontendResult<(FrontendReader<I>, Headers)> {
+        let Self {
+            inner,
+            max_head_length,
+        } = self;
+        let (io, trailers) = inner.drain().await.map_err(FrontendError::BodyReadError)?;
+        Ok((
+            FrontendReader::new_with_buffer(io, max_head_length),
+            trailers,
+        ))
+    }
+}
+
+/// The body reader kind for a frontend request, typed so that draining
+/// always produces a [`FrontendReader`] without exposing raw IO.
+pub enum FrontendBodyReaderKind<I> {
+    Bodyless(FrontendBodylessBodyReader<I>),
+    CL(FrontendContentLengthBodyReader<I>),
+    TE(FrontendChunkedBodyReader<I>),
+}
+
+impl<I: AsyncReadExt + Unpin> FrontendBodyReaderKind<I> {
+    pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
+        match self {
+            FrontendBodyReaderKind::Bodyless(_) => Ok(None),
+            FrontendBodyReaderKind::CL(r) => r.read(max_len).await,
+            FrontendBodyReaderKind::TE(r) => r.read(max_len).await,
+        }
+    }
+
+    /// Drain the body and return the next [`FrontendReader`], discarding
+    /// any trailers. Use the `TE` variant directly to access trailers.
+    pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
+        match self {
+            FrontendBodyReaderKind::Bodyless(r) => r.drain().await,
+            FrontendBodyReaderKind::CL(r) => r.drain().await,
+            FrontendBodyReaderKind::TE(r) => {
+                let (reader, _trailers) = r.drain().await?;
+                Ok(reader)
+            }
+        }
+    }
+}
+
 /// A frontend request body reader.
 pub struct FrontendBodyReader<I> {
     max_head_length: usize,
@@ -206,12 +318,29 @@ impl<I> FrontendBodyReader<I> {
         self.reader.mode()
     }
 
-    pub fn into_kind(self) -> (BodyReaderKind<I>, usize) {
+    pub fn into_kind(self) -> FrontendBodyReaderKind<I> {
         let Self {
             max_head_length,
             reader,
         } = self;
-        (reader.into_kind(), max_head_length)
+        match reader.into_kind() {
+            BodyReaderKind::Bodyless(inner) => {
+                FrontendBodyReaderKind::Bodyless(FrontendBodylessBodyReader {
+                    inner,
+                    max_head_length,
+                })
+            }
+            BodyReaderKind::CL(inner) => {
+                FrontendBodyReaderKind::CL(FrontendContentLengthBodyReader {
+                    inner,
+                    max_head_length,
+                })
+            }
+            BodyReaderKind::TE(inner) => FrontendBodyReaderKind::TE(FrontendChunkedBodyReader {
+                inner,
+                max_head_length,
+            }),
+        }
     }
 }
 

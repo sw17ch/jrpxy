@@ -1,6 +1,8 @@
 pub use jrpxy_body::BodyWriterKind;
-use jrpxy_body::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header};
-use jrpxy_http_message::{framing::HeadFraming, message::Request};
+use jrpxy_body::{
+    BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header,
+};
+use jrpxy_http_message::{framing::HeadFraming, header::Headers, message::Request};
 use tokio::io::{self, AsyncWriteExt};
 
 use crate::error::{BackendError, BackendResult};
@@ -33,7 +35,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
-            kind: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len), io),
+            kind: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len, io)),
         })
     }
 
@@ -112,6 +114,80 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Backend wrapper for [`BodylessBodyWriter`].
+pub struct BackendBodylessBodyWriter<I> {
+    inner: BodylessBodyWriter<I>,
+}
+
+impl<I: AsyncWriteExt + Unpin> BackendBodylessBodyWriter<I> {
+    pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
+        let Self { inner } = self;
+        Ok(BackendWriter::new(inner.finish()))
+    }
+}
+
+/// Backend wrapper for [`ContentLengthBodyWriter`].
+pub struct BackendContentLengthBodyWriter<I> {
+    inner: ContentLengthBodyWriter<I>,
+}
+
+impl<I: AsyncWriteExt + Unpin> BackendContentLengthBodyWriter<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
+        let Self { inner } = self;
+        inner.write(buf).await.map_err(BackendError::BodyWriteError)
+    }
+
+    pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
+        let Self { inner } = self;
+        let io = inner.finish().await.map_err(BackendError::BodyWriteError)?;
+        Ok(BackendWriter::new(io))
+    }
+}
+
+/// Backend wrapper for [`ChunkedBodyWriter`]. Finishing it with trailers
+/// forwards them to the backend as chunked trailer fields.
+pub struct BackendChunkedBodyWriter<I> {
+    inner: ChunkedBodyWriter<I>,
+}
+
+impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyWriter<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
+        let Self { inner } = self;
+        inner.write(buf).await.map_err(BackendError::BodyWriteError)
+    }
+
+    pub async fn finish_with_trailers(self, trailers: &Headers) -> BackendResult<BackendWriter<I>> {
+        let Self { inner } = self;
+        let io = inner
+            .finish_with_trailers(trailers)
+            .await
+            .map_err(BackendError::BodyWriteError)?;
+        Ok(BackendWriter::new(io))
+    }
+
+    pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
+        self.finish_with_trailers(&Default::default()).await
+    }
+}
+
+/// The body writer kind for a backend connection, typed so that finishing
+/// always produces a [`BackendWriter`] without exposing raw IO.
+pub enum BackendBodyWriterKind<I> {
+    Bodyless(BackendBodylessBodyWriter<I>),
+    CL(BackendContentLengthBodyWriter<I>),
+    TE(BackendChunkedBodyWriter<I>),
+}
+
+impl<I: AsyncWriteExt + Unpin> BackendBodyWriterKind<I> {
+    pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
+        match self {
+            BackendBodyWriterKind::Bodyless(w) => w.finish().await,
+            BackendBodyWriterKind::CL(w) => w.finish().await,
+            BackendBodyWriterKind::TE(w) => w.finish().await,
+        }
+    }
+}
+
 pub struct BackendBodyWriter<I> {
     kind: BodyWriterKind<I>,
 }
@@ -135,9 +211,19 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
         Ok(BackendWriter { io })
     }
 
-    pub fn into_kind(self) -> BodyWriterKind<I> {
+    pub fn into_kind(self) -> BackendBodyWriterKind<I> {
         let Self { kind } = self;
-        kind
+        match kind {
+            BodyWriterKind::Bodyless(inner) => {
+                BackendBodyWriterKind::Bodyless(BackendBodylessBodyWriter { inner })
+            }
+            BodyWriterKind::CL(inner) => {
+                BackendBodyWriterKind::CL(BackendContentLengthBodyWriter { inner })
+            }
+            BodyWriterKind::TE(inner) => {
+                BackendBodyWriterKind::TE(BackendChunkedBodyWriter { inner })
+            }
+        }
     }
 }
 

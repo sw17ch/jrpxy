@@ -7,12 +7,12 @@ use jrpxy_backend::{
     reader::{
         BackendBodyReader, BackendReader, BackendResponse, BackendStreamReader, ResponseStream,
     },
-    writer::{BackendBodyWriter, BackendWriter},
+    writer::{BackendBodyWriter, BackendBodyWriterKind, BackendWriter},
 };
-use jrpxy_body::{BodyReadMode, BodyReader, BodyReaderKind, BodyWriterKind};
+use jrpxy_body::BodyReadMode;
 use jrpxy_frontend::{
     error::FrontendError,
-    reader::{FrontendBodyReader, FrontendReader, FrontendRequest},
+    reader::{FrontendBodyReader, FrontendBodyReaderKind, FrontendReader, FrontendRequest},
     writer::FrontendWriter,
 };
 use jrpxy_http_message::{
@@ -513,58 +513,22 @@ where
                 let buf = match frontend_body_reader.read(options.body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
-                        let (frontend_kind, max_head_len) = frontend_body_reader.into_kind();
+                        let frontend_kind = frontend_body_reader.into_kind();
                         let backend_kind = backend_body_writer.into_kind();
 
                         ret = async {
-                            let (frontend_io, backend_writer) = match (frontend_kind, backend_kind)
-                            {
-                                // Chunked to Chunked
-                                (BodyReaderKind::TE(fr), BodyWriterKind::TE(bw)) => {
-                                    let (io, trailers) =
-                                        fr.drain().await.map_err(FrontendError::BodyReadError)?;
-                                    let bw = bw
-                                        .finish_with_trailers(&trailers)
-                                        .await
-                                        .map_err(BackendError::BodyWriteError)?;
-                                    (io, BackendWriter::new(bw))
+                            match (frontend_kind, backend_kind) {
+                                (FrontendBodyReaderKind::TE(fr), BackendBodyWriterKind::TE(bw)) => {
+                                    let (next_reader, trailers) = fr.drain().await?;
+                                    let next_backend = bw.finish_with_trailers(&trailers).await?;
+                                    Ok((next_reader, next_backend))
                                 }
-                                // Chunked to Other
-                                (BodyReaderKind::TE(fr), other_bw) => {
-                                    let (io, _) =
-                                        fr.drain().await.map_err(FrontendError::BodyReadError)?;
-                                    let bw = other_bw
-                                        .finish()
-                                        .await
-                                        .map_err(BackendError::BodyWriteError)?;
-                                    (io, BackendWriter::new(bw))
+                                (fr, bw) => {
+                                    let next_reader = fr.drain().await?;
+                                    let next_backend = bw.finish().await?;
+                                    Ok((next_reader, next_backend))
                                 }
-                                // Other to Chunked
-                                (other_fr, BodyWriterKind::TE(bw)) => {
-                                    let io = BodyReader::from_kind(other_fr)
-                                        .drain()
-                                        .await
-                                        .map_err(FrontendError::BodyReadError)?;
-                                    let bw =
-                                        bw.finish().await.map_err(BackendError::BodyWriteError)?;
-                                    (io, BackendWriter::new(bw))
-                                }
-                                // Other to Other
-                                (other_fr, other_bw) => {
-                                    let io = BodyReader::from_kind(other_fr)
-                                        .drain()
-                                        .await
-                                        .map_err(FrontendError::BodyReadError)?;
-                                    let bw = other_bw
-                                        .finish()
-                                        .await
-                                        .map_err(BackendError::BodyWriteError)?;
-                                    (io, BackendWriter::new(bw))
-                                }
-                            };
-                            let next_reader =
-                                FrontendReader::new_with_buffer(frontend_io, max_head_len);
-                            Ok((next_reader, backend_writer))
+                            }
                         }
                         .await;
                         break;
