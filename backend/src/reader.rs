@@ -247,7 +247,7 @@ pub struct BackendBodylessBodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> BackendBodylessBodyReader<I> {
-    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+    pub fn drain(self) -> BackendResult<BackendReader<I>> {
         let Self { inner } = self;
         Ok(BackendReader::new_with_iobuffer(inner.drain()))
     }
@@ -322,7 +322,7 @@ impl<I: AsyncReadExt + Unpin> BackendBodyReaderKind<I> {
     /// any trailers. Use the `TE` variant directly to access trailers.
     pub async fn drain(self) -> BackendResult<BackendReader<I>> {
         match self {
-            BackendBodyReaderKind::Bodyless(r) => r.drain().await,
+            BackendBodyReaderKind::Bodyless(r) => r.drain(),
             BackendBodyReaderKind::CL(r) => r.drain().await,
             BackendBodyReaderKind::TE(r) => {
                 let (reader, _trailers) = r.drain().await?;

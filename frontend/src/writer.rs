@@ -217,7 +217,7 @@ pub struct FrontendBodylessBodyWriter<I> {
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendBodylessBodyWriter<I> {
-    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
+    pub fn finish(self) -> FrontendResult<FrontendWriter<I>> {
         let Self { inner } = self;
         Ok(FrontendWriter { io: inner.finish() })
     }
@@ -290,7 +290,7 @@ pub enum FrontendBodyWriterKind<I> {
 impl<I: AsyncWriteExt + Unpin> FrontendBodyWriterKind<I> {
     pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
         match self {
-            FrontendBodyWriterKind::Bodyless(w) => w.finish().await,
+            FrontendBodyWriterKind::Bodyless(w) => w.finish(),
             FrontendBodyWriterKind::CL(w) => w.finish().await,
             FrontendBodyWriterKind::TE(w) => w.finish().await,
         }

@@ -206,7 +206,7 @@ pub struct FrontendBodylessBodyReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendBodylessBodyReader<I> {
-    pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
+    pub fn drain(self) -> FrontendResult<FrontendReader<I>> {
         let Self {
             inner,
             max_head_length,
@@ -297,7 +297,7 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReaderKind<I> {
     /// any trailers. Use the `TE` variant directly to access trailers.
     pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
         match self {
-            FrontendBodyReaderKind::Bodyless(r) => r.drain().await,
+            FrontendBodyReaderKind::Bodyless(r) => r.drain(),
             FrontendBodyReaderKind::CL(r) => r.drain().await,
             FrontendBodyReaderKind::TE(r) => {
                 let (reader, _trailers) = r.drain().await?;
