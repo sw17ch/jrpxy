@@ -1618,6 +1618,123 @@ mod test {
         );
     }
 
+    /// RFC 9110 15.4.5 / RFC 9112 6.3: a 304 Not Modified response MUST NOT
+    /// include a message body, but MAY include headers such as `content-length`
+    /// and `transfer-encoding` to indicate what the representation would have
+    /// looked like. The proxy must forward `content-length` to the client and
+    /// must not read any body bytes from the backend connection.
+    #[tokio::test]
+    async fn not_modified_response_preserves_content_length() {
+        let frontend_reader = b"\
+            GET / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            If-None-Match: \"abc\"\r\n\
+            \r\n\
+            GET / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        // Backend sends 304 with content-length but no body, followed by a
+        // second response to prove the connection is left in a clean state.
+        let backend_reader = b"\
+            HTTP/1.1 304 Not Modified\r\n\
+            content-length: 512\r\n\
+            etag: \"abc\"\r\n\
+            \r\n\
+            HTTP/1.1 200 Ok\r\n\
+            content-length: 5\r\n\
+            \r\n\
+            hello";
+        let mut backend_writer = Vec::new();
+
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let proxy_client = ProxyClient::new(
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
+            ProxyOptions::default(),
+        );
+
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .write_backend_request(backend_connection)
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let (client, backend_connection) = rbr
+            .forward_response()
+            .await
+            .expect("failed to forward response");
+
+        // Release the mutable borrow on frontend_writer before asserting.
+        let (frontend_reader, _) = client.into_parts();
+
+        // content-length must be forwarded (RFC 9110 §15.4.5).
+        let expected = b"\
+            HTTP/1.1 304 Not Modified\r\n\
+            content-length: 512\r\n\
+            etag: \"abc\"\r\n\
+            Via: 1.1 jrpxy\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected.as_slice()),
+            jrpxy_util::debug::AsciiDebug(frontend_writer.as_slice()),
+        );
+
+        // The backend connection must be positioned right at the start of the
+        // next response — no body bytes were consumed from the 304.
+        let mut frontend_writer = Vec::new();
+        let proxy_client = ProxyClient::new(
+            frontend_reader,
+            FrontendWriter::new(&mut frontend_writer),
+            ProxyOptions::default(),
+        );
+
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("second start failed")
+            .write_backend_request(backend_connection)
+            .await
+            .expect("second backend write failed")
+            .read_backend_response()
+            .await
+            .expect("second read failed");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let (client, _) = rbr.forward_response().await.expect("second forward failed");
+
+        let (_, fw) = client.into_parts();
+
+        // For a normal response with a body the proxy rewrites the framing
+        // header, so content-length is appended after Via rather than
+        // preserved in its original position.
+        let expected_second = b"\
+            HTTP/1.1 200 Ok\r\n\
+            Via: 1.1 jrpxy\r\n\
+            content-length: 5\r\n\
+            \r\nhello";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_second.as_slice()),
+            jrpxy_util::debug::AsciiDebug(fw.as_inner()),
+        );
+    }
+
     /// A HEAD request must receive a bodyless response. The origin correctly
     /// sends no body but includes a `content-length` header indicating the size
     /// of the representation. The proxy must forward the header (so the client
