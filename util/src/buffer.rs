@@ -161,10 +161,7 @@ mod test {
         // with an opaque index-out-of-bounds; with an explicit assertion it
         // should panic with a clear message.
         let chunk = r.chunk_mut();
-        assert_eq!(
-            chunk.len(),
-            actual_spare,
-        );
+        assert_eq!(chunk.len(), actual_spare,);
     }
 
     #[test]

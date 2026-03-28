@@ -990,8 +990,7 @@ mod test {
 
         let did_fe_read = proxy_client.start().await.expect("client start failed");
 
-        let backend_connection =
-            bp.get_connection().await.expect("no backend connection");
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let did_be_write = did_fe_read
             .write_backend_request(backend_connection)
             .await
@@ -1170,8 +1169,7 @@ mod test {
 
         let did_fe_read = proxy_client.start().await.expect("client start failed");
 
-        let backend_connection =
-            bp.get_connection().await.expect("no backend connection");
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let did_be_write = did_fe_read
             .write_backend_request(backend_connection)
             .await
