@@ -2,7 +2,7 @@ pub use jrpxy_body::BodyWriterKind;
 use jrpxy_body::{
     BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header,
 };
-use jrpxy_http_message::{framing::HeadFraming, header::Headers, message::Request};
+use jrpxy_http_message::{framing::WriteFraming, header::Headers, message::Request};
 use tokio::io::{self, AsyncWriteExt};
 
 use crate::error::{BackendError, BackendResult};
@@ -17,7 +17,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
 
     pub async fn send_as_chunked(self, request: &Request) -> BackendResult<BackendBodyWriter<I>> {
         let Self { mut io } = self;
-        write_request_to(request, HeadFraming::Chunked, &mut io)
+        write_request_to(request, WriteFraming::Chunked, &mut io)
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
@@ -31,7 +31,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         body_len: u64,
     ) -> BackendResult<BackendBodyWriter<I>> {
         let Self { mut io } = self;
-        write_request_to(request, HeadFraming::Length(body_len), &mut io)
+        write_request_to(request, WriteFraming::Length(body_len), &mut io)
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
@@ -47,7 +47,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         request: &Request,
     ) -> Result<BackendBodyWriter<I>, BackendError> {
         let Self { mut io } = self;
-        write_request_to(request, HeadFraming::NoFraming, &mut io)
+        write_request_to(request, WriteFraming::PreserveFraming, &mut io)
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter {
@@ -63,7 +63,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
 
 async fn write_request_to<W: AsyncWriteExt + Unpin>(
     req: &Request,
-    framing: HeadFraming,
+    framing: WriteFraming,
     mut w: W,
 ) -> io::Result<()> {
     let method = req.method();
@@ -94,12 +94,12 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
 
     // add the framing header, if any
     match framing {
-        HeadFraming::NoFraming => {}
-        HeadFraming::Length(l) => {
+        WriteFraming::PreserveFraming | WriteFraming::StripFraming => {}
+        WriteFraming::Length(l) => {
             let cl = format!("content-length: {l}\r\n");
             w.write_all(cl.as_bytes()).await?;
         }
-        HeadFraming::Chunked => {
+        WriteFraming::Chunked => {
             w.write_all(b"transfer-encoding: chunked\r\n").await?;
         }
     }

@@ -69,7 +69,7 @@ use jrpxy_body::BodylessBodyWriter;
 use jrpxy_body::ChunkedBodyWriter;
 use jrpxy_body::ContentLengthBodyWriter;
 use jrpxy_body::is_framing_header;
-use jrpxy_http_message::framing::HeadFraming;
+use jrpxy_http_message::framing::WriteFraming;
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::Response;
 use tokio::io;
@@ -108,7 +108,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         response: &Response,
     ) -> FrontendResult<FrontendBodyWriter<I>> {
         let Self { mut io } = self;
-        write_response_to(response, HeadFraming::Chunked, &mut io)
+        write_response_to(response, WriteFraming::Chunked, &mut io)
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
@@ -125,7 +125,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         body_len: u64,
     ) -> FrontendResult<FrontendBodyWriter<I>> {
         let Self { mut io } = self;
-        write_response_to(response, HeadFraming::Length(body_len), &mut io)
+        write_response_to(response, WriteFraming::Length(body_len), &mut io)
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
@@ -133,21 +133,46 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         })
     }
 
-    /// Send the response to the frontend as bodyless. This is used most
-    /// frequently as a response to a `HEAD` request. This will not remove any
-    /// framing header sent from the origin, and will not add its own. This
-    /// means that the request may specify a `content-length` or
-    /// `transfer-encoding: chunked` header, and it will remain in place when
-    /// forwarding to the frontend. If this is used with something like a
-    /// 1xx-informational response, it is assumed the user has ensured that the
-    /// response adheres to the standard (no content-length or transfer-encoding
-    /// headers in the 1xx response, etc).
-    pub async fn send_as_bodyless(
+    /// Send the response to the frontend with no body, preserving any framing
+    /// headers (`content-length`, `transfer-encoding`) from the origin.
+    ///
+    /// Use this for responses to `HEAD` requests and `304 Not Modified`
+    /// responses, where framing headers describe the representation that
+    /// *would* have been sent rather than an actual body.
+    pub async fn send_as_bodyless_keep_framing(
         self,
         response: &Response,
     ) -> Result<FrontendBodyWriter<I>, FrontendError> {
         let Self { mut io } = self;
-        write_response_to(response, HeadFraming::NoFraming, &mut io)
+        write_response_to(response, WriteFraming::PreserveFraming, &mut io)
+            .await
+            .map_err(FrontendError::WriteError)?;
+        Ok(FrontendBodyWriter {
+            kind: BodyWriterKind::Bodyless(BodylessBodyWriter::new(io)),
+        })
+    }
+
+    /// Send the response to the frontend with no body, stripping any framing
+    /// headers from the origin.
+    ///
+    /// Use this for responses that must never carry a body by definition:
+    /// `1xx` informational responses and `204 No Content`. Forwarding a
+    /// `content-length` on these would corrupt the client's parser.
+    ///
+    /// # Panics (debug)
+    /// Asserts in debug builds that the response carries no framing headers,
+    /// catching misbehaving origins during development.
+    pub async fn send_as_no_content(
+        self,
+        response: &Response,
+    ) -> Result<FrontendBodyWriter<I>, FrontendError> {
+        debug_assert!(
+            !response.headers().iter().any(|(n, _)| is_framing_header(n)),
+            "send_as_no_content called on a response that contains framing headers \
+             (content-length or transfer-encoding); the origin is misbehaving"
+        );
+        let Self { mut io } = self;
+        write_response_to(response, WriteFraming::StripFraming, &mut io)
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter {
@@ -156,9 +181,9 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
     }
 }
 
-pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
+async fn write_response_to<W: AsyncWriteExt + Unpin>(
     res: &Response,
-    framing: HeadFraming,
+    framing: WriteFraming,
     mut w: W,
 ) -> io::Result<()> {
     let code = res.code();
@@ -176,13 +201,12 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
     w.write_all(reason).await?;
     w.write_all(b"\r\n").await?;
 
-    // if framing is specified, remove any existing framing header. otherwise,
-    // we'll leave the framing header specified by the origin in place. this is
-    // mostly useful for responses to HEAD requests.
+    // NoFraming leaves the origin's framing headers in place (HEAD / 304).
+    // All other variants strip them and optionally append a new one.
     let headers = res
         .headers()
         .iter()
-        .filter(|(n, _)| framing.is_no_framing() || !is_framing_header(n));
+        .filter(|(n, _)| framing.preserves_framing() || !is_framing_header(n));
 
     // write out each header
     for (n, v) in headers {
@@ -194,13 +218,13 @@ pub(crate) async fn write_response_to<W: AsyncWriteExt + Unpin>(
 
     // add the framing header
     match framing {
-        HeadFraming::NoFraming => {}
-        HeadFraming::Length(l) => {
+        WriteFraming::PreserveFraming | WriteFraming::StripFraming => {}
+        WriteFraming::Length(l) => {
             // TODO: we can avoid this heap allocation
             let cl = format!("content-length: {l}\r\n");
             w.write_all(cl.as_bytes()).await?;
         }
-        HeadFraming::Chunked => {
+        WriteFraming::Chunked => {
             w.write_all(b"transfer-encoding: chunked\r\n").await?;
         }
     }

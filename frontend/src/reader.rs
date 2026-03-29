@@ -44,7 +44,7 @@ use jrpxy_body::{
     ContentLengthBodyReader, PeekableBodyReader,
 };
 use jrpxy_http_message::{
-    framing::HeadFraming,
+    framing::ParsedFraming,
     header::Headers,
     message::{ParseSlots, Request},
 };
@@ -151,19 +151,19 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
         } = self;
 
         let reader = match req.framing()? {
-            HeadFraming::Length(cl) => FrontendBodyReader::new(
+            ParsedFraming::Length(cl) => FrontendBodyReader::new(
                 io_buffer,
                 max_head_length,
                 BodyReadMode::ContentLength(cl),
                 parse_slots,
             ),
-            HeadFraming::Chunked => FrontendBodyReader::new(
+            ParsedFraming::Chunked => FrontendBodyReader::new(
                 io_buffer,
                 max_head_length,
                 BodyReadMode::Chunk,
                 parse_slots,
             ),
-            HeadFraming::NoFraming => FrontendBodyReader::new(
+            ParsedFraming::NoFraming => FrontendBodyReader::new(
                 io_buffer,
                 max_head_length,
                 BodyReadMode::Bodyless,

@@ -316,7 +316,7 @@ where
 
         if client_supports_informational_response {
             let response = proxy_informational_response.into_frontend_response();
-            let frontend_body_writer = frontend_writer.send_as_bodyless(&response).await?;
+            let frontend_body_writer = frontend_writer.send_as_no_content(&response).await?;
             frontend_writer = frontend_body_writer.finish().await?;
         } else {
             drop(proxy_informational_response);
@@ -391,11 +391,9 @@ where
             client_options,
         } = self;
 
-        let _ = {
-            // TODO: use client_options to decide if we need to buffer the
-            // response (chunk-encoded) or if we can send back a content-length.
-            client_options
-        };
+        // TODO: use client_options to decide if we need to buffer the response
+        // (chunk-encoded) or if we can send back a content-length.
+        let is_head = client_options.is_head;
 
         let (response, mut backend_body_reader) = proxy_response.into_frontend_response();
         let mut frontend_body_writer = match backend_body_reader.mode() {
@@ -405,7 +403,19 @@ where
                     .send_as_content_length(&response, cl)
                     .await?
             }
-            BodyReadMode::Bodyless => frontend_writer.send_as_bodyless(&response).await?,
+            BodyReadMode::Bodyless => {
+                // HEAD responses and 304 Not Modified carry framing headers
+                // that describe the representation, not an actual body; those
+                // must be forwarded. All other bodyless codes (204, etc.) must
+                // not carry framing headers.
+                if is_head || response.code() == 304 {
+                    frontend_writer
+                        .send_as_bodyless_keep_framing(&response)
+                        .await?
+                } else {
+                    frontend_writer.send_as_no_content(&response).await?
+                }
+            }
         };
 
         let f2b_fut = async move {

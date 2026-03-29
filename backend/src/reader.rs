@@ -5,7 +5,7 @@ use jrpxy_body::{
 };
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::{
-    framing::HeadFraming,
+    framing::ParsedFraming,
     message::{ParseSlots, Response},
 };
 use jrpxy_util::io_buffer::IoBuffer;
@@ -142,13 +142,13 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
             BackendBodyReader::new(io_buffer, BodyReadMode::Bodyless, parse_slots)
         } else {
             match framing {
-                HeadFraming::Length(cl) => {
+                ParsedFraming::Length(cl) => {
                     BackendBodyReader::new(io_buffer, BodyReadMode::ContentLength(cl), parse_slots)
                 }
-                HeadFraming::Chunked => {
+                ParsedFraming::Chunked => {
                     BackendBodyReader::new(io_buffer, BodyReadMode::Chunk, parse_slots)
                 }
-                HeadFraming::NoFraming => {
+                ParsedFraming::NoFraming => {
                     BackendBodyReader::new(io_buffer, BodyReadMode::Bodyless, parse_slots)
                 }
             }

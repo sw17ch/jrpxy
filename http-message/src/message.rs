@@ -7,7 +7,7 @@ use jrpxy_util::{buffer::Buffer, parse::is_valid_tchar};
 pub use httparse::Error as HttpParseError;
 
 use crate::{
-    framing::HeadFraming,
+    framing::ParsedFraming,
     header::{HeaderError, Headers},
     version::HttpVersion,
 };
@@ -383,7 +383,7 @@ impl Request {
         self.inner.headers.get_header(needle)
     }
 
-    pub fn framing(&self) -> Result<HeadFraming, HeaderError> {
+    pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
         self.inner.headers.framing()
     }
 
@@ -450,7 +450,7 @@ impl Response {
         self.inner.headers.get_header(needle)
     }
 
-    pub fn framing(&self) -> Result<HeadFraming, HeaderError> {
+    pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
         self.inner.headers.framing()
     }
 

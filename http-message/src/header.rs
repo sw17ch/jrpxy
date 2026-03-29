@@ -1,6 +1,6 @@
 use bytes::Bytes;
 
-use crate::framing::HeadFraming;
+use crate::framing::ParsedFraming;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HeaderError {
@@ -83,7 +83,7 @@ impl Headers {
         None
     }
 
-    pub fn framing(&self) -> Result<HeadFraming, HeaderError> {
+    pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
         let mut cl = None;
         let mut te = false;
 
@@ -117,10 +117,10 @@ impl Headers {
         }
 
         match (cl, te) {
-            (None, true) => Ok(HeadFraming::Chunked),
-            (None, false) => Ok(HeadFraming::NoFraming),
+            (None, true) => Ok(ParsedFraming::Chunked),
+            (None, false) => Ok(ParsedFraming::NoFraming),
             (Some(_), true) => Err(HeaderError::BothTeAndCl),
-            (Some(cl), false) => Ok(HeadFraming::Length(cl)),
+            (Some(cl), false) => Ok(ParsedFraming::Length(cl)),
         }
     }
 
