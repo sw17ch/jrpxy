@@ -212,6 +212,8 @@ impl<I: AsyncReadExt + Unpin> BackendStreamReader<I> {
             max_head_length,
             reader,
         } = self;
+        // TODO: move max_head_length into the BackendReader in the same way
+        // it's on the FrontendReader.
         reader.read(allow_body, max_head_length).await
     }
 }
