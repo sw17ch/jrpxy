@@ -52,6 +52,97 @@ pub enum ProxyCopyError {
 
 pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
 
+/// Returned when writing the request head to the backend fails.
+///
+/// Holds the decomposed request so the caller can retry with a different
+/// backend (via [`retry_backend_request`]) or write an error response to the
+/// client using `frontend_writer`. The failed backend connection is discarded.
+///
+/// [`retry_backend_request`]: BackendRequestError::retry_backend_request
+pub struct BackendRequestError<FR, FW> {
+    /// The request that was being forwarded, with hop-by-hop headers removed
+    /// and proxy headers (e.g. `Via`) already merged in.
+    request: Request,
+    frontend_body_reader: FrontendBodyReader<FR>,
+    frontend_writer: FrontendWriter<FW>,
+    options: ProxyOptions,
+    client_options: ClientOptions,
+    error: BackendError,
+}
+
+impl<FR, FW> std::fmt::Debug for BackendRequestError<FR, FW> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendRequestError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<FR, FW> From<BackendRequestError<FR, FW>> for ProxyError {
+    fn from(e: BackendRequestError<FR, FW>) -> Self {
+        ProxyError::BackendError(e.error)
+    }
+}
+
+impl<FR, FW> BackendRequestError<FR, FW>
+where
+    FW: AsyncWriteExt + Unpin,
+{
+    /// Retry forwarding the request to a different backend connection.
+    ///
+    /// On success, returns a [`ForwardedRequest`] ready for
+    /// [`read_backend_response`]. On failure, returns another
+    /// [`BackendRequestError`] with the same request and frontend state, so
+    /// the caller can try yet another backend or give up.
+    ///
+    /// [`read_backend_response`]: ForwardedRequest::read_backend_response
+    pub async fn retry_backend_request<BR, BW>(
+        self,
+        backend_connection: BackendConnection<BR, BW>,
+    ) -> Result<ForwardedRequest<FR, FW, BR, BW>, BackendRequestError<FR, FW>>
+    where
+        BR: AsyncReadExt + Unpin,
+        BW: AsyncWriteExt + Unpin,
+    {
+        let Self {
+            request,
+            frontend_body_reader,
+            frontend_writer,
+            options,
+            client_options,
+            error: _,
+        } = self;
+
+        let (backend_reader, backend_writer) = backend_connection;
+        let write_result = match frontend_body_reader.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(&request).await,
+            BodyReadMode::ContentLength(cl) => {
+                backend_writer.send_as_content_length(&request, cl).await
+            }
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&request).await,
+        };
+
+        match write_result {
+            Ok(backend_body_writer) => Ok(ForwardedRequest {
+                options,
+                client_options,
+                frontend_body_reader,
+                frontend_writer,
+                backend_reader,
+                backend_body_writer,
+            }),
+            Err(error) => Err(BackendRequestError {
+                request,
+                frontend_body_reader,
+                frontend_writer,
+                options,
+                client_options,
+                error,
+            }),
+        }
+    }
+}
+
 type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 
 pub struct ProxyOptions {
@@ -160,10 +251,15 @@ where
     /// The backend reader and writer are taken here, allowing the caller to
     /// select the backend based on the request (e.g. by hostname or path)
     /// after inspecting the request via [`as_proxy_request`].
+    ///
+    /// On error, returns a [`BackendRequestError`] holding the request and
+    /// frontend state. Use [`BackendRequestError::retry_backend_request`] to
+    /// try a different backend, or write an error response to the client via
+    /// `frontend_writer`. The failed backend connection is discarded.
     pub async fn write_backend_request<BR, BW>(
         self,
         backend_connection: BackendConnection<BR, BW>,
-    ) -> ProxyResult<ForwardedRequest<FR, FW, BR, BW>>
+    ) -> Result<ForwardedRequest<FR, FW, BR, BW>, BackendRequestError<FR, FW>>
     where
         BR: AsyncReadExt + Unpin,
         BW: AsyncWriteExt + Unpin,
@@ -178,24 +274,32 @@ where
         let (backend_reader, backend_writer) = backend_connection;
         let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
 
-        let backend_body_writer = match frontend_body_reader.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(&backend_request).await?,
+        let write_result = match frontend_body_reader.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(&backend_request).await,
             BodyReadMode::ContentLength(cl) => {
-                backend_writer
-                    .send_as_content_length(&backend_request, cl)
-                    .await?
+                backend_writer.send_as_content_length(&backend_request, cl).await
             }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&backend_request).await?,
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&backend_request).await,
         };
 
-        Ok(ForwardedRequest {
-            options,
-            client_options,
-            frontend_body_reader,
-            frontend_writer,
-            backend_reader,
-            backend_body_writer,
-        })
+        match write_result {
+            Ok(backend_body_writer) => Ok(ForwardedRequest {
+                options,
+                client_options,
+                frontend_body_reader,
+                frontend_writer,
+                backend_reader,
+                backend_body_writer,
+            }),
+            Err(error) => Err(BackendRequestError {
+                request: backend_request,
+                frontend_body_reader,
+                frontend_writer,
+                options,
+                client_options,
+                error,
+            }),
+        }
     }
 }
 
