@@ -84,6 +84,165 @@ impl<FR, FW> From<BackendRequestError<FR, FW>> for ProxyError {
     }
 }
 
+/// Returned when reading the response head from the backend fails.
+///
+/// The broken backend connection is discarded. The frontend state and the
+/// original request are preserved so the caller can retry with a different
+/// backend (via [`retry_backend_request`]) or write an error response to the
+/// client via `frontend_writer`.
+///
+/// [`retry_backend_request`]: BackendResponseError::retry_backend_request
+pub struct BackendResponseError<FR, FW> {
+    /// The request that was forwarded, ready to be sent to a different backend.
+    request: Request,
+    frontend_body_reader: FrontendBodyReader<FR>,
+    frontend_writer: FrontendWriter<FW>,
+    options: ProxyOptions,
+    client_options: ClientOptions,
+    error: BackendError,
+}
+
+impl<FR, FW> std::fmt::Debug for BackendResponseError<FR, FW> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendResponseError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<FR, FW> From<BackendResponseError<FR, FW>> for ProxyError {
+    fn from(e: BackendResponseError<FR, FW>) -> Self {
+        ProxyError::BackendError(e.error)
+    }
+}
+
+/// Returned when reading the next response from the backend fails after at
+/// least one informational response has already been received from the backend.
+///
+/// Retry is not offered: the backend has already acknowledged the request
+/// (evidenced by the 1xx it sent), so retrying risks duplicate processing.
+/// The frontend connection is still alive; an error can be sent to the client.
+pub struct BackendStreamError<FR, FW> {
+    frontend_body_reader: FrontendBodyReader<FR>,
+    frontend_writer: FrontendWriter<FW>,
+    options: ProxyOptions,
+    client_options: ClientOptions,
+    error: BackendError,
+}
+
+impl<FR, FW> std::fmt::Debug for BackendStreamError<FR, FW> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BackendStreamError")
+            .field("error", &self.error)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<FR, FW> From<BackendStreamError<FR, FW>> for ProxyError {
+    fn from(e: BackendStreamError<FR, FW>) -> Self {
+        ProxyError::BackendError(e.error)
+    }
+}
+
+/// Error returned by [`ReceivedInformationalResponse::forward_informational_response`].
+///
+/// Two distinct failure modes arise in that method:
+///
+/// - [`Frontend`]: writing the 1xx to the client failed; `frontend_writer` has
+///   been consumed and cannot be recovered.
+/// - [`Backend`]: reading the next response from the backend failed; the
+///   frontend is still alive and the error carries `frontend_writer` so the
+///   caller can send an error response to the client.
+///
+/// [`Frontend`]: InformationalForwardError::Frontend
+/// [`Backend`]: InformationalForwardError::Backend
+pub enum InformationalForwardError<FR, FW> {
+    Frontend(FrontendError),
+    Backend(BackendStreamError<FR, FW>),
+}
+
+impl<FR, FW> std::fmt::Debug for InformationalForwardError<FR, FW> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            InformationalForwardError::Frontend(e) => {
+                f.debug_tuple("Frontend").field(e).finish()
+            }
+            InformationalForwardError::Backend(e) => {
+                f.debug_tuple("Backend").field(e).finish()
+            }
+        }
+    }
+}
+
+impl<FR, FW> From<InformationalForwardError<FR, FW>> for ProxyError {
+    fn from(e: InformationalForwardError<FR, FW>) -> Self {
+        match e {
+            InformationalForwardError::Frontend(e) => ProxyError::FrontendError(e),
+            InformationalForwardError::Backend(e) => ProxyError::BackendError(e.error),
+        }
+    }
+}
+
+impl<FR, FW> BackendResponseError<FR, FW>
+where
+    FW: AsyncWriteExt + Unpin,
+{
+    /// Retry forwarding the request to a different backend connection.
+    ///
+    /// On success, returns a [`ForwardedRequest`] ready for
+    /// [`read_backend_response`]. On failure, returns another
+    /// [`BackendResponseError`] with the same request and frontend state, so
+    /// the caller can try yet another backend or give up.
+    ///
+    /// [`read_backend_response`]: ForwardedRequest::read_backend_response
+    pub async fn retry_backend_request<BR, BW>(
+        self,
+        backend_connection: BackendConnection<BR, BW>,
+    ) -> Result<ForwardedRequest<FR, FW, BR, BW>, BackendResponseError<FR, FW>>
+    where
+        BR: AsyncReadExt + Unpin,
+        BW: AsyncWriteExt + Unpin,
+    {
+        let Self {
+            request,
+            frontend_body_reader,
+            frontend_writer,
+            options,
+            client_options,
+            error: _,
+        } = self;
+
+        let (backend_reader, backend_writer) = backend_connection;
+        let write_result = match frontend_body_reader.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(&request).await,
+            BodyReadMode::ContentLength(cl) => {
+                backend_writer.send_as_content_length(&request, cl).await
+            }
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&request).await,
+        };
+
+        match write_result {
+            Ok(backend_body_writer) => Ok(ForwardedRequest {
+                request,
+                options,
+                client_options,
+                frontend_body_reader,
+                frontend_writer,
+                backend_reader,
+                backend_body_writer,
+            }),
+            Err(error) => Err(BackendResponseError {
+                request,
+                frontend_body_reader,
+                frontend_writer,
+                options,
+                client_options,
+                error,
+            }),
+        }
+    }
+}
+
 impl<FR, FW> BackendRequestError<FR, FW>
 where
     FW: AsyncWriteExt + Unpin,
@@ -124,6 +283,7 @@ where
 
         match write_result {
             Ok(backend_body_writer) => Ok(ForwardedRequest {
+                request,
                 options,
                 client_options,
                 frontend_body_reader,
@@ -148,6 +308,9 @@ type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 pub struct ProxyOptions {
     pub max_backend_head_length: usize,
     pub body_chunk_size: usize,
+    /// TODO: make a builder for ProxyOptions so that we can validate
+    /// `received_by` doesn't contain something like \r\n which would do bad
+    /// things when inserting it into the `Via` header.
     pub received_by: Cow<'static, str>,
 }
 
@@ -284,6 +447,7 @@ where
 
         match write_result {
             Ok(backend_body_writer) => Ok(ForwardedRequest {
+                request: backend_request,
                 options,
                 client_options,
                 frontend_body_reader,
@@ -304,6 +468,7 @@ where
 }
 
 pub struct ForwardedRequest<FR, FW, BR, BW> {
+    request: Request,
     options: ProxyOptions,
     client_options: ClientOptions,
     frontend_body_reader: FrontendBodyReader<FR>,
@@ -324,8 +489,9 @@ where
 {
     pub async fn read_backend_response(
         self,
-    ) -> ProxyResult<ReceivedResponseStream<FR, FW, BR, BW>> {
+    ) -> Result<ReceivedResponseStream<FR, FW, BR, BW>, BackendResponseError<FR, FW>> {
         let Self {
+            request,
             options,
             client_options,
             frontend_body_reader,
@@ -334,9 +500,25 @@ where
             backend_body_writer,
         } = self;
 
-        let response_stream = backend_reader
+        let response_stream = match backend_reader
             .read(!client_options.is_head, options.max_backend_head_length)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(error) => {
+                // backend_reader and backend_body_writer are both discarded;
+                // the backend connection is broken.
+                drop(backend_body_writer);
+                return Err(BackendResponseError {
+                    request,
+                    frontend_body_reader,
+                    frontend_writer,
+                    options,
+                    client_options,
+                    error,
+                });
+            }
+        };
         let response_stream = ProxyResponseStream::new(response_stream, &options.received_by);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
@@ -405,7 +587,7 @@ where
 
     pub async fn forward_informational_response(
         self,
-    ) -> ProxyResult<InformationalForwardResult<FR, FW, BR, BW>> {
+    ) -> Result<InformationalForwardResult<FR, FW, BR, BW>, InformationalForwardError<FR, FW>> {
         let Self {
             proxy_informational_response,
             frontend_body_reader,
@@ -422,13 +604,32 @@ where
 
         if client_supports_informational_response {
             let response = proxy_informational_response.into_frontend_response();
-            let frontend_body_writer = frontend_writer.send_as_no_content(&response).await?;
-            frontend_writer = frontend_body_writer.finish().await?;
+            let frontend_body_writer = frontend_writer
+                .send_as_no_content(&response)
+                .await
+                .map_err(InformationalForwardError::Frontend)?;
+            frontend_writer = frontend_body_writer
+                .finish()
+                .await
+                .map_err(InformationalForwardError::Frontend)?;
         } else {
             drop(proxy_informational_response);
         }
 
-        let response_stream = match proxy_stream_reader.read().await? {
+        let response_stream = match proxy_stream_reader.read().await {
+            Ok(r) => r,
+            Err(error) => {
+                return Err(InformationalForwardError::Backend(BackendStreamError {
+                    frontend_body_reader,
+                    frontend_writer,
+                    options,
+                    client_options,
+                    error,
+                }));
+            }
+        };
+
+        let response_stream = match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 ReceivedResponseStream::Response(ReceivedResponse {
                     frontend_body_reader,
