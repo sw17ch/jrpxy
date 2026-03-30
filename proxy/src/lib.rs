@@ -413,7 +413,7 @@ where
     ///
     /// The backend reader and writer are taken here, allowing the caller to
     /// select the backend based on the request (e.g. by hostname or path)
-    /// after inspecting the request via [`as_proxy_request`].
+    /// after inspecting the request via [`ReceivedRequest::as_proxy_request`].
     ///
     /// On error, returns a [`BackendRequestError`] holding the request and
     /// frontend state. Use [`BackendRequestError::retry_backend_request`] to
@@ -1187,11 +1187,7 @@ pub enum ProxyResponseStream<I> {
 }
 
 impl<I> ProxyResponseStream<I> {
-    /// Process a [`BackendResponseStream`] into a [`ProxyResponseStream`].
-    ///
-    /// `received_by` is the proxy identifier inserted into the `Via` header
-    /// per RFC 9110 7.6.3 (e.g. a hostname or pseudonym).
-    pub fn new(stream: ResponseStream<I>, received_by: &str) -> Self {
+    fn new(stream: ResponseStream<I>, received_by: &str) -> Self {
         match stream {
             ResponseStream::Response(mut backend) => {
                 let version = backend.res().version();

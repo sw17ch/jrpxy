@@ -19,12 +19,7 @@ impl ParsedFraming {
 }
 
 /// The framing instruction used when writing an HTTP message head to a
-/// connection. Passed to the internal `write_request_to` / `write_response_to`
-/// helpers and to the public `send_as_*` methods on [`FrontendWriter`] and
-/// [`BackendWriter`].
-///
-/// [`FrontendWriter`]: jrpxy_frontend::writer::FrontendWriter
-/// [`BackendWriter`]: jrpxy_backend::writer::BackendWriter
+/// connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WriteFraming {
     /// Write a `content-length: <len>` framing header.
