@@ -201,15 +201,50 @@ pub struct PendingFrontendResponse<FW> {
 }
 
 impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
+    /// Send a 1xx informational response to the client. Proxy headers are
+    /// injected automatically.
+    ///
+    /// Unlike the terminal `send_as_*` methods, this returns a fresh
+    /// [`PendingFrontendResponse`] because a 1xx response is non-terminal —
+    /// the frontend is still awaiting the final response to the same request.
+    pub async fn send_informational(
+        self,
+        response: &mut Response,
+    ) -> Result<PendingFrontendResponse<FW>, FrontendError> {
+        let Self {
+            frontend_writer,
+            options,
+            client_options,
+        } = self;
+        let version = response.version();
+        insert_proxy_headers(response.headers_mut(), version, &options.received_by);
+        let body_writer = frontend_writer.send_as_no_content(response).await?;
+        let frontend_writer = body_writer.finish().await?;
+        Ok(PendingFrontendResponse {
+            frontend_writer,
+            options,
+            client_options,
+        })
+    }
+
     /// Send the response with a chunked body. Proxy headers are injected
     /// automatically.
     pub async fn send_as_chunked(
         self,
         response: &mut Response,
-    ) -> Result<FrontendBodyWriter<FW>, FrontendError> {
+    ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
+        let Self {
+            frontend_writer,
+            options,
+            client_options: _,
+        } = self;
         let version = response.version();
-        insert_proxy_headers(response, version, &self.options.received_by);
-        self.frontend_writer.send_as_chunked(response).await
+        insert_proxy_headers(response.headers_mut(), version, &options.received_by);
+        let body_writer = frontend_writer.send_as_chunked(response).await?;
+        Ok(PendingFrontendResponseBodyWriter {
+            body_writer,
+            options,
+        })
     }
 
     /// Send the response with a content-length delimited body. Proxy headers
@@ -218,12 +253,21 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         self,
         response: &mut Response,
         body_len: u64,
-    ) -> Result<FrontendBodyWriter<FW>, FrontendError> {
+    ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
+        let Self {
+            frontend_writer,
+            options,
+            client_options: _,
+        } = self;
         let version = response.version();
-        insert_proxy_headers(response, version, &self.options.received_by);
-        self.frontend_writer
+        insert_proxy_headers(response.headers_mut(), version, &options.received_by);
+        let body_writer = frontend_writer
             .send_as_content_length(response, body_len)
-            .await
+            .await?;
+        Ok(PendingFrontendResponseBodyWriter {
+            body_writer,
+            options,
+        })
     }
 
     /// Send the response with no body, preserving any framing headers from
@@ -232,23 +276,76 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     pub async fn send_as_bodyless_keep_framing(
         self,
         response: &mut Response,
-    ) -> Result<FrontendBodyWriter<FW>, FrontendError> {
+    ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
+        let Self {
+            frontend_writer,
+            options,
+            client_options: _,
+        } = self;
         let version = response.version();
-        insert_proxy_headers(response, version, &self.options.received_by);
-        self.frontend_writer
+        insert_proxy_headers(response.headers_mut(), version, &options.received_by);
+        let body_writer = frontend_writer
             .send_as_bodyless_keep_framing(response)
-            .await
+            .await?;
+        Ok(PendingFrontendResponseBodyWriter {
+            body_writer,
+            options,
+        })
     }
 
-    /// Send the response with no body and no framing headers (for `1xx` and
+    /// Send the response with no body and no framing headers (for
     /// `204 No Content`). Proxy headers are injected automatically.
+    ///
+    /// For 1xx informational responses use [`send_informational`] instead.
+    ///
+    /// [`send_informational`]: PendingFrontendResponse::send_informational
     pub async fn send_as_no_content(
         self,
         response: &mut Response,
-    ) -> Result<FrontendBodyWriter<FW>, FrontendError> {
+    ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
+        let Self {
+            frontend_writer,
+            options,
+            client_options: _,
+        } = self;
         let version = response.version();
-        insert_proxy_headers(response, version, &self.options.received_by);
-        self.frontend_writer.send_as_no_content(response).await
+        insert_proxy_headers(response.headers_mut(), version, &options.received_by);
+        let body_writer = frontend_writer.send_as_no_content(response).await?;
+        Ok(PendingFrontendResponseBodyWriter {
+            body_writer,
+            options,
+        })
+    }
+}
+
+/// A frontend body writer produced by [`PendingFrontendResponse::send_as_*`].
+///
+/// Carries [`ProxyOptions`] through the body-write cycle so that
+/// [`forward_response`] can recover them for [`ProxyClient`] construction
+/// without needing to clone before consuming [`PendingFrontendResponse`].
+///
+/// [`forward_response`]: ReceivedResponse::forward_response
+pub struct PendingFrontendResponseBodyWriter<FW> {
+    body_writer: FrontendBodyWriter<FW>,
+    options: ProxyOptions,
+}
+
+impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponseBodyWriter<FW> {
+    /// Write a chunk of the response body.
+    pub async fn write(&mut self, buf: &[u8]) -> Result<(), FrontendError> {
+        self.body_writer.write(buf).await
+    }
+
+    /// Finish writing the response body. Returns the underlying
+    /// [`FrontendWriter`] — the terminal response is complete, and the
+    /// frontend is no longer expecting a response on this request.
+    pub async fn finish(self) -> Result<FrontendWriter<FW>, FrontendError> {
+        self.body_writer.finish().await
+    }
+
+    /// Abort the response body, closing the connection.
+    pub async fn abort(self) -> Result<(), FrontendError> {
+        self.body_writer.abort().await
     }
 }
 
@@ -397,7 +494,6 @@ where
 
 type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 
-#[derive(Clone)]
 pub struct ProxyOptions {
     pub max_backend_head_length: usize,
     pub body_chunk_size: usize,
@@ -675,31 +771,17 @@ where
             backend_body_writer,
         } = self;
 
-        // Stash fields needed to reconstruct `pending` after `send_as_*`
-        // consumes it, and to build error values.
-        let options = pending.options.clone();
-        let client_options = pending.client_options;
-
         // RFC9110 section 15.2 states that a server MUST NOT send any 1xx
         // response to a HTTP/1.0 client.
-        let client_supports_informational_response = client_options.version == HttpVersion::Http11;
+        let client_supports_informational_response =
+            pending.client_options.version == HttpVersion::Http11;
 
         let pending = if client_supports_informational_response {
             let mut response = proxy_informational_response.into_frontend_response();
-            // pending.send_as_no_content injects the Via header automatically.
-            let frontend_body_writer = pending
-                .send_as_no_content(&mut response)
+            pending
+                .send_informational(&mut response)
                 .await
-                .map_err(InformationalForwardError::Frontend)?;
-            let frontend_writer = frontend_body_writer
-                .finish()
-                .await
-                .map_err(InformationalForwardError::Frontend)?;
-            PendingFrontendResponse {
-                frontend_writer,
-                options,
-                client_options,
-            }
+                .map_err(InformationalForwardError::Frontend)?
         } else {
             drop(proxy_informational_response);
             pending
@@ -779,14 +861,11 @@ where
 
         // TODO: use client_options to decide if we need to buffer the response
         // (chunk-encoded) or if we can send back a content-length.
-
-        // Stash fields needed after `pending` is consumed by `send_as_*`.
         let is_head = pending.client_options.is_head;
         let body_chunk_size = pending.options.body_chunk_size;
-        let options = pending.options.clone();
 
         let (mut response, mut backend_body_reader) = proxy_response.into_frontend_response();
-        let mut frontend_body_writer = match backend_body_reader.mode() {
+        let pending_body_writer = match backend_body_reader.mode() {
             BodyReadMode::Chunk => pending.send_as_chunked(&mut response).await?,
             BodyReadMode::ContentLength(cl) => {
                 pending.send_as_content_length(&mut response, cl).await?
@@ -803,6 +882,10 @@ where
                 }
             }
         };
+        let PendingFrontendResponseBodyWriter {
+            body_writer: mut frontend_body_writer,
+            options,
+        } = pending_body_writer;
 
         let f2b_fut = async move {
             let ret;
@@ -1002,13 +1085,13 @@ fn strip_hop_by_hop_headers(headers: &mut Headers) -> Headers {
     })
 }
 
-/// Inject a `Via` header (RFC 9110 sec 7.6.3) directly into `response`.
-fn insert_proxy_headers(response: &mut Response, version: HttpVersion, received_by: &str) {
+/// Inject a `Via` header (RFC 9110 sec 7.6.3) into `headers`.
+fn insert_proxy_headers(headers: &mut Headers, version: HttpVersion, received_by: &str) {
     let via_version = match version {
         HttpVersion::Http10 => "1.0",
         HttpVersion::Http11 => "1.1",
     };
-    response.headers_mut().push(
+    headers.push(
         Bytes::from_static(b"Via"),
         Bytes::from(format!("{via_version} {received_by}")),
     );
@@ -1040,15 +1123,8 @@ impl<I> ProxyRequest<I> {
         let version = frontend.req().version();
         let hop_by_hop = strip_hop_by_hop_headers(frontend.req_mut().headers_mut());
 
-        let via_version = match version {
-            HttpVersion::Http10 => "1.0",
-            HttpVersion::Http11 => "1.1",
-        };
         let mut proxy_headers = Headers::with_capacity(1);
-        proxy_headers.push(
-            Bytes::from_static(b"Via"),
-            Bytes::from(format!("{via_version} {received_by}")),
-        );
+        insert_proxy_headers(&mut proxy_headers, version, received_by);
 
         Self {
             frontend,
