@@ -207,11 +207,8 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         self,
         response: &mut Response,
     ) -> Result<FrontendBodyWriter<FW>, FrontendError> {
-        insert_proxy_headers(
-            response,
-            self.client_options.version,
-            &self.options.received_by,
-        );
+        let version = response.version();
+        insert_proxy_headers(response, version, &self.options.received_by);
         self.frontend_writer.send_as_chunked(response).await
     }
 
@@ -222,11 +219,8 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         response: &mut Response,
         body_len: u64,
     ) -> Result<FrontendBodyWriter<FW>, FrontendError> {
-        insert_proxy_headers(
-            response,
-            self.client_options.version,
-            &self.options.received_by,
-        );
+        let version = response.version();
+        insert_proxy_headers(response, version, &self.options.received_by);
         self.frontend_writer
             .send_as_content_length(response, body_len)
             .await
@@ -239,11 +233,8 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         self,
         response: &mut Response,
     ) -> Result<FrontendBodyWriter<FW>, FrontendError> {
-        insert_proxy_headers(
-            response,
-            self.client_options.version,
-            &self.options.received_by,
-        );
+        let version = response.version();
+        insert_proxy_headers(response, version, &self.options.received_by);
         self.frontend_writer
             .send_as_bodyless_keep_framing(response)
             .await
@@ -255,11 +246,8 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         self,
         response: &mut Response,
     ) -> Result<FrontendBodyWriter<FW>, FrontendError> {
-        insert_proxy_headers(
-            response,
-            self.client_options.version,
-            &self.options.received_by,
-        );
+        let version = response.version();
+        insert_proxy_headers(response, version, &self.options.received_by);
         self.frontend_writer.send_as_no_content(response).await
     }
 }
@@ -435,6 +423,7 @@ where
 
 type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 
+#[derive(Clone)]
 pub struct ProxyOptions {
     pub max_backend_head_length: usize,
     pub body_chunk_size: usize,
@@ -444,6 +433,7 @@ pub struct ProxyOptions {
     pub received_by: Cow<'static, str>,
 }
 
+#[derive(Clone, Copy)]
 struct ClientOptions {
     is_head: bool,
     version: HttpVersion,
@@ -653,8 +643,7 @@ where
                 });
             }
         };
-        let response_stream =
-            ProxyResponseStream::new(response_stream, &pending.options.received_by);
+        let response_stream = ProxyResponseStream::new(response_stream);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 ReceivedResponseStream::Response(ReceivedResponse {
@@ -720,44 +709,47 @@ where
         let Self {
             proxy_informational_response,
             frontend_body_reader,
-            pending:
-                PendingFrontendResponse {
-                    mut frontend_writer,
-                    options,
-                    client_options,
-                },
+            pending,
             proxy_stream_reader,
             backend_body_writer,
         } = self;
+
+        // Stash fields needed to reconstruct `pending` after `send_as_*`
+        // consumes it, and to build error values.
+        let options = pending.options.clone();
+        let client_options = pending.client_options;
 
         // RFC9110 section 15.2 states that a server MUST NOT send any 1xx
         // response to a HTTP/1.0 client.
         let client_supports_informational_response = client_options.version == HttpVersion::Http11;
 
-        if client_supports_informational_response {
-            let response = proxy_informational_response.into_frontend_response();
-            let frontend_body_writer = frontend_writer
-                .send_as_no_content(&response)
+        let pending = if client_supports_informational_response {
+            let mut response = proxy_informational_response.into_frontend_response();
+            // pending.send_as_no_content injects the Via header automatically.
+            let frontend_body_writer = pending
+                .send_as_no_content(&mut response)
                 .await
                 .map_err(InformationalForwardError::Frontend)?;
-            frontend_writer = frontend_body_writer
+            let frontend_writer = frontend_body_writer
                 .finish()
                 .await
                 .map_err(InformationalForwardError::Frontend)?;
+            PendingFrontendResponse {
+                frontend_writer,
+                options,
+                client_options,
+            }
         } else {
             drop(proxy_informational_response);
-        }
+            pending
+        };
 
         let response_stream = match proxy_stream_reader.read().await {
             Ok(r) => r,
             Err(error) => {
                 return Err(InformationalForwardError::Backend(BackendStreamError {
                     frontend_body_reader,
-                    pending: PendingFrontendResponse {
-                        frontend_writer,
-                        options,
-                        client_options,
-                    },
+                    pending,
                     error,
                 }));
             }
@@ -767,11 +759,7 @@ where
             ProxyResponseStream::Response(proxy_response) => {
                 ReceivedResponseStream::Response(ReceivedResponse {
                     frontend_body_reader,
-                    pending: PendingFrontendResponse {
-                        frontend_writer,
-                        options,
-                        client_options,
-                    },
+                    pending,
                     proxy_response,
                     backend_body_writer,
                 })
@@ -782,11 +770,7 @@ where
             ) => ReceivedResponseStream::Informational(ReceivedInformationalResponse {
                 proxy_informational_response,
                 frontend_body_reader,
-                pending: PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+                pending,
                 proxy_stream_reader,
                 backend_body_writer,
             }),
@@ -827,27 +811,24 @@ where
     ) -> ProxyResult<(ProxyClient<FR, FW>, BackendConnection<BR, BW>)> {
         let Self {
             mut frontend_body_reader,
-            pending:
-                PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+            pending,
             proxy_response,
             mut backend_body_writer,
         } = self;
 
         // TODO: use client_options to decide if we need to buffer the response
         // (chunk-encoded) or if we can send back a content-length.
-        let is_head = client_options.is_head;
 
-        let (response, mut backend_body_reader) = proxy_response.into_frontend_response();
+        // Stash fields needed after `pending` is consumed by `send_as_*`.
+        let is_head = pending.client_options.is_head;
+        let body_chunk_size = pending.options.body_chunk_size;
+        let options = pending.options.clone();
+
+        let (mut response, mut backend_body_reader) = proxy_response.into_frontend_response();
         let mut frontend_body_writer = match backend_body_reader.mode() {
-            BodyReadMode::Chunk => frontend_writer.send_as_chunked(&response).await?,
+            BodyReadMode::Chunk => pending.send_as_chunked(&mut response).await?,
             BodyReadMode::ContentLength(cl) => {
-                frontend_writer
-                    .send_as_content_length(&response, cl)
-                    .await?
+                pending.send_as_content_length(&mut response, cl).await?
             }
             BodyReadMode::Bodyless => {
                 // HEAD responses and 304 Not Modified carry framing headers
@@ -855,11 +836,9 @@ where
                 // must be forwarded. All other bodyless codes (204, etc.) must
                 // not carry framing headers.
                 if is_head || response.code() == 304 {
-                    frontend_writer
-                        .send_as_bodyless_keep_framing(&response)
-                        .await?
+                    pending.send_as_bodyless_keep_framing(&mut response).await?
                 } else {
-                    frontend_writer.send_as_no_content(&response).await?
+                    pending.send_as_no_content(&mut response).await?
                 }
             }
         };
@@ -867,7 +846,7 @@ where
         let f2b_fut = async move {
             let ret;
             loop {
-                let buf = match frontend_body_reader.read(options.body_chunk_size).await {
+                let buf = match frontend_body_reader.read(body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
                         let frontend_kind = frontend_body_reader.into_kind();
@@ -911,7 +890,7 @@ where
         let b2f_fut = async move {
             let ret;
             loop {
-                let buf = match backend_body_reader.read(options.body_chunk_size).await {
+                let buf = match backend_body_reader.read(body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
                         let backend_kind = backend_body_reader.into_kind();
@@ -1044,44 +1023,22 @@ fn parse_connection_tokens(value: &[u8]) -> Vec<Bytes> {
         .collect()
 }
 
-/// Remove all hop-by-hop headers from `headers` and build the `Via` header
-/// (RFC 9110 7.6.3).
+/// Remove all hop-by-hop headers from `headers` (RFC 9110 7.6.1, RFC 9112).
 ///
-/// Returns `(hop_by_hop, proxy_headers)` where `hop_by_hop` contains the
-/// removed headers and `proxy_headers` contains the headers added by this
-/// proxy.
-fn process_hop_by_hop(
-    headers: &mut Headers,
-    version: HttpVersion,
-    received_by: &str,
-) -> (Headers, Headers) {
-    // TODO: this should be two functions: split_out_hop_by_hop_headers and
-    // add_proxy_headers.
-
+/// Returns the removed headers.
+fn strip_hop_by_hop_headers(headers: &mut Headers) -> Headers {
     // Collect any extra hop-by-hop names listed in the Connection header.
     let connection_tokens = headers
         .get_header("connection")
         .map(|v| parse_connection_tokens(v))
         .unwrap_or_default();
 
-    let hop_by_hop = headers.remove(|(name, _)| {
+    headers.remove(|(name, _)| {
         is_standard_hop_by_hop(name)
             || connection_tokens
                 .iter()
                 .any(|t| t.as_ref().eq_ignore_ascii_case(name))
-    });
-
-    let via_version = match version {
-        HttpVersion::Http10 => "1.0",
-        HttpVersion::Http11 => "1.1",
-    };
-    let mut proxy_headers = Headers::with_capacity(1);
-    proxy_headers.push(
-        Bytes::from_static(b"Via"),
-        Bytes::from(format!("{via_version} {received_by}")),
-    );
-
-    (hop_by_hop, proxy_headers)
+    })
 }
 
 /// Inject a `Via` header (RFC 9110 sec 7.6.3) directly into `response`.
@@ -1120,8 +1077,17 @@ impl<I> ProxyRequest<I> {
     /// per RFC 9110 7.6.3 (e.g. a hostname or pseudonym).
     pub fn new(mut frontend: FrontendRequest<I>, received_by: &str) -> Self {
         let version = frontend.req().version();
-        let (hop_by_hop, proxy_headers) =
-            process_hop_by_hop(frontend.req_mut().headers_mut(), version, received_by);
+        let hop_by_hop = strip_hop_by_hop_headers(frontend.req_mut().headers_mut());
+
+        let via_version = match version {
+            HttpVersion::Http10 => "1.0",
+            HttpVersion::Http11 => "1.1",
+        };
+        let mut proxy_headers = Headers::with_capacity(1);
+        proxy_headers.push(
+            Bytes::from_static(b"Via"),
+            Bytes::from(format!("{via_version} {received_by}")),
+        );
 
         Self {
             frontend,
@@ -1181,16 +1147,11 @@ impl<I> ProxyRequest<I> {
 
 /// The proxy-processed form of a regular (non-1xx) backend response.
 ///
-/// The three header sets exposed by this type are:
-///
-/// - **original headers**: the end-to-end headers remaining after hop-by-hop
-///   removal.
-/// - **hop-by-hop headers**: the headers that were removed.
-/// - **proxy headers**: headers added by this proxy.
+/// Hop-by-hop headers have been stripped on construction and are available
+/// via [`ProxyResponse::hop_by_hop_headers`].
 pub struct ProxyResponse<I> {
     backend: BackendResponse<I>,
     hop_by_hop: Headers,
-    proxy_headers: Headers,
 }
 
 impl<I> ProxyResponse<I> {
@@ -1210,55 +1171,30 @@ impl<I> ProxyResponse<I> {
         &self.hop_by_hop
     }
 
-    /// The proxy headers that will be by this proxy (e.g. `Via`).
-    pub fn proxy_headers(&self) -> &Headers {
-        &self.proxy_headers
-    }
-
-    /// A mutable reference to the proxy headers that will be added to the
-    /// response before forwarding to the next hop. This allows the user to add
-    /// or remove proxy headers before forwarding.
-    pub fn proxy_headers_mut(&mut self) -> &mut Headers {
-        &mut self.proxy_headers
-    }
-
-    /// The end-to-end headers on this response
+    /// The end-to-end headers on this response.
     pub fn end_to_end_headers(&self) -> &Headers {
         self.res().headers()
     }
 
-    /// Convert the [`ProxyRequest`] into a request with all the hop-by-hop
-    /// headers removed, and proxy headers added.
+    /// Convert the [`ProxyResponse`] into a response ready to send to the
+    /// frontend. Hop-by-hop headers have already been removed. `Via` will be
+    /// injected by [`PendingFrontendResponse::send_as_*`].
     pub fn into_frontend_response(self) -> (Response, BackendBodyReader<I>) {
         let Self {
-            mut backend,
+            backend,
             hop_by_hop: _,
-            proxy_headers,
         } = self;
-
-        // merge the proxy headers into the request
-        let current_headers = backend.res_mut().headers_mut();
-        current_headers.merge(&proxy_headers);
-
-        // having removed hop-by-hop headers, and merged in proxy headers, we
-        // can now break the backend into parts and return them as a frontend
-        // response
         backend.into_parts()
     }
 }
 
 /// The proxy-processed form of a 1xx informational response.
 ///
-/// The three header sets exposed by this type are:
-///
-/// - **original headers**: the end-to-end headers remaining after hop-by-hop
-///   removal.
-/// - **hop-by-hop headers**: the headers that were removed.
-/// - **proxy headers**: headers added by this proxy.
+/// Hop-by-hop headers have been stripped on construction and are available
+/// via [`ProxyInformationalResponse::hop_by_hop_headers`].
 pub struct ProxyInformationalResponse {
     res: Response,
     hop_by_hop: Headers,
-    proxy_headers: Headers,
 }
 
 impl ProxyInformationalResponse {
@@ -1267,7 +1203,7 @@ impl ProxyInformationalResponse {
         &self.res
     }
 
-    /// The end-to-end headers on this response
+    /// The end-to-end headers on this response.
     pub fn end_to_end_headers(&self) -> &Headers {
         self.res().headers()
     }
@@ -1278,57 +1214,32 @@ impl ProxyInformationalResponse {
         &self.hop_by_hop
     }
 
-    /// The proxy headers that will be by this proxy (e.g. `Via`).
-    pub fn proxy_headers(&self) -> &Headers {
-        &self.proxy_headers
-    }
-
-    /// A mutable reference to the proxy headers that will be added to the
-    /// response before forwarding to the next hop. This allows the user to add
-    /// or remove proxy headers before forwarding.
-    pub fn proxy_headers_mut(&mut self) -> &mut Headers {
-        &mut self.proxy_headers
-    }
-
-    /// Convert the [`ProxyRequest`] into a request with all the hop-by-hop
-    /// headers removed, and proxy headers added.
+    /// Convert the [`ProxyInformationalResponse`] into a response ready to
+    /// send to the frontend. Hop-by-hop headers have already been removed.
     pub fn into_frontend_response(self) -> Response {
-        let Self {
-            mut res,
-            hop_by_hop: _,
-            proxy_headers,
-        } = self;
-
-        // merge the proxy headers into the request
-        let current_headers = res.headers_mut();
-        current_headers.merge(&proxy_headers);
-
-        // then we can return the pieces normally
+        let Self { res, hop_by_hop: _ } = self;
         res
     }
 }
 
 /// Reads the next response in a stream, producing a [`ProxyResponseStream`].
 ///
-/// Wraps [`BackendStreamReader`] and applies the same hop-by-hop removal and
-/// `Via` injection to each response it yields.
+/// Wraps [`BackendStreamReader`] and applies hop-by-hop removal to each
+/// response it yields.
 pub struct ProxyStreamReader<I> {
-    received_by: Box<str>,
     reader: BackendStreamReader<I>,
 }
 
 impl<I: AsyncReadExt + Unpin> ProxyStreamReader<I> {
     pub async fn read(self) -> BackendResult<ProxyResponseStream<I>> {
         let stream = self.reader.read().await?;
-        Ok(ProxyResponseStream::new(stream, &self.received_by))
+        Ok(ProxyResponseStream::new(stream))
     }
 }
 
 /// The proxy-processed form of [`ResponseStream`].
 ///
-/// Each variant carries the same three header sets as [`ProxyRequest`]:
-/// end-to-end headers remaining on the message, removed hop-by-hop headers,
-/// and headers added by this proxy.
+/// Each variant has had its hop-by-hop headers stripped.
 pub enum ProxyResponseStream<I> {
     /// A regular (non-1xx) response.
     Response(ProxyResponse<I>),
@@ -1338,32 +1249,20 @@ pub enum ProxyResponseStream<I> {
 }
 
 impl<I> ProxyResponseStream<I> {
-    fn new(stream: ResponseStream<I>, received_by: &str) -> Self {
+    fn new(stream: ResponseStream<I>) -> Self {
         match stream {
             ResponseStream::Response(mut backend) => {
-                let version = backend.res().version();
-                let (hop_by_hop, proxy_headers) =
-                    process_hop_by_hop(backend.res_mut().headers_mut(), version, received_by);
+                let hop_by_hop = strip_hop_by_hop_headers(backend.res_mut().headers_mut());
                 ProxyResponseStream::Response(ProxyResponse {
                     backend,
                     hop_by_hop,
-                    proxy_headers,
                 })
             }
             ResponseStream::Informational(mut res, reader) => {
-                let version = res.version();
-                let (hop_by_hop, proxy_headers) =
-                    process_hop_by_hop(res.headers_mut(), version, received_by);
+                let hop_by_hop = strip_hop_by_hop_headers(res.headers_mut());
                 ProxyResponseStream::Informational(
-                    ProxyInformationalResponse {
-                        res,
-                        hop_by_hop,
-                        proxy_headers,
-                    },
-                    ProxyStreamReader {
-                        received_by: received_by.into(),
-                        reader,
-                    },
+                    ProxyInformationalResponse { res, hop_by_hop },
+                    ProxyStreamReader { reader },
                 )
             }
         }
@@ -1385,7 +1284,11 @@ mod test {
     use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
     use jrpxy_pool::{BackendProxyProvider, OneshotBackend};
 
-    use crate::{ProxyClient, ProxyOptions, ReceivedResponseStream};
+    use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
+
+    use crate::{
+        ClientOptions, PendingFrontendResponse, ProxyClient, ProxyOptions, ReceivedResponseStream,
+    };
 
     use super::{
         ProxyInformationalResponse, ProxyRequest, ProxyResponse, ProxyResponseStream,
@@ -1417,7 +1320,7 @@ mod test {
     async fn make_proxy_response(raw: &[u8]) -> ProxyResponseStream<&[u8]> {
         let reader = BackendReader::new(raw);
         let stream = reader.read(true, 8192).await.expect("valid response");
-        ProxyResponseStream::new(stream, "proxy.example.com")
+        ProxyResponseStream::new(stream)
     }
 
     #[tokio::test]
@@ -1679,6 +1582,7 @@ mod test {
         let frontend_writer = frontend_writer.into_inner();
 
         // The 1xx informational response must NOT be forwarded to an HTTP/1.0 client.
+        // Via uses "1.1" because the backend responded with HTTP/1.1.
         let expected_frontend_writer = b"\
             HTTP/1.1 200 Ok\r\n\
             Via: 1.1 jrpxy\r\n\
@@ -1746,6 +1650,75 @@ mod test {
             hello";
         assert_eq!(
             jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
+    }
+
+    #[tokio::test]
+    async fn informational_response_via_injected() {
+        let frontend_reader = b"\
+            GET / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let backend_reader = b"\
+            HTTP/1.1 100 Continue\r\n\
+            \r\n\
+            HTTP/1.1 200 Ok\r\n\
+            content-length: 0\r\n\
+            \r\n";
+        let mut backend_writer = Vec::new();
+
+        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
+        let proxy_client = ProxyClient::new(
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
+            ProxyOptions::default(),
+        );
+
+        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .write_backend_request(backend_connection)
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbir = match be_res_stat {
+            ReceivedResponseStream::Informational(rbir) => rbir,
+            ReceivedResponseStream::Response(_) => panic!("expected informational"),
+        };
+
+        let be_res_stat = rbir
+            .forward_informational_response()
+            .await
+            .expect("failed to forward informational")
+            .into_inner();
+
+        let rbr = match be_res_stat {
+            ReceivedResponseStream::Response(rbr) => rbr,
+            ReceivedResponseStream::Informational(_) => panic!("expected final response"),
+        };
+
+        rbr.forward_response()
+            .await
+            .expect("failed to forward response");
+
+        let expected = b"\
+            HTTP/1.1 100 Continue\r\n\
+            Via: 1.1 jrpxy\r\n\
+            \r\n\
+            HTTP/1.1 200 Ok\r\n\
+            Via: 1.1 jrpxy\r\n\
+            content-length: 0\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected.as_slice()),
             jrpxy_util::debug::AsciiDebug(&frontend_writer)
         );
     }
@@ -2479,22 +2452,42 @@ mod test {
 
     #[tokio::test]
     async fn adds_via_header_to_response() {
-        let raw = b"\
-            HTTP/1.1 200 Ok\r\n\
-            Content-Length: 0\r\n\
-            \r\n";
+        let mut buf = Vec::new();
+        let pending = PendingFrontendResponse {
+            frontend_writer: FrontendWriter::new(&mut buf),
+            options: ProxyOptions {
+                received_by: "proxy.example.com".into(),
+                ..Default::default()
+            },
+            client_options: ClientOptions {
+                is_head: false,
+                version: HttpVersion::Http11,
+            },
+        };
 
-        let pr = into_response(make_proxy_response(raw).await);
+        let mut response = ResponseBuilder::new(4)
+            .with_version(HttpVersion::Http11)
+            .with_code(200)
+            .with_reason("Ok")
+            .build()
+            .expect("failed to build response")
+            .into();
 
-        let via = pr
-            .proxy_headers()
-            .get_header("via")
-            .expect("Via must be present");
-        assert_eq!(via.as_ref(), b"1.1 proxy.example.com");
+        let body_writer = pending
+            .send_as_content_length(&mut response, 0)
+            .await
+            .expect("send failed");
+        body_writer.finish().await.expect("finish failed");
+
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Via: 1.1 proxy.example.com"),
+            "expected Via header in output: {output:?}"
+        );
     }
 
     #[tokio::test]
-    async fn informational_response_hop_by_hop_and_via() {
+    async fn informational_response_hop_by_hop() {
         // A 100 Continue with a hop-by-hop header, followed by the real response.
         let raw = b"\
             HTTP/1.1 100 Continue\r\n\
@@ -2508,7 +2501,7 @@ mod test {
 
         let reader = BackendReader::new(raw.as_slice());
         let stream = reader.read(true, 8192).await.expect("valid response");
-        let proxy_stream = ProxyResponseStream::new(stream, "proxy.example.com");
+        let proxy_stream = ProxyResponseStream::new(stream);
 
         let (info, next_reader) = into_informational(proxy_stream);
 
@@ -2548,22 +2541,35 @@ mod test {
                 .any(|n| n.eq_ignore_ascii_case(b"x-interim-hop"))
         );
 
-        // Via is injected into the 1xx
-        let via = info
-            .proxy_headers()
-            .get_header("via")
-            .expect("Via must be present");
-        assert_eq!(via.as_ref(), b"1.1 proxy.example.com");
+        // Via is injected when the 1xx is forwarded via PendingFrontendResponse.
+        let mut buf = Vec::new();
+        let pending = PendingFrontendResponse {
+            frontend_writer: FrontendWriter::new(&mut buf),
+            options: ProxyOptions {
+                received_by: "proxy.example.com".into(),
+                ..Default::default()
+            },
+            client_options: ClientOptions {
+                is_head: false,
+                version: HttpVersion::Http11,
+            },
+        };
+        let mut forwarded = info.into_frontend_response();
+        let bw = pending
+            .send_as_no_content(&mut forwarded)
+            .await
+            .expect("send failed");
+        bw.finish().await.expect("finish failed");
+        let output = String::from_utf8(buf).unwrap();
+        assert!(
+            output.contains("Via: 1.1 proxy.example.com"),
+            "expected Via header in forwarded 1xx: {output:?}"
+        );
 
         // The following final response is also processed
         let final_stream = next_reader.read().await.expect("read final response");
         let final_res = into_response(final_stream);
-
-        let via = final_res
-            .proxy_headers()
-            .get_header("via")
-            .expect("Via must be present");
-        assert_eq!(via.as_ref(), b"1.1 proxy.example.com");
+        assert_eq!(final_res.res().code(), 200);
     }
 
     #[tokio::test]
@@ -2581,7 +2587,7 @@ mod test {
 
         let reader = BackendReader::new(raw.as_slice());
         let stream = reader.read(true, 8192).await.expect("valid response");
-        let proxy_stream = ProxyResponseStream::new(stream, "proxy.example.com");
+        let proxy_stream = ProxyResponseStream::new(stream);
 
         let (info1, r1) = into_informational(proxy_stream);
         assert_eq!(info1.res().code(), 100);
