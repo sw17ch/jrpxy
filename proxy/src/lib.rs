@@ -310,12 +310,7 @@ where
         let Self {
             request,
             frontend_body_reader,
-            pending:
-                PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+            pending,
             error: _,
         } = self;
 
@@ -332,22 +327,14 @@ where
             Ok(backend_body_writer) => Ok(ForwardedRequest {
                 request,
                 frontend_body_reader,
-                pending: PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+                pending,
                 backend_reader,
                 backend_body_writer,
             }),
             Err(error) => Err(BackendResponseError {
                 request,
                 frontend_body_reader,
-                pending: PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+                pending,
                 error,
             }),
         }
@@ -377,12 +364,7 @@ where
         let Self {
             request,
             frontend_body_reader,
-            pending:
-                PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+            pending,
             error: _,
         } = self;
 
@@ -399,22 +381,14 @@ where
             Ok(backend_body_writer) => Ok(ForwardedRequest {
                 request,
                 frontend_body_reader,
-                pending: PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+                pending,
                 backend_reader,
                 backend_body_writer,
             }),
             Err(error) => Err(BackendRequestError {
                 request,
                 frontend_body_reader,
-                pending: PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+                pending,
                 error,
             }),
         }
@@ -549,11 +523,6 @@ where
             proxy_request,
             pending,
         } = self;
-        let PendingFrontendResponse {
-            frontend_writer,
-            options,
-            client_options,
-        } = pending;
 
         let (backend_reader, backend_writer) = backend_connection;
         let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
@@ -572,22 +541,14 @@ where
             Ok(backend_body_writer) => Ok(ForwardedRequest {
                 request: backend_request,
                 frontend_body_reader,
-                pending: PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+                pending,
                 backend_reader,
                 backend_body_writer,
             }),
             Err(error) => Err(BackendRequestError {
                 request: backend_request,
                 frontend_body_reader,
-                pending: PendingFrontendResponse {
-                    frontend_writer,
-                    options,
-                    client_options,
-                },
+                pending,
                 error,
             }),
         }
