@@ -209,7 +209,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     /// the frontend is still awaiting the final response to the same request.
     pub async fn send_informational(
         self,
-        response: &mut Response,
+        mut response: Response,
     ) -> Result<PendingFrontendResponse<FW>, FrontendError> {
         let Self {
             frontend_writer,
@@ -218,7 +218,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         } = self;
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
-        let body_writer = frontend_writer.send_as_no_content(response).await?;
+        let body_writer = frontend_writer.send_as_no_content(&response).await?;
         let frontend_writer = body_writer.finish().await?;
         Ok(PendingFrontendResponse {
             frontend_writer,
@@ -231,7 +231,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     /// automatically.
     pub async fn send_as_chunked(
         self,
-        response: &mut Response,
+        mut response: Response,
     ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
         let Self {
             frontend_writer,
@@ -240,7 +240,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         } = self;
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
-        let body_writer = frontend_writer.send_as_chunked(response).await?;
+        let body_writer = frontend_writer.send_as_chunked(&response).await?;
         Ok(PendingFrontendResponseBodyWriter {
             body_writer,
             options,
@@ -251,7 +251,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     /// are injected automatically.
     pub async fn send_as_content_length(
         self,
-        response: &mut Response,
+        mut response: Response,
         body_len: u64,
     ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
         let Self {
@@ -262,7 +262,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
         let body_writer = frontend_writer
-            .send_as_content_length(response, body_len)
+            .send_as_content_length(&response, body_len)
             .await?;
         Ok(PendingFrontendResponseBodyWriter {
             body_writer,
@@ -275,7 +275,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     /// injected automatically.
     pub async fn send_as_bodyless_keep_framing(
         self,
-        response: &mut Response,
+        mut response: Response,
     ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
         let Self {
             frontend_writer,
@@ -285,7 +285,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
         let body_writer = frontend_writer
-            .send_as_bodyless_keep_framing(response)
+            .send_as_bodyless_keep_framing(&response)
             .await?;
         Ok(PendingFrontendResponseBodyWriter {
             body_writer,
@@ -301,7 +301,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     /// [`send_informational`]: PendingFrontendResponse::send_informational
     pub async fn send_as_no_content(
         self,
-        response: &mut Response,
+        mut response: Response,
     ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
         let Self {
             frontend_writer,
@@ -310,7 +310,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         } = self;
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
-        let body_writer = frontend_writer.send_as_no_content(response).await?;
+        let body_writer = frontend_writer.send_as_no_content(&response).await?;
         Ok(PendingFrontendResponseBodyWriter {
             body_writer,
             options,
@@ -777,9 +777,9 @@ where
             pending.client_options.version == HttpVersion::Http11;
 
         let pending = if client_supports_informational_response {
-            let mut response = proxy_informational_response.into_frontend_response();
+            let response = proxy_informational_response.into_frontend_response();
             pending
-                .send_informational(&mut response)
+                .send_informational(response)
                 .await
                 .map_err(InformationalForwardError::Frontend)?
         } else {
@@ -864,21 +864,19 @@ where
         let is_head = pending.client_options.is_head;
         let body_chunk_size = pending.options.body_chunk_size;
 
-        let (mut response, mut backend_body_reader) = proxy_response.into_frontend_response();
+        let (response, mut backend_body_reader) = proxy_response.into_frontend_response();
         let pending_body_writer = match backend_body_reader.mode() {
-            BodyReadMode::Chunk => pending.send_as_chunked(&mut response).await?,
-            BodyReadMode::ContentLength(cl) => {
-                pending.send_as_content_length(&mut response, cl).await?
-            }
+            BodyReadMode::Chunk => pending.send_as_chunked(response).await?,
+            BodyReadMode::ContentLength(cl) => pending.send_as_content_length(response, cl).await?,
             BodyReadMode::Bodyless => {
                 // HEAD responses and 304 Not Modified carry framing headers
                 // that describe the representation, not an actual body; those
                 // must be forwarded. All other bodyless codes (204, etc.) must
                 // not carry framing headers.
                 if is_head || response.code() == 304 {
-                    pending.send_as_bodyless_keep_framing(&mut response).await?
+                    pending.send_as_bodyless_keep_framing(response).await?
                 } else {
-                    pending.send_as_no_content(&mut response).await?
+                    pending.send_as_no_content(response).await?
                 }
             }
         };
@@ -2502,7 +2500,7 @@ mod test {
             },
         };
 
-        let mut response = ResponseBuilder::new(4)
+        let response = ResponseBuilder::new(4)
             .with_version(HttpVersion::Http11)
             .with_code(200)
             .with_reason("Ok")
@@ -2511,7 +2509,7 @@ mod test {
             .into();
 
         let body_writer = pending
-            .send_as_content_length(&mut response, 0)
+            .send_as_content_length(response, 0)
             .await
             .expect("send failed");
         body_writer.finish().await.expect("finish failed");
@@ -2591,9 +2589,9 @@ mod test {
                 version: HttpVersion::Http11,
             },
         };
-        let mut forwarded = info.into_frontend_response();
+        let forwarded = info.into_frontend_response();
         let bw = pending
-            .send_as_no_content(&mut forwarded)
+            .send_as_no_content(forwarded)
             .await
             .expect("send failed");
         bw.finish().await.expect("finish failed");
