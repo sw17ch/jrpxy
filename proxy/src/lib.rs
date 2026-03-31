@@ -318,7 +318,8 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     }
 }
 
-/// A frontend body writer produced by [`PendingFrontendResponse::send_as_*`].
+/// A frontend body writer produced by `send_as_*` methods on
+/// [`PendingFrontendResponse`].
 ///
 /// Carries [`ProxyOptions`] through the body-write cycle so that
 /// [`forward_response`] can recover them for [`ProxyClient`] construction
@@ -1212,8 +1213,7 @@ impl<I> ProxyResponse<I> {
     }
 
     /// Convert the [`ProxyResponse`] into a response ready to send to the
-    /// frontend. Hop-by-hop headers have already been removed. `Via` will be
-    /// injected by [`PendingFrontendResponse::send_as_*`].
+    /// frontend. Hop-by-hop headers have already been removed.
     pub fn into_frontend_response(self) -> (Response, BackendBodyReader<I>) {
         let Self {
             backend,
