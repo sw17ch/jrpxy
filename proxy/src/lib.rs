@@ -1277,26 +1277,23 @@ fn is_standard_hop_by_hop(name: &[u8]) -> bool {
         .any(|h| h.eq_ignore_ascii_case(name))
 }
 
-/// Parse the comma-separated token list in a `Connection` header value into
-/// individual header name bytes.
-fn parse_connection_tokens(value: &[u8]) -> Vec<Bytes> {
-    // TODO: let's make this an actual parser eventually
-    value
-        .split(|&b| b == b',')
-        .map(|s| Bytes::copy_from_slice(s.trim_ascii()))
-        .filter(|s| !s.is_empty())
-        .collect()
-}
-
 /// Remove all hop-by-hop headers from `headers` (RFC 9110 7.6.1, RFC 9112).
 ///
 /// Returns the removed headers.
 fn strip_hop_by_hop_headers(headers: &mut Headers) -> Headers {
-    // Collect any extra hop-by-hop names listed in the Connection header.
-    let connection_tokens = headers
-        .get_header("connection")
-        .map(|v| parse_connection_tokens(v))
-        .unwrap_or_default();
+    let mut connection_tokens = Vec::new();
+
+    // Collect any extra hop-by-hop names listed in any Connection header.
+    for (_h, v) in headers.get_header("connection") {
+        // TODO: let's make this an actual parser eventually
+        let tokens = v
+            .split(|&b| b == b',')
+            .map(|s| Bytes::copy_from_slice(s.trim_ascii()))
+            .filter(|s| !s.is_empty());
+        for tok in tokens {
+            connection_tokens.push(tok);
+        }
+    }
 
     headers.remove(|(name, _)| {
         is_standard_hop_by_hop(name)
@@ -1647,7 +1644,9 @@ mod test {
             rbir.as_response()
                 .end_to_end_headers()
                 .get_header("x-hdr")
+                .next()
                 .unwrap()
+                .1
         );
 
         // Verify we can read the end-to-end header in the informational response
@@ -1656,14 +1655,18 @@ mod test {
             rbir.as_response()
                 .hop_by_hop_headers()
                 .get_header("connection")
+                .next()
                 .unwrap()
+                .1
         );
         assert_eq!(
             b"2".as_slice(),
             rbir.as_response()
                 .hop_by_hop_headers()
                 .get_header("filter")
+                .next()
                 .unwrap()
+                .1
         );
 
         // Ensure the hop-by-hop headers are NOT in the end-to-end headers
@@ -1671,12 +1674,14 @@ mod test {
             rbir.as_response()
                 .end_to_end_headers()
                 .get_header("filter")
+                .next()
                 .is_none()
         );
         assert!(
             rbir.as_response()
                 .end_to_end_headers()
                 .get_header("connection")
+                .next()
                 .is_none()
         );
 
@@ -1698,7 +1703,9 @@ mod test {
             rbr.as_response()
                 .end_to_end_headers()
                 .get_header("y-hdr")
+                .next()
                 .unwrap()
+                .1
         );
 
         // Verify we can read the end-to-end header in the informational response
@@ -1707,14 +1714,18 @@ mod test {
             rbr.as_response()
                 .hop_by_hop_headers()
                 .get_header("connection")
+                .next()
                 .unwrap()
+                .1
         );
         assert_eq!(
             b"20".as_slice(),
             rbr.as_response()
                 .hop_by_hop_headers()
                 .get_header("filter-res")
+                .next()
                 .unwrap()
+                .1
         );
 
         // Ensure the hop-by-hop headers are NOT in the end-to-end headers
@@ -1722,12 +1733,14 @@ mod test {
             rbr.as_response()
                 .end_to_end_headers()
                 .get_header("filter-res")
+                .next()
                 .is_none()
         );
         assert!(
             rbr.as_response()
                 .end_to_end_headers()
                 .get_header("connection")
+                .next()
                 .is_none()
         );
 
@@ -2594,11 +2607,15 @@ mod test {
 
     #[tokio::test]
     async fn removes_connection_listed_headers() {
+        // Note this request has two connection headers. Tokens from both should
+        // be removed.
         let raw = b"\
             GET / HTTP/1.1\r\n\
             Host: example.com\r\n\
-            Connection: x-custom-hop\r\n\
-            X-Custom-Hop: value\r\n\
+            X-Custom-Hop-1: value\r\n\
+            Connection: x-custom-hop-2\r\n\
+            X-Custom-Hop-2: value\r\n\
+            Connection: x-custom-hop-1\r\n\
             \r\n";
 
         let pr = make_proxy_request(raw).await;
@@ -2607,7 +2624,8 @@ mod test {
         assert!(
             names
                 .iter()
-                .all(|n| !n.eq_ignore_ascii_case(b"x-custom-hop"))
+                .all(|n| !n.eq_ignore_ascii_case(b"x-custom-hop-1")
+                    && !n.eq_ignore_ascii_case(b"x-custom-hop-2"))
         );
 
         let hop: Vec<_> = pr
@@ -2615,7 +2633,14 @@ mod test {
             .iter()
             .map(|(n, _)| n.clone())
             .collect();
-        assert!(hop.iter().any(|n| n.eq_ignore_ascii_case(b"x-custom-hop")));
+        assert!(
+            hop.iter()
+                .any(|n| n.eq_ignore_ascii_case(b"x-custom-hop-1"))
+        );
+        assert!(
+            hop.iter()
+                .any(|n| n.eq_ignore_ascii_case(b"x-custom-hop-2"))
+        );
     }
 
     #[tokio::test]
@@ -2630,8 +2655,9 @@ mod test {
         let via = pr
             .proxy_headers()
             .get_header("via")
+            .next()
             .expect("Via must be present");
-        assert_eq!(via.as_ref(), b"1.1 proxy.example.com");
+        assert_eq!(via.1.as_ref(), b"1.1 proxy.example.com");
     }
 
     #[tokio::test]
@@ -2646,8 +2672,9 @@ mod test {
         let via = pr
             .proxy_headers()
             .get_header("via")
+            .next()
             .expect("Via must be present");
-        assert_eq!(via.as_ref(), b"1.0 proxy.example.com");
+        assert_eq!(via.1.as_ref(), b"1.0 proxy.example.com");
     }
 
     #[tokio::test]

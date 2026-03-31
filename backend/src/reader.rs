@@ -787,16 +787,18 @@ mod test {
         let xres = res
             .headers()
             .get_header("x-res")
+            .next()
             .expect("header not present");
-        assert_eq!(xres, b"1".as_ref());
+        assert_eq!(xres.1, b"1".as_ref());
 
         let result = reader.read().await.expect("failed to read");
         let (res, reader) = result.try_into_informational().expect("not informational");
         let xres = res
             .headers()
             .get_header("x-res")
+            .next()
             .expect("header not present");
-        assert_eq!(xres, b"2".as_ref());
+        assert_eq!(xres.1, b"2".as_ref());
 
         let result = reader.read().await.expect("read failed");
         let res = result.try_into_response().expect("not response");
@@ -804,8 +806,9 @@ mod test {
         let xres = res
             .headers()
             .get_header("x-res")
+            .next()
             .expect("header not present");
-        assert_eq!(xres, b"3".as_ref());
+        assert_eq!(xres.1, b"3".as_ref());
         let _out = body_reader.drain().await.expect("failed to drain");
     }
 

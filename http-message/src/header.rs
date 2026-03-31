@@ -17,18 +17,12 @@ pub enum HeaderError {
 }
 
 pub struct HeaderIter<'s> {
-    position: usize,
     spans: &'s [(Bytes, Bytes)],
 }
 
 impl<'s> HeaderIter<'s> {
-    /// An iterator over headers inside of `buf` identified by `spans`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if any span falls outside of the buffer.
-    pub fn new(spans: &'s [(Bytes, Bytes)]) -> Self {
-        Self { position: 0, spans }
+    fn new(spans: &'s [(Bytes, Bytes)]) -> Self {
+        Self { spans }
     }
 }
 
@@ -36,12 +30,64 @@ impl<'s> Iterator for HeaderIter<'s> {
     type Item = &'s (Bytes, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.position >= self.spans.len() {
-            return None;
+        self.spans.split_off_first()
+    }
+}
+
+pub struct HeadersFilter<'s, F> {
+    iter: HeaderIter<'s>,
+    filter_fn: F,
+}
+
+impl<'s, F> HeadersFilter<'s, F> {
+    fn new(spans: &'s [(Bytes, Bytes)], filter_fn: F) -> Self {
+        Self {
+            iter: HeaderIter::new(spans),
+            filter_fn,
         }
-        let p = self.position;
-        self.position += 1;
-        Some(&self.spans[p])
+    }
+}
+
+impl<'s, F> Iterator for HeadersFilter<'s, F>
+where
+    F: FnMut(&[u8], &[u8]) -> bool,
+{
+    type Item = &'s (Bytes, Bytes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for h in self.iter.by_ref() {
+            if (self.filter_fn)(&h.0, &h.1) {
+                return Some(h);
+            }
+        }
+        None
+    }
+}
+
+pub struct HeaderNameIter<'s, 'n> {
+    needle: &'n [u8],
+    iter: HeaderIter<'s>,
+}
+
+impl<'s, 'n> HeaderNameIter<'s, 'n> {
+    fn new(spans: &'s [(Bytes, Bytes)], needle: &'n [u8]) -> Self {
+        Self {
+            needle,
+            iter: HeaderIter::new(spans),
+        }
+    }
+}
+
+impl<'s, 'n> Iterator for HeaderNameIter<'s, 'n> {
+    type Item = &'s (Bytes, Bytes);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        for h in self.iter.by_ref() {
+            if self.needle.eq_ignore_ascii_case(&h.0) {
+                return Some(h);
+            }
+        }
+        None
     }
 }
 
@@ -72,15 +118,16 @@ impl Headers {
         self.len() == 0
     }
 
-    pub fn get_header(&self, needle: &str) -> Option<&Bytes> {
-        let needle = needle.as_bytes();
-        for (name, value) in self.iter() {
-            if needle.eq_ignore_ascii_case(name) {
-                return Some(value);
-            }
-        }
+    pub fn filter_headers<P>(&self, predicate: P) -> HeadersFilter<'_, P>
+    where
+        P: FnMut(&[u8], &[u8]) -> bool,
+    {
+        HeadersFilter::new(&self.headers, predicate)
+    }
 
-        None
+    pub fn get_header<'s, 'n>(&'s self, name: &'n str) -> HeaderNameIter<'s, 'n> {
+        let needle = name.as_bytes();
+        HeaderNameIter::new(&self.headers, needle)
     }
 
     pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
