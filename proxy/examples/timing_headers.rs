@@ -63,7 +63,7 @@ async fn handle_client_connection(mut socket: TcpStream) {
         ProxyOptions::default(),
     );
 
-    // ── step 1: read the incoming request ────────────────────────────────────
+    // step 1: read the incoming request
     let received = match client.start().await {
         Ok(r) => r,
         Err(e) => {
@@ -73,7 +73,7 @@ async fn handle_client_connection(mut socket: TcpStream) {
     };
     let t_delta_rx_request = t_start.elapsed().as_secs_f32() * 1000.0;
 
-    // ── step 2: forward the request to the backend ───────────────────────────
+    // step 2: forward the request to the backend
     let mut backend = match TcpStream::connect(BACKEND_ADDR).await {
         Ok(s) => s,
         Err(e) => {
@@ -95,7 +95,7 @@ async fn handle_client_connection(mut socket: TcpStream) {
     };
     let t_delta_tx_request = t_start.elapsed().as_secs_f32() * 1000.0;
 
-    // ── step 3: read the backend response ────────────────────────────────────
+    // step 3: read the backend response
     // Forward any 1xx informational responses along the way, then settle on
     // the final response.
     let mut stream = match forwarded.read_backend_response().await {
@@ -142,7 +142,7 @@ async fn handle_client_connection(mut socket: TcpStream) {
 
     println!("[proxy] timing={timing}");
 
-    // ── step 4: stream the response back to the client ────────────────────────
+    // step 4: stream the response back to the client
     if let Err(e) = response.forward_response().await {
         eprintln!("[proxy] failed to forward response: {e}");
     }
