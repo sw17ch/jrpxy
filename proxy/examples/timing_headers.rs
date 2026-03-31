@@ -1,10 +1,10 @@
-//! Demonstrates custom request and response header injection using `jrpxy-proxy`.
+//! Demonstrates custom request and response header injection using
+//! `jrpxy-proxy`.
 //!
 //! The proxy:
-//! - injects `x-request-time` (nanoseconds since the Unix epoch) into every
-//!   forwarded request
-//! - injects `x-elapsed-nanos` (nanoseconds elapsed between request send and
-//!   response receipt) into every forwarded response
+//! - inserts `x-time-delta-informational-response` on informational responses
+//! - inserts `x-timing` on final responses which details all the timing
+//!   information for the proxy session
 //!
 //! A minimal HTTP backend is co-located in the same process for convenience.
 //!
