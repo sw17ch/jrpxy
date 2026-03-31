@@ -1549,8 +1549,8 @@ mod test {
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 
     use crate::{
-        ClientOptions, PendingFrontendResponse, ProxyClient, ProxyError, ProxyFrontendError,
-        ProxyOptions, ResponseStreamReceived,
+        ClientOptions, FrontendRequestError, PendingFrontendResponse, ProxyClient, ProxyError,
+        ProxyFrontendError, ProxyOptions, ResponseStreamReceived,
     };
 
     use super::{
@@ -2835,9 +2835,9 @@ mod test {
         assert_eq!(final_res.res().code(), 200);
     }
 
-    /// We don't support the CONNECT method
+    /// CONNECT is not supported - test frontend request handling errors
     #[tokio::test]
-    async fn connect_method_returns_error() {
+    async fn connect_method_not_supported() {
         let frontend_reader = b"\
             CONNECT example.com:443 HTTP/1.1\r\n\
             Host: example.com:443\r\n\
@@ -2850,21 +2850,47 @@ mod test {
             ProxyOptions::default(),
         );
 
-        match proxy_client.start().await {
+        let req_err = match proxy_client.start().await {
             Ok(_) => panic!("expected error for CONNECT, got Ok"),
-            Err(e) => assert!(
-                matches!(
-                    e.into(),
-                    ProxyError::ProxyFrontend(ProxyFrontendError::ConnectNotSupported),
-                ),
-                "unexpected error kind",
-            ),
-        }
+            Err(FrontendRequestError::Request(e)) => e,
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        };
+
+        assert!(matches!(
+            req_err.error(),
+            ProxyFrontendError::ConnectNotSupported
+        ));
+
+        let (pending, _proxy_request) = req_err.into_pending_response();
+
+        let response = ResponseBuilder::new(4)
+            .with_version(HttpVersion::Http11)
+            .with_code(405)
+            .with_reason("Method Not Allowed")
+            .build()
+            .expect("failed to build 405 response")
+            .into();
+
+        let body_writer = pending
+            .send_as_content_length(response, 0)
+            .await
+            .expect("failed to send error response");
+        body_writer.finish().await.expect("failed to finish");
+
+        let expected = b"\
+            HTTP/1.1 405 Method Not Allowed\r\n\
+            Via: 1.1 jrpxy\r\n\
+            content-length: 0\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
     }
 
-    /// We don't support the TRACE method
+    /// TRACE is not supported - test frontend request handling errors
     #[tokio::test]
-    async fn trace_method_returns_error() {
+    async fn trace_method_not_supported() {
         let frontend_reader = b"\
             TRACE / HTTP/1.1\r\n\
             Host: example.com\r\n\
@@ -2877,16 +2903,90 @@ mod test {
             ProxyOptions::default(),
         );
 
-        match proxy_client.start().await {
+        let req_err = match proxy_client.start().await {
             Ok(_) => panic!("expected error for TRACE, got Ok"),
-            Err(e) => assert!(
-                matches!(
-                    e.into(),
-                    ProxyError::ProxyFrontend(ProxyFrontendError::TraceNotSupported),
-                ),
-                "unexpected error kind",
-            ),
-        }
+            Err(FrontendRequestError::Request(e)) => e,
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        };
+
+        assert!(matches!(
+            req_err.error(),
+            ProxyFrontendError::TraceNotSupported
+        ));
+
+        let (pending, _proxy_request) = req_err.into_pending_response();
+
+        let response = ResponseBuilder::new(4)
+            .with_version(HttpVersion::Http11)
+            .with_code(405)
+            .with_reason("Method Not Allowed")
+            .build()
+            .expect("failed to build 405 response")
+            .into();
+
+        let body_writer = pending
+            .send_as_content_length(response, 0)
+            .await
+            .expect("failed to send error response");
+        body_writer.finish().await.expect("failed to finish");
+
+        let expected = b"\
+            HTTP/1.1 405 Method Not Allowed\r\n\
+            Via: 1.1 jrpxy\r\n\
+            content-length: 0\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
+    }
+
+    /// When the frontend sends a malformed request, start() returns a
+    /// FrontendRequestError::Frontend that still carries a PendingFrontendResponse,
+    /// so the proxy can write a 400 Bad Request back to the client.
+    #[tokio::test]
+    async fn malformed_request_can_send_error_response() {
+        // A request line with no path or HTTP version — not parseable.
+        let frontend_reader = b"GET\r\n\r\n";
+        let mut frontend_writer = Vec::new();
+
+        let proxy_client = ProxyClient::new(
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
+            ProxyOptions::default(),
+        );
+
+        let read_err = match proxy_client.start().await {
+            Ok(_) => panic!("expected parse error, got Ok"),
+            Err(FrontendRequestError::Frontend(e)) => e,
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        };
+
+        let pending = read_err.into_pending_response();
+
+        let response = ResponseBuilder::new(4)
+            .with_version(HttpVersion::Http11)
+            .with_code(400)
+            .with_reason("Bad Request")
+            .build()
+            .expect("failed to build 400 response")
+            .into();
+
+        let body_writer = pending
+            .send_as_content_length(response, 0)
+            .await
+            .expect("failed to send error response");
+        body_writer.finish().await.expect("failed to finish");
+
+        let expected = b"\
+            HTTP/1.1 400 Bad Request\r\n\
+            Via: 1.1 jrpxy\r\n\
+            content-length: 0\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
     }
 
     #[tokio::test]
