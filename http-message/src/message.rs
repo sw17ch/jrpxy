@@ -379,10 +379,6 @@ impl Request {
         &mut self.inner.headers
     }
 
-    pub fn get_header(&self, needle: &str) -> Option<&Bytes> {
-        self.inner.headers.get_header(needle)
-    }
-
     pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
         self.inner.headers.framing()
     }
@@ -444,10 +440,6 @@ impl Response {
 
     pub fn headers_mut(&mut self) -> &mut Headers {
         &mut self.inner.headers
-    }
-
-    pub fn get_header(&self, needle: &str) -> Option<&Bytes> {
-        self.inner.headers.get_header(needle)
     }
 
     pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {

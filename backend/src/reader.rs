@@ -784,18 +784,27 @@ mod test {
         let result = reader.read(true, 128).await.expect("failed to read");
 
         let (res, reader) = result.try_into_informational().expect("not informational");
-        let xres = res.get_header("x-res").expect("header not present");
+        let xres = res
+            .headers()
+            .get_header("x-res")
+            .expect("header not present");
         assert_eq!(xres, b"1".as_ref());
 
         let result = reader.read().await.expect("failed to read");
         let (res, reader) = result.try_into_informational().expect("not informational");
-        let xres = res.get_header("x-res").expect("header not present");
+        let xres = res
+            .headers()
+            .get_header("x-res")
+            .expect("header not present");
         assert_eq!(xres, b"2".as_ref());
 
         let result = reader.read().await.expect("read failed");
         let res = result.try_into_response().expect("not response");
         let (res, body_reader) = res.into_parts();
-        let xres = res.get_header("x-res").expect("header not present");
+        let xres = res
+            .headers()
+            .get_header("x-res")
+            .expect("header not present");
         assert_eq!(xres, b"3".as_ref());
         let _out = body_reader.drain().await.expect("failed to drain");
     }
