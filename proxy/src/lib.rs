@@ -600,7 +600,7 @@ impl<FR, FW> FrontendRequestError<FR, FW> {
         options: ProxyOptions,
         version: HttpVersion,
         proxy_request: ProxyRequest<FR>,
-        connect_not_supported: ProxyFrontendError,
+        error: ProxyFrontendError,
     ) -> FrontendRequestError<FR, FW> {
         Self::Request(FrontendRequestErrorKindRequest {
             pending: PendingFrontendResponse {
@@ -612,7 +612,7 @@ impl<FR, FW> FrontendRequestError<FR, FW> {
                 },
             },
             reader: proxy_request,
-            error: connect_not_supported,
+            error,
         })
     }
 }
@@ -654,8 +654,9 @@ impl<FW> FrontendRequestErrorKindRead<FW> {
     }
 }
 
-/// An error occurred while reading the request from the frontend. We cannot
-/// recover the reader, but we can write something back.
+/// A valid request was received from the frontend, but there is a semantic
+/// problem exists with that request. We can still send back an error message,
+/// and optionally drain the body so that we can keep the connection open.
 pub struct FrontendRequestErrorKindRequest<FR, FW> {
     pending: PendingFrontendResponse<FW>,
     reader: ProxyRequest<FR>,
