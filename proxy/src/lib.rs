@@ -18,39 +18,14 @@ use jrpxy_frontend::{
     writer::{FrontendBodyWriter, FrontendBodyWriterKind, FrontendWriter},
 };
 use jrpxy_http_message::{
-    header::{HeaderError, Headers},
+    header::Headers,
     message::{Request, Response},
     version::HttpVersion,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-#[derive(thiserror::Error, Debug)]
-pub enum ProxyError {
-    #[error("Frontend Error: {0}")]
-    FrontendError(#[from] FrontendError),
-    #[error("Backend Error: {0}")]
-    BackendError(#[from] BackendError),
-    #[error("No available backend connection")]
-    NoBackendConnection,
-    #[error("Invalid request framing: {0}")]
-    InvalidRequestFraming(HeaderError),
-    #[error("Body copy error: {0}")]
-    CopyError(#[from] ProxyCopyError),
-    #[error("Error copying the frontend body to the backend, but response completed: {0}")]
-    FrontendCopyError(ProxyCopyError),
-    #[error("Failed to completely copy the frontend body to the backend, but response completed")]
-    FrontendCopyIncomplete,
-}
-
-#[derive(thiserror::Error, Debug)]
-pub enum ProxyCopyError {
-    #[error("Frontend Error: {0}")]
-    FrontendError(#[from] FrontendError),
-    #[error("Backend Error: {0}")]
-    BackendError(#[from] BackendError),
-}
-
-pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
+pub mod error;
+pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
 /// Returned when writing the request head to the backend fails.
 ///
