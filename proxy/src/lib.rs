@@ -1549,7 +1549,7 @@ mod test {
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 
     use crate::{
-        ClientOptions, FrontendRequestError, PendingFrontendResponse, ProxyClient, ProxyError,
+        ClientOptions, FrontendRequestError, PendingFrontendResponse, ProxyClient,
         ProxyFrontendError, ProxyOptions, ResponseStreamReceived,
     };
 
