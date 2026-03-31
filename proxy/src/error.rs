@@ -18,6 +18,16 @@ pub enum ProxyError {
     FrontendCopyError(ProxyCopyError),
     #[error("Failed to completely copy the frontend body to the backend, but response completed")]
     FrontendCopyIncomplete,
+    #[error("Proxy error on frontend: {0}")]
+    ProxyFrontend(ProxyFrontendError),
+}
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyFrontendError {
+    #[error("CONNECT method is not supported")]
+    ConnectNotSupported,
+    #[error("TRACE method is not supported")]
+    TraceNotSupported,
 }
 
 #[derive(thiserror::Error, Debug)]

@@ -30,6 +30,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub mod error;
 pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
+use crate::error::ProxyFrontendError;
+
 /// Returned when writing the request head to the backend fails.
 ///
 /// Holds the decomposed request so the caller can retry with a different
@@ -652,9 +654,16 @@ where
         let proxy_request = ProxyRequest::new(req, &options.received_by);
         let is_head = proxy_request.req().method() == b"HEAD".as_slice();
 
-        // TODO: detect CONNECT and TRACE methods. RFC 9110 section 9.3.6 says
-        // we must reject CONNECT methods if they are not supported. Typically
-        // this is done by sending a '400 Bad Request'.
+        if proxy_request.req().method() == b"CONNECT".as_slice() {
+            return Err(ProxyError::ProxyFrontend(
+                ProxyFrontendError::ConnectNotSupported,
+            ));
+        }
+        if proxy_request.req().method() == b"TRACE".as_slice() {
+            return Err(ProxyError::ProxyFrontend(
+                ProxyFrontendError::TraceNotSupported,
+            ));
+        }
 
         let version = proxy_request.req().version();
         Ok(RequestReceived {
@@ -1416,6 +1425,7 @@ mod test {
 
     use crate::{
         ClientOptions, PendingFrontendResponse, ProxyClient, ProxyOptions, ResponseStreamReceived,
+        error::ProxyFrontendError,
     };
 
     use super::{
@@ -2698,6 +2708,53 @@ mod test {
         let final_stream = next_reader.read().await.expect("read final response");
         let final_res = into_response(final_stream);
         assert_eq!(final_res.res().code(), 200);
+    }
+
+    /// We don't support the CONNECT method
+    #[tokio::test]
+    async fn connect_method_returns_error() {
+        let frontend_reader = b"\
+            CONNECT example.com:443 HTTP/1.1\r\n\
+            Host: example.com:443\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let proxy_client = ProxyClient::new(
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
+            ProxyOptions::default(),
+        );
+
+        match proxy_client.start().await {
+            Ok(_) => panic!("expected ConnectNotSupported error, got Ok"),
+            Err(crate::error::ProxyError::ProxyFrontend(
+                ProxyFrontendError::ConnectNotSupported,
+            )) => {}
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
+    }
+
+    /// We don't support the TRACE method
+    #[tokio::test]
+    async fn trace_method_returns_error() {
+        let frontend_reader = b"\
+            TRACE / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let proxy_client = ProxyClient::new(
+            FrontendReader::new(frontend_reader.as_ref(), 8192),
+            FrontendWriter::new(&mut frontend_writer),
+            ProxyOptions::default(),
+        );
+
+        match proxy_client.start().await {
+            Ok(_) => panic!("expected ConnectNotSupported error, got Ok"),
+            Err(crate::error::ProxyError::ProxyFrontend(ProxyFrontendError::TraceNotSupported)) => {
+            }
+            Err(e) => panic!("unexpected error variant: {e:?}"),
+        }
     }
 
     #[tokio::test]
