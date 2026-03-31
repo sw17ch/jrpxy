@@ -30,7 +30,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub mod error;
 pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
-use crate::error::ProxyFrontendError;
+pub use crate::error::ProxyFrontendError;
 
 /// Returned when writing the request head to the backend fails.
 ///
@@ -585,6 +585,103 @@ where
 
 type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 
+/// Returned when [`ProxyClient::start`] fails.
+pub enum FrontendRequestError<FR, FW> {
+    /// The frontend sent a request that could not be parsed.
+    Frontend(FrontendRequestErrorKindRead<FW>),
+    /// The frontend sent a valid request that the proxy refuses to handle.
+    Request(FrontendRequestErrorKindRequest<FR, FW>),
+}
+
+impl<FR, FW> FrontendRequestError<FR, FW> {
+    /// Convenience method to construct a new request error.
+    fn new_request(
+        frontend_writer: FrontendWriter<FW>,
+        options: ProxyOptions,
+        version: HttpVersion,
+        proxy_request: ProxyRequest<FR>,
+        connect_not_supported: ProxyFrontendError,
+    ) -> FrontendRequestError<FR, FW> {
+        Self::Request(FrontendRequestErrorKindRequest {
+            pending: PendingFrontendResponse {
+                frontend_writer,
+                options,
+                client_options: ClientOptions {
+                    is_head: false,
+                    version,
+                },
+            },
+            reader: proxy_request,
+            error: connect_not_supported,
+        })
+    }
+}
+
+impl<FR, FW> std::fmt::Debug for FrontendRequestError<FR, FW> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frontend(arg0) => f.debug_tuple("Frontend").field(&arg0.error).finish(),
+            Self::Request(arg0) => f.debug_tuple("Request").field(&arg0.error).finish(),
+        }
+    }
+}
+
+impl<FR, FW> From<FrontendRequestError<FR, FW>> for ProxyError {
+    fn from(value: FrontendRequestError<FR, FW>) -> Self {
+        match value {
+            FrontendRequestError::Frontend(read) => ProxyError::FrontendError(read.error),
+            FrontendRequestError::Request(request) => ProxyError::ProxyFrontend(request.error),
+        }
+    }
+}
+
+/// An error occurred while reading the request from the frontend. We cannot
+/// recover the reader, but we can write something back.
+pub struct FrontendRequestErrorKindRead<FW> {
+    pending: PendingFrontendResponse<FW>,
+    error: FrontendError,
+}
+
+impl<FW> FrontendRequestErrorKindRead<FW> {
+    pub fn error(&self) -> &FrontendError {
+        &self.error
+    }
+
+    /// Consumes the error and returns a [`PendingFrontendResponse`] so the
+    /// caller can send an error response to the frontend client.
+    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
+        self.pending
+    }
+}
+
+/// An error occurred while reading the request from the frontend. We cannot
+/// recover the reader, but we can write something back.
+pub struct FrontendRequestErrorKindRequest<FR, FW> {
+    pending: PendingFrontendResponse<FW>,
+    reader: ProxyRequest<FR>,
+    error: ProxyFrontendError,
+}
+
+impl<FR, FW> FrontendRequestErrorKindRequest<FR, FW> {
+    pub fn error(&self) -> &ProxyFrontendError {
+        &self.error
+    }
+
+    /// Consumes the error and returns a [`PendingFrontendResponse`] along with
+    /// the [`FrontendBodyReader`] so the caller can send an error response to
+    /// the frontend client. This also allows the user to possibly drain the
+    /// request from the client so that the connection can be reused.
+    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, ProxyRequest<FR>) {
+        let Self {
+            pending,
+            reader,
+            error: _,
+        } = self;
+        (pending, reader)
+    }
+}
+
+#[derive(Debug)]
 pub struct ProxyOptions {
     pub max_backend_head_length: usize,
     pub body_chunk_size: usize,
@@ -594,7 +691,7 @@ pub struct ProxyOptions {
     pub received_by: Cow<'static, str>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 struct ClientOptions {
     is_head: bool,
     version: HttpVersion,
@@ -644,28 +741,56 @@ where
         }
     }
 
-    pub async fn start(self) -> ProxyResult<RequestReceived<FR, FW>> {
+    pub async fn start(self) -> Result<RequestReceived<FR, FW>, FrontendRequestError<FR, FW>> {
         let Self {
             frontend_reader,
             frontend_writer,
             options,
         } = self;
-        let req = frontend_reader.read().await?;
-        let proxy_request = ProxyRequest::new(req, &options.received_by);
-        let is_head = proxy_request.req().method() == b"HEAD".as_slice();
 
-        if proxy_request.req().method() == b"CONNECT".as_slice() {
-            return Err(ProxyError::ProxyFrontend(
+        let req = match frontend_reader.read().await {
+            Ok(req) => req,
+            Err(error) => {
+                return Err(FrontendRequestError::Frontend(
+                    FrontendRequestErrorKindRead {
+                        pending: PendingFrontendResponse {
+                            frontend_writer,
+                            options,
+                            client_options: ClientOptions {
+                                is_head: false,
+                                version: HttpVersion::Http11,
+                            },
+                        },
+                        error,
+                    },
+                ));
+            }
+        };
+
+        let proxy_request = ProxyRequest::new(req, &options.received_by);
+        let method = proxy_request.req().method();
+        let is_head = method == b"HEAD".as_slice();
+        let version = proxy_request.req().version();
+
+        if method == b"CONNECT".as_slice() {
+            return Err(FrontendRequestError::new_request(
+                frontend_writer,
+                options,
+                version,
+                proxy_request,
                 ProxyFrontendError::ConnectNotSupported,
             ));
         }
-        if proxy_request.req().method() == b"TRACE".as_slice() {
-            return Err(ProxyError::ProxyFrontend(
+        if method == b"TRACE".as_slice() {
+            return Err(FrontendRequestError::new_request(
+                frontend_writer,
+                options,
+                version,
+                proxy_request,
                 ProxyFrontendError::TraceNotSupported,
             ));
         }
 
-        let version = proxy_request.req().version();
         Ok(RequestReceived {
             proxy_request,
             pending: PendingFrontendResponse {
@@ -1424,8 +1549,8 @@ mod test {
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 
     use crate::{
-        ClientOptions, PendingFrontendResponse, ProxyClient, ProxyOptions, ResponseStreamReceived,
-        error::ProxyFrontendError,
+        ClientOptions, PendingFrontendResponse, ProxyClient, ProxyError, ProxyFrontendError,
+        ProxyOptions, ResponseStreamReceived,
     };
 
     use super::{
@@ -2726,11 +2851,14 @@ mod test {
         );
 
         match proxy_client.start().await {
-            Ok(_) => panic!("expected ConnectNotSupported error, got Ok"),
-            Err(crate::error::ProxyError::ProxyFrontend(
-                ProxyFrontendError::ConnectNotSupported,
-            )) => {}
-            Err(e) => panic!("unexpected error variant: {e:?}"),
+            Ok(_) => panic!("expected error for CONNECT, got Ok"),
+            Err(e) => assert!(
+                matches!(
+                    e.into(),
+                    ProxyError::ProxyFrontend(ProxyFrontendError::ConnectNotSupported),
+                ),
+                "unexpected error kind",
+            ),
         }
     }
 
@@ -2750,10 +2878,14 @@ mod test {
         );
 
         match proxy_client.start().await {
-            Ok(_) => panic!("expected ConnectNotSupported error, got Ok"),
-            Err(crate::error::ProxyError::ProxyFrontend(ProxyFrontendError::TraceNotSupported)) => {
-            }
-            Err(e) => panic!("unexpected error variant: {e:?}"),
+            Ok(_) => panic!("expected error for TRACE, got Ok"),
+            Err(e) => assert!(
+                matches!(
+                    e.into(),
+                    ProxyError::ProxyFrontend(ProxyFrontendError::TraceNotSupported),
+                ),
+                "unexpected error kind",
+            ),
         }
     }
 
