@@ -1213,6 +1213,12 @@ impl ProxyInformationalResponse {
         &self.res
     }
 
+    /// A mutable reference to the underlying [`Response`] with hop-by-hop
+    /// headers removed.
+    pub fn res_mut(&mut self) -> &mut Response {
+        &mut self.res
+    }
+
     /// The end-to-end headers on this response.
     pub fn end_to_end_headers(&self) -> &Headers {
         self.res().headers()
