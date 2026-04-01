@@ -698,7 +698,7 @@ pub struct ResponseReader<FR, FW, BR, BW> {
     backend_body_writer: BackendBodyWriter<BW>,
 }
 
-pub enum BackendResponse<FR, FW, BR, BW> {
+pub enum BackendResponseStream<FR, FW, BR, BW> {
     Informational(InformationalResponseReceived<FR, FW, BR, BW>),
     Response(ResponseReceived<FR, FW, BR, BW>),
 }
@@ -710,7 +710,7 @@ where
 {
     pub async fn read_backend_response(
         self,
-    ) -> Result<BackendResponse<FR, FW, BR, BW>, BackendResponseError<FR, FW>> {
+    ) -> Result<BackendResponseStream<FR, FW, BR, BW>, BackendResponseError<FR, FW>> {
         let Self {
             request,
             backend_reader,
@@ -736,7 +736,7 @@ where
         let response_stream = ProxyResponseStream::new(response_stream);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
-                BackendResponse::Response(ResponseReceived {
+                BackendResponseStream::Response(ResponseReceived {
                     frontend_body_reader,
                     pending,
                     proxy_response,
@@ -746,7 +746,7 @@ where
             ProxyResponseStream::Informational(
                 proxy_informational_response,
                 proxy_stream_reader,
-            ) => BackendResponse::Informational(InformationalResponseReceived {
+            ) => BackendResponseStream::Informational(InformationalResponseReceived {
                 proxy_informational_response,
                 frontend_body_reader,
                 pending,
@@ -758,12 +758,12 @@ where
 }
 
 pub enum InformationalForwardResult<FR, FW, BR, BW> {
-    Forwarded(BackendResponse<FR, FW, BR, BW>),
-    Dropped(BackendResponse<FR, FW, BR, BW>),
+    Forwarded(BackendResponseStream<FR, FW, BR, BW>),
+    Dropped(BackendResponseStream<FR, FW, BR, BW>),
 }
 
 impl<FR, FW, BR, BW> InformationalForwardResult<FR, FW, BR, BW> {
-    pub fn into_inner(self) -> BackendResponse<FR, FW, BR, BW> {
+    pub fn into_inner(self) -> BackendResponseStream<FR, FW, BR, BW> {
         match self {
             InformationalForwardResult::Forwarded(r) => r,
             InformationalForwardResult::Dropped(r) => r,
@@ -833,7 +833,7 @@ where
 
         let response_stream = match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
-                BackendResponse::Response(ResponseReceived {
+                BackendResponseStream::Response(ResponseReceived {
                     frontend_body_reader,
                     pending,
                     proxy_response,
@@ -843,7 +843,7 @@ where
             ProxyResponseStream::Informational(
                 proxy_informational_response,
                 proxy_stream_reader,
-            ) => BackendResponse::Informational(InformationalResponseReceived {
+            ) => BackendResponseStream::Informational(InformationalResponseReceived {
                 proxy_informational_response,
                 frontend_body_reader,
                 pending,
@@ -1436,8 +1436,8 @@ mod test {
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 
     use crate::{
-        BackendResponse, ClientOptions, FrontendRequestError, PendingFrontendResponse, ProxyClient,
-        ProxyFrontendError, ProxyOptions,
+        BackendResponseStream, ClientOptions, FrontendRequestError, PendingFrontendResponse,
+        ProxyClient, ProxyFrontendError, ProxyOptions,
     };
 
     use super::{
@@ -1535,10 +1535,10 @@ mod test {
             .expect("failed to read backend response");
 
         let rbir = match be_res_stat {
-            BackendResponse::Response(_read_backend_response) => {
+            BackendResponseStream::Response(_read_backend_response) => {
                 panic!("incorrect response type")
             }
-            BackendResponse::Informational(read_backend_informational_response) => {
+            BackendResponseStream::Informational(read_backend_informational_response) => {
                 read_backend_informational_response
             }
         };
@@ -1596,8 +1596,8 @@ mod test {
             .expect("failed to forward informational response");
 
         let rbr = match be_res_stat.into_inner() {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_rbir) => {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_rbir) => {
                 panic!("incorrect response type")
             }
         };
@@ -1732,8 +1732,8 @@ mod test {
 
         // First, we get the informational response from the backend
         let rbir = match be_res_stat {
-            BackendResponse::Response(_) => panic!("incorrect response type"),
-            BackendResponse::Informational(rbir) => rbir,
+            BackendResponseStream::Response(_) => panic!("incorrect response type"),
+            BackendResponseStream::Informational(rbir) => rbir,
         };
 
         // We attempt to forward the informational to the HTTP/1.0 client.
@@ -1751,8 +1751,8 @@ mod test {
         // Now we can read the next response from the origin. This one is a
         // normal response.
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("incorrect response type"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("incorrect response type"),
         };
 
         // Normal responses can be forwarded to HTTP/1.0 clients.
@@ -1814,8 +1814,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (client, _backend_connection) = rbr
@@ -1875,8 +1875,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbir = match be_res_stat {
-            BackendResponse::Informational(rbir) => rbir,
-            BackendResponse::Response(_) => panic!("expected informational"),
+            BackendResponseStream::Informational(rbir) => rbir,
+            BackendResponseStream::Response(_) => panic!("expected informational"),
         };
 
         let be_res_stat = rbir
@@ -1886,8 +1886,8 @@ mod test {
             .into_inner();
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("expected final response"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("expected final response"),
         };
 
         rbr.forward_response()
@@ -1945,8 +1945,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (client, (_backend_reader, backend_writer)) = rbr
@@ -2009,8 +2009,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (_client, (_backend_reader, backend_writer)) = rbr
@@ -2076,8 +2076,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (_client, (_backend_reader, backend_writer)) = rbr
@@ -2145,8 +2145,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (client, _backend_connection) = rbr
@@ -2213,8 +2213,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (client, _backend_connection) = rbr
@@ -2294,8 +2294,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (client, backend_connection) = rbr
@@ -2340,8 +2340,8 @@ mod test {
             .expect("second read failed");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (client, _) = rbr.forward_response().await.expect("second forward failed");
@@ -2412,8 +2412,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (client, backend_connection) = rbr
@@ -2459,8 +2459,8 @@ mod test {
             .expect("failed to read backend response");
 
         let rbr = match be_res_stat {
-            BackendResponse::Response(rbr) => rbr,
-            BackendResponse::Informational(_) => panic!("unexpected informational"),
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
         let (client, _backend_connection) = rbr
