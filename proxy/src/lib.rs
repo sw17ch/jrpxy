@@ -514,7 +514,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
 /// [`forward_response`] can recover them for [`ProxyClient`] construction
 /// without needing to clone before consuming [`PendingFrontendResponse`].
 ///
-/// [`forward_response`]: ResponseReceived::forward_response
+/// [`forward_response`]: BackendResponse::forward_response
 pub struct PendingFrontendResponseBodyWriter<FW> {
     body_writer: FrontendBodyWriter<FW>,
     options: ProxyOptions,
@@ -649,7 +649,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponseBodyWriterKind<FW> {
     }
 }
 
-/// Error returned by [`InformationalResponseReceived::forward_informational_response`].
+/// Error returned by [`BackendInformationalResponse::forward_informational_response`].
 ///
 /// Two distinct failure modes arise in that method:
 ///
@@ -699,8 +699,8 @@ pub struct ResponseReader<FR, FW, BR, BW> {
 }
 
 pub enum BackendResponseStream<FR, FW, BR, BW> {
-    Informational(InformationalResponseReceived<FR, FW, BR, BW>),
-    Response(ResponseReceived<FR, FW, BR, BW>),
+    Informational(BackendInformationalResponse<FR, FW, BR, BW>),
+    Response(BackendResponse<FR, FW, BR, BW>),
 }
 
 impl<FR, FW, BR, BW> ResponseReader<FR, FW, BR, BW>
@@ -736,7 +736,7 @@ where
         let response_stream = ProxyResponseStream::new(response_stream);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
-                BackendResponseStream::Response(ResponseReceived {
+                BackendResponseStream::Response(BackendResponse {
                     frontend_body_reader,
                     pending,
                     proxy_response,
@@ -746,7 +746,7 @@ where
             ProxyResponseStream::Informational(
                 proxy_informational_response,
                 proxy_stream_reader,
-            ) => BackendResponseStream::Informational(InformationalResponseReceived {
+            ) => BackendResponseStream::Informational(BackendInformationalResponse {
                 proxy_informational_response,
                 frontend_body_reader,
                 pending,
@@ -771,7 +771,7 @@ impl<FR, FW, BR, BW> InformationalForwardResult<FR, FW, BR, BW> {
     }
 }
 
-pub struct InformationalResponseReceived<FR, FW, BR, BW> {
+pub struct BackendInformationalResponse<FR, FW, BR, BW> {
     proxy_informational_response: ProxyInformationalResponse,
     frontend_body_reader: FrontendBodyReader<FR>,
     pending: PendingFrontendResponse<FW>,
@@ -779,7 +779,7 @@ pub struct InformationalResponseReceived<FR, FW, BR, BW> {
     backend_body_writer: BackendBodyWriter<BW>,
 }
 
-impl<FR, FW, BR, BW> InformationalResponseReceived<FR, FW, BR, BW>
+impl<FR, FW, BR, BW> BackendInformationalResponse<FR, FW, BR, BW>
 where
     FW: AsyncWriteExt + Unpin,
     BR: AsyncReadExt + Unpin,
@@ -833,7 +833,7 @@ where
 
         let response_stream = match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
-                BackendResponseStream::Response(ResponseReceived {
+                BackendResponseStream::Response(BackendResponse {
                     frontend_body_reader,
                     pending,
                     proxy_response,
@@ -843,7 +843,7 @@ where
             ProxyResponseStream::Informational(
                 proxy_informational_response,
                 proxy_stream_reader,
-            ) => BackendResponseStream::Informational(InformationalResponseReceived {
+            ) => BackendResponseStream::Informational(BackendInformationalResponse {
                 proxy_informational_response,
                 frontend_body_reader,
                 pending,
@@ -860,14 +860,14 @@ where
     }
 }
 
-pub struct ResponseReceived<FR, FW, BR, BW> {
+pub struct BackendResponse<FR, FW, BR, BW> {
     frontend_body_reader: FrontendBodyReader<FR>,
     pending: PendingFrontendResponse<FW>,
     proxy_response: ProxyResponse<BR>,
     backend_body_writer: BackendBodyWriter<BW>,
 }
 
-impl<FR, FW, BR, BW> ResponseReceived<FR, FW, BR, BW>
+impl<FR, FW, BR, BW> BackendResponse<FR, FW, BR, BW>
 where
     FR: AsyncReadExt + Unpin,
     FW: AsyncWriteExt + Unpin,
