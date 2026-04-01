@@ -55,12 +55,7 @@ where
     type Item = &'s (Bytes, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for h in self.iter.by_ref() {
-            if (self.filter_fn)(&h.0, &h.1) {
-                return Some(h);
-            }
-        }
-        None
+        self.iter.by_ref().find(|&h| (self.filter_fn)(&h.0, &h.1))
     }
 }
 
@@ -82,12 +77,9 @@ impl<'s, 'n> Iterator for HeaderNameIter<'s, 'n> {
     type Item = &'s (Bytes, Bytes);
 
     fn next(&mut self) -> Option<Self::Item> {
-        for h in self.iter.by_ref() {
-            if self.needle.eq_ignore_ascii_case(&h.0) {
-                return Some(h);
-            }
-        }
-        None
+        self.iter
+            .by_ref()
+            .find(|&h| self.needle.eq_ignore_ascii_case(&h.0))
     }
 }
 
