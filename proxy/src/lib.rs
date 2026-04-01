@@ -88,9 +88,9 @@ where
     }
 
     /// Start the proxy transaction by attempting to read and verify a request
-    /// from the frontend reader. Transitions to [`RequestReceived`] on success,
+    /// from the frontend reader. Returns a [`FrontendProxyRequest`] on success,
     /// or [`FrontendRequestError`] on failure.
-    pub async fn start(self) -> Result<RequestReceived<FR, FW>, FrontendRequestError<FR, FW>> {
+    pub async fn start(self) -> Result<FrontendProxyRequest<FR, FW>, FrontendRequestError<FR, FW>> {
         let Self {
             frontend_reader,
             frontend_writer,
@@ -109,115 +109,34 @@ where
             }
         };
 
-        let frontend_request = FrontendProxyRequest::new(req);
-        let method = frontend_request.req().method();
-        let is_head = method == b"HEAD".as_slice();
-        let version = frontend_request.req().version();
+        let is_head = req.req().method() == b"HEAD".as_slice();
+        let version = req.req().version();
+        let pending = PendingFrontendResponse {
+            frontend_writer,
+            options,
+            client_options: ClientOptions { is_head, version },
+        };
+        let frontend_request = FrontendProxyRequest::new(req, pending);
 
+        let method = frontend_request.req().method();
         if method == b"CONNECT".as_slice() {
             return Err(FrontendRequestError::new_request(
-                frontend_writer,
-                options,
-                version,
                 frontend_request,
                 ProxyFrontendError::ConnectNotSupported,
             ));
         }
         if method == b"TRACE".as_slice() {
             return Err(FrontendRequestError::new_request(
-                frontend_writer,
-                options,
-                version,
                 frontend_request,
                 ProxyFrontendError::TraceNotSupported,
             ));
         }
 
-        Ok(RequestReceived {
-            frontend_request,
-            pending: PendingFrontendResponse {
-                frontend_writer,
-                options,
-                client_options: ClientOptions { is_head, version },
-            },
-        })
+        Ok(frontend_request)
     }
 }
 
 /// A valid request has been received from the frontend. We can forward this
-/// request to a backend using [`RequestReceived::write_backend_request`]. This
-/// will transition to [`RequestForwarded`] on success or
-/// [`BackendRequestError`] on failure.
-pub struct RequestReceived<FR, FW> {
-    frontend_request: FrontendProxyRequest<FR>,
-    pending: PendingFrontendResponse<FW>,
-}
-
-impl<FR, FW> RequestReceived<FR, FW> {
-    pub fn as_frontend_request(&self) -> &FrontendProxyRequest<FR> {
-        &self.frontend_request
-    }
-    pub fn as_frontend_request_mut(&mut self) -> &mut FrontendProxyRequest<FR> {
-        &mut self.frontend_request
-    }
-}
-
-impl<FR, FW> RequestReceived<FR, FW>
-where
-    FW: AsyncWriteExt + Unpin,
-{
-    /// Write the request to the backend connection.
-    ///
-    /// The backend reader and writer are taken here, allowing the caller to
-    /// select the backend based on the request (e.g. by hostname or path)
-    /// after inspecting the request via [`RequestReceived::as_proxy_request`].
-    ///
-    /// On error, returns a [`BackendRequestError`] holding the request and
-    /// frontend state. Use [`BackendRequestError::retry_backend_request`] to
-    /// try a different backend, or write an error response to the client via
-    /// `frontend_writer`. The failed backend connection is discarded.
-    pub async fn write_backend_request<BR, BW>(
-        self,
-        backend_connection: BackendConnection<BR, BW>,
-    ) -> Result<RequestForwarded<FR, FW, BR, BW>, BackendRequestError<FR, FW>>
-    where
-        BR: AsyncReadExt + Unpin,
-        BW: AsyncWriteExt + Unpin,
-    {
-        let Self {
-            frontend_request,
-            pending,
-        } = self;
-
-        let (backend_reader, backend_writer) = backend_connection;
-        let backend_request = frontend_request.prepare(&pending.options.received_by);
-
-        let write_result = match backend_request.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(backend_request.req()).await,
-            BodyReadMode::ContentLength(cl) => {
-                backend_writer
-                    .send_as_content_length(backend_request.req(), cl)
-                    .await
-            }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(backend_request.req()).await,
-        };
-
-        match write_result {
-            Ok(backend_body_writer) => Ok(RequestForwarded {
-                request: backend_request,
-                pending,
-                backend_reader,
-                backend_body_writer,
-            }),
-            Err(error) => Err(BackendRequestError {
-                request: backend_request,
-                pending,
-                error,
-            }),
-        }
-    }
-}
-
 /// Returned when [`ProxyClient::start`] fails.
 pub enum FrontendRequestError<FR, FW> {
     /// The frontend sent a request that could not be parsed.
@@ -229,21 +148,10 @@ pub enum FrontendRequestError<FR, FW> {
 impl<FR, FW> FrontendRequestError<FR, FW> {
     /// Convenience method to construct a new request error.
     fn new_request(
-        frontend_writer: FrontendWriter<FW>,
-        options: ProxyOptions,
-        version: HttpVersion,
-        frontend_request: FrontendProxyRequest<FR>,
+        frontend_request: FrontendProxyRequest<FR, FW>,
         error: ProxyFrontendError,
     ) -> FrontendRequestError<FR, FW> {
         Self::Request(FrontendRequestErrorKindRequest {
-            pending: PendingFrontendResponse {
-                frontend_writer,
-                options,
-                client_options: ClientOptions {
-                    is_head: false,
-                    version,
-                },
-            },
             reader: frontend_request,
             error,
         })
@@ -307,11 +215,10 @@ impl<FW> FrontendRequestErrorKindRead<FW> {
 }
 
 /// A valid request was received from the frontend, but there is a semantic
-/// problem exists with that request. We can still send back an error message,
+/// problem with that request. We can still send back an error message,
 /// and optionally drain the body so that we can keep the connection open.
 pub struct FrontendRequestErrorKindRequest<FR, FW> {
-    pending: PendingFrontendResponse<FW>,
-    reader: FrontendProxyRequest<FR>,
+    reader: FrontendProxyRequest<FR, FW>,
     error: ProxyFrontendError,
 }
 
@@ -320,34 +227,23 @@ impl<FR, FW> FrontendRequestErrorKindRequest<FR, FW> {
         &self.error
     }
 
-    /// Consumes the error and returns a [`PendingFrontendResponse`] along with
-    /// the [`FrontendProxyRequest`] so the caller can send an error response to
-    /// the frontend client. This also allows the user to possibly drain the
-    /// request from the client so that the connection can be reused.
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, FrontendProxyRequest<FR>) {
-        let Self {
-            pending,
-            reader,
-            error: _,
-        } = self;
-        (pending, reader)
+    /// Consumes the error and returns the [`FrontendProxyRequest`] so the
+    /// caller can inspect the request, send an error response, or drain the
+    /// body for connection reuse.
+    pub fn into_frontend_request(self) -> FrontendProxyRequest<FR, FW> {
+        self.reader
     }
 }
 
 /// Returned when writing the request head to the backend fails.
 ///
-/// Holds the decomposed request so the caller can retry with a different
-/// backend (via [`retry_backend_request`]) or write an error response to the
-/// client (via [`into_pending_response`]). The failed backend connection is
-/// discarded.
+/// The failed backend connection is discarded. The request is preserved so
+/// the caller can retry with a different backend via
+/// [`into_backend_request`] or send an error response to the frontend.
 ///
-/// [`retry_backend_request`]: BackendRequestError::retry_backend_request
-/// [`into_pending_response`]: BackendRequestError::into_pending_response
+/// [`into_backend_request`]: BackendRequestError::into_backend_request
 pub struct BackendRequestError<FR, FW> {
-    /// The request that was being forwarded, with hop-by-hop headers removed
-    /// and proxy headers (e.g. `Via`) already merged in.
-    request: BackendProxyRequest<FR>,
-    pending: PendingFrontendResponse<FW>,
+    request: BackendProxyRequest<FR, FW>,
     error: BackendError,
 }
 
@@ -371,28 +267,23 @@ impl<FR, FW> BackendRequestError<FR, FW> {
         &self.error
     }
 
-    /// Consumes the error and returns a [`PendingFrontendResponse`] and the
-    /// [`BackendProxyRequest`]. The request is returned so the caller can
-    /// retry with a different backend or drain the frontend body to reuse the
-    /// frontend connection.
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, BackendProxyRequest<FR>) {
-        (self.pending, self.request)
+    /// Consumes the error and returns the [`BackendProxyRequest`] so the caller
+    /// can retry with a different backend or send an error response to the
+    /// frontend via [`BackendProxyRequest::into_pending_response`].
+    pub fn into_backend_request(self) -> BackendProxyRequest<FR, FW> {
+        self.request
     }
 }
 
 /// Returned when reading the response head from the backend fails.
 ///
-/// The broken backend connection is discarded. The frontend state and the
-/// original request are preserved so the caller can retry with a different
-/// backend (via [`retry_backend_request`]) or write an error response to the
-/// client (via [`into_pending_response`]).
+/// The broken backend connection is discarded. The request is preserved so
+/// the caller can retry with a different backend via
+/// [`into_backend_request`] or send an error response to the frontend.
 ///
-/// [`retry_backend_request`]: BackendResponseError::retry_backend_request
-/// [`into_pending_response`]: BackendResponseError::into_pending_response
+/// [`into_backend_request`]: BackendResponseError::into_backend_request
 pub struct BackendResponseError<FR, FW> {
-    /// The request that was forwarded, ready to be sent to a different backend.
-    request: BackendProxyRequest<FR>,
-    pending: PendingFrontendResponse<FW>,
+    request: BackendProxyRequest<FR, FW>,
     error: BackendError,
 }
 
@@ -416,12 +307,11 @@ impl<FR, FW> BackendResponseError<FR, FW> {
         &self.error
     }
 
-    /// Consumes the error and returns a [`PendingFrontendResponse`] and the
-    /// [`BackendProxyRequest`]. The request is returned so the caller can
-    /// retry with a different backend or drain the frontend body to reuse the
-    /// frontend connection.
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, BackendProxyRequest<FR>) {
-        (self.pending, self.request)
+    /// Consumes the error and returns the [`BackendProxyRequest`] so the caller
+    /// can retry with a different backend or send an error response to the
+    /// frontend via [`BackendProxyRequest::into_pending_response`].
+    pub fn into_backend_request(self) -> BackendProxyRequest<FR, FW> {
+        self.request
     }
 }
 
@@ -775,111 +665,6 @@ impl<FR, FW> From<InformationalForwardError<FR, FW>> for ProxyError {
     }
 }
 
-impl<FR, FW> BackendResponseError<FR, FW>
-where
-    FW: AsyncWriteExt + Unpin,
-{
-    /// Retry forwarding the request to a different backend connection.
-    ///
-    /// On success, returns a [`RequestForwarded`] ready for
-    /// [`read_backend_response`]. On failure, returns another
-    /// [`BackendResponseError`] with the same request and frontend state, so
-    /// the caller can try yet another backend or give up.
-    ///
-    /// [`read_backend_response`]: RequestForwarded::read_backend_response
-    pub async fn retry_backend_request<BR, BW>(
-        self,
-        backend_connection: BackendConnection<BR, BW>,
-    ) -> Result<RequestForwarded<FR, FW, BR, BW>, BackendResponseError<FR, FW>>
-    where
-        BR: AsyncReadExt + Unpin,
-        BW: AsyncWriteExt + Unpin,
-    {
-        let Self {
-            request,
-            pending,
-            error: _,
-        } = self;
-
-        let (backend_reader, backend_writer) = backend_connection;
-        let write_result = match request.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(request.req()).await,
-            BodyReadMode::ContentLength(cl) => {
-                backend_writer
-                    .send_as_content_length(request.req(), cl)
-                    .await
-            }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(request.req()).await,
-        };
-
-        match write_result {
-            Ok(backend_body_writer) => Ok(RequestForwarded {
-                request,
-                pending,
-                backend_reader,
-                backend_body_writer,
-            }),
-            Err(error) => Err(BackendResponseError {
-                request,
-                pending,
-                error,
-            }),
-        }
-    }
-}
-
-impl<FR, FW> BackendRequestError<FR, FW>
-where
-    FW: AsyncWriteExt + Unpin,
-{
-    /// Retry forwarding the request to a different backend connection.
-    ///
-    /// On success, returns a [`RequestForwarded`] ready for
-    /// [`read_backend_response`]. On failure, returns another
-    /// [`BackendRequestError`] with the same request and frontend state, so
-    /// the caller can try yet another backend or give up.
-    ///
-    /// [`read_backend_response`]: RequestForwarded::read_backend_response
-    pub async fn retry_backend_request<BR, BW>(
-        self,
-        backend_connection: BackendConnection<BR, BW>,
-    ) -> Result<RequestForwarded<FR, FW, BR, BW>, BackendRequestError<FR, FW>>
-    where
-        BR: AsyncReadExt + Unpin,
-        BW: AsyncWriteExt + Unpin,
-    {
-        let Self {
-            request,
-            pending,
-            error: _,
-        } = self;
-
-        let (backend_reader, backend_writer) = backend_connection;
-        let write_result = match request.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(request.req()).await,
-            BodyReadMode::ContentLength(cl) => {
-                backend_writer
-                    .send_as_content_length(request.req(), cl)
-                    .await
-            }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(request.req()).await,
-        };
-
-        match write_result {
-            Ok(backend_body_writer) => Ok(RequestForwarded {
-                request,
-                pending,
-                backend_reader,
-                backend_body_writer,
-            }),
-            Err(error) => Err(BackendRequestError {
-                request,
-                pending,
-                error,
-            }),
-        }
-    }
-}
 
 type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 
@@ -900,8 +685,7 @@ impl Default for ProxyOptions {
 }
 
 pub struct RequestForwarded<FR, FW, BR, BW> {
-    request: BackendProxyRequest<FR>,
-    pending: PendingFrontendResponse<FW>,
+    request: BackendProxyRequest<FR, FW>,
     backend_reader: BackendReader<BR>,
     backend_body_writer: BackendBodyWriter<BW>,
 }
@@ -921,15 +705,14 @@ where
     ) -> Result<ResponseStreamReceived<FR, FW, BR, BW>, BackendResponseError<FR, FW>> {
         let Self {
             request,
-            pending,
             backend_reader,
             backend_body_writer,
         } = self;
 
         let response_stream = match backend_reader
             .read(
-                !pending.client_options.is_head,
-                pending.options.max_backend_head_length,
+                !request.pending.client_options.is_head,
+                request.pending.options.max_backend_head_length,
             )
             .await
         {
@@ -938,14 +721,10 @@ where
                 // backend_reader and backend_body_writer are both discarded;
                 // the backend connection is broken.
                 drop(backend_body_writer);
-                return Err(BackendResponseError {
-                    request,
-                    pending,
-                    error,
-                });
+                return Err(BackendResponseError { request, error });
             }
         };
-        let (_, frontend_body_reader) = request.into_parts();
+        let (_, frontend_body_reader, pending) = request.into_parts();
         let response_stream = ProxyResponseStream::new(response_stream);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
@@ -1337,28 +1116,28 @@ fn insert_proxy_headers(headers: &mut Headers, version: HttpVersion, received_by
     );
 }
 
-/// A proxy request constructed from a [`FrontendRequest`].
+/// A proxy request received from the frontend.
 ///
-/// On construction, all hop-by-hop headers are stripped from the request and
-/// stored separately. Call [`prepare`] to produce a [`BackendProxyRequest`]
-/// with proxy headers (e.g. `Via`) merged in, ready to forward to a backend.
+/// Hop-by-hop headers are stripped on construction. The request can be
+/// inspected and modified before forwarding. Call [`into_backend_request`] to
+/// produce a [`BackendProxyRequest`] with proxy headers (e.g. `Via`) merged
+/// in, ready to write to a backend connection.
 ///
-/// [`prepare`]: FrontendProxyRequest::prepare
-pub struct FrontendProxyRequest<I> {
-    frontend: FrontendRequest<I>,
+/// Also carries a [`PendingFrontendResponse`] so the caller can send an error
+/// response to the frontend at any point via [`into_pending_response`].
+///
+/// [`into_backend_request`]: FrontendProxyRequest::into_backend_request
+/// [`into_pending_response`]: FrontendProxyRequest::into_pending_response
+pub struct FrontendProxyRequest<FR, FW> {
+    frontend: FrontendRequest<FR>,
     hop_by_hop: Headers,
+    pending: PendingFrontendResponse<FW>,
 }
 
-impl<I> FrontendProxyRequest<I> {
-    /// Construct a [`FrontendProxyRequest`] from a [`FrontendRequest`].
-    ///
-    /// All hop-by-hop headers are stripped on construction.
-    pub fn new(mut frontend: FrontendRequest<I>) -> Self {
+impl<FR, FW> FrontendProxyRequest<FR, FW> {
+    fn new(mut frontend: FrontendRequest<FR>, pending: PendingFrontendResponse<FW>) -> Self {
         let hop_by_hop = strip_hop_by_hop_headers(frontend.req_mut().headers_mut());
-        Self {
-            frontend,
-            hop_by_hop,
-        }
+        Self { frontend, hop_by_hop, pending }
     }
 
     /// The underlying [`Request`] with hop-by-hop headers removed.
@@ -1377,37 +1156,43 @@ impl<I> FrontendProxyRequest<I> {
         &self.hop_by_hop
     }
 
-    /// Prepare the request for forwarding to a backend.
+    /// Convert this frontend request into a [`BackendProxyRequest`] ready to
+    /// write to a backend connection.
     ///
-    /// `received_by` is the proxy identifier inserted into the `Via` header
-    /// per RFC 9110 §7.6.3. Proxy headers are merged into the request and the
-    /// result is split into a [`BackendProxyRequest`] ready to write.
-    pub fn prepare(self, received_by: &str) -> BackendProxyRequest<I> {
-        let Self {
-            mut frontend,
-            hop_by_hop: _,
-        } = self;
+    /// Proxy headers (e.g. `Via`) are merged in using the `received_by`
+    /// identifier from [`ProxyOptions`]. The pending frontend response is
+    /// carried through into the [`BackendProxyRequest`].
+    pub fn into_backend_request(self) -> BackendProxyRequest<FR, FW> {
+        let Self { mut frontend, hop_by_hop: _, pending } = self;
         let version = frontend.req().version();
-        insert_proxy_headers(frontend.req_mut().headers_mut(), version, received_by);
+        insert_proxy_headers(
+            frontend.req_mut().headers_mut(),
+            version,
+            &pending.options.received_by,
+        );
         let (request, body_reader) = frontend.into_parts();
-        BackendProxyRequest {
-            request,
-            body_reader,
-        }
+        BackendProxyRequest { request, body_reader, pending }
+    }
+
+    /// Discard the request and return the [`PendingFrontendResponse`] so the
+    /// caller can send an error response to the frontend.
+    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
+        self.pending
     }
 }
 
-/// A backend request produced by [`FrontendProxyRequest::prepare`].
+/// A backend request produced by [`FrontendProxyRequest::into_backend_request`].
 ///
-/// Proxy headers (e.g. `Via`) have been merged in. Holds the prepared request
-/// together with the frontend body reader so both can be passed to a backend
-/// writer or recovered intact for retry on error.
-pub struct BackendProxyRequest<I> {
+/// Proxy headers (e.g. `Via`) have been merged in. Carries the prepared
+/// request, the frontend body reader, and the pending frontend response so all
+/// three are available for writing, retry, or error handling.
+pub struct BackendProxyRequest<FR, FW> {
     request: Request,
-    body_reader: FrontendBodyReader<I>,
+    body_reader: FrontendBodyReader<FR>,
+    pending: PendingFrontendResponse<FW>,
 }
 
-impl<I> BackendProxyRequest<I> {
+impl<FR, FW> BackendProxyRequest<FR, FW> {
     /// The underlying [`Request`] with hop-by-hop headers removed and proxy
     /// headers merged in.
     pub fn req(&self) -> &Request {
@@ -1424,8 +1209,55 @@ impl<I> BackendProxyRequest<I> {
         self.body_reader.mode()
     }
 
-    pub fn into_parts(self) -> (Request, FrontendBodyReader<I>) {
-        (self.request, self.body_reader)
+    /// Discard the request and body reader, returning the
+    /// [`PendingFrontendResponse`] so the caller can send an error response
+    /// to the frontend.
+    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
+        self.pending
+    }
+
+    /// Decompose into the prepared request, frontend body reader, and pending
+    /// frontend response.
+    fn into_parts(self) -> (Request, FrontendBodyReader<FR>, PendingFrontendResponse<FW>) {
+        (self.request, self.body_reader, self.pending)
+    }
+
+    /// Write this backend request to the given backend connection.
+    ///
+    /// On success, returns a [`RequestForwarded`] ready for
+    /// [`read_backend_response`]. On failure, returns a [`BackendRequestError`]
+    /// that carries this request intact so the caller can retry with a
+    /// different backend or send an error response via
+    /// [`BackendRequestError::into_backend_request`].
+    ///
+    /// [`read_backend_response`]: RequestForwarded::read_backend_response
+    pub async fn write<BR, BW>(
+        self,
+        backend_connection: BackendConnection<BR, BW>,
+    ) -> Result<RequestForwarded<FR, FW, BR, BW>, BackendRequestError<FR, FW>>
+    where
+        BR: AsyncReadExt + Unpin,
+        BW: AsyncWriteExt + Unpin,
+    {
+        let (backend_reader, backend_writer) = backend_connection;
+        let write_result = match self.body_reader.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(&self.request).await,
+            BodyReadMode::ContentLength(cl) => {
+                backend_writer.send_as_content_length(&self.request, cl).await
+            }
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&self.request).await,
+        };
+        match write_result {
+            Ok(backend_body_writer) => Ok(RequestForwarded {
+                request: self,
+                backend_reader,
+                backend_body_writer,
+            }),
+            Err(error) => Err(BackendRequestError {
+                request: self,
+                error,
+            }),
+        }
     }
 }
 
@@ -1601,16 +1433,25 @@ mod test {
         }
     }
 
-    async fn make_frontend_proxy_request(raw: &[u8]) -> FrontendProxyRequest<&[u8]> {
+    async fn make_frontend_proxy_request(
+        raw: &[u8],
+    ) -> FrontendProxyRequest<&[u8], tokio::io::Sink> {
         let reader = FrontendReader::new(raw, 8192);
-        let frontend = reader.read().await.expect("valid request");
-        FrontendProxyRequest::new(frontend)
+        let req = reader.read().await.expect("valid request");
+        let is_head = req.req().method() == b"HEAD".as_slice();
+        let version = req.req().version();
+        let pending = PendingFrontendResponse {
+            frontend_writer: FrontendWriter::new(tokio::io::sink()),
+            options: ProxyOptions::default(),
+            client_options: ClientOptions { is_head, version },
+        };
+        FrontendProxyRequest::new(req, pending)
     }
 
-    async fn make_backend_proxy_request(raw: &[u8]) -> BackendProxyRequest<&[u8]> {
-        make_frontend_proxy_request(raw)
-            .await
-            .prepare("proxy.example.com")
+    async fn make_backend_proxy_request(
+        raw: &[u8],
+    ) -> BackendProxyRequest<&[u8], tokio::io::Sink> {
+        make_frontend_proxy_request(raw).await.into_backend_request()
     }
 
     async fn make_proxy_response(raw: &[u8]) -> ProxyResponseStream<&[u8]> {
@@ -1655,7 +1496,8 @@ mod test {
 
         let backend_connection = bp.get_connection().await.expect("no backend connection");
         let did_be_write = did_fe_read
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed");
 
@@ -1850,7 +1692,8 @@ mod test {
 
         let backend_connection = bp.get_connection().await.expect("no backend connection");
         let did_be_write = did_fe_read
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed");
 
@@ -1934,7 +1777,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1994,7 +1838,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2063,7 +1908,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2126,7 +1972,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2192,7 +2039,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2260,7 +2108,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2327,7 +2176,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2407,7 +2257,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2452,7 +2303,8 @@ mod test {
             .start()
             .await
             .expect("second start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("second backend write failed")
             .read_backend_response()
@@ -2523,7 +2375,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2569,7 +2422,8 @@ mod test {
             .start()
             .await
             .expect("client start failed")
-            .write_backend_request(backend_connection)
+            .into_backend_request()
+            .write(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2687,13 +2541,8 @@ mod test {
 
         let pr = make_backend_proxy_request(raw).await;
 
-        let via = pr
-            .req()
-            .headers()
-            .get_header("via")
-            .next()
-            .expect("Via must be present");
-        assert_eq!(via.1.as_ref(), b"1.1 proxy.example.com");
+        let via = pr.req().headers().get_header("via").next().expect("Via must be present");
+        assert_eq!(via.1.as_ref(), b"1.1 jrpxy");
     }
 
     #[tokio::test]
@@ -2705,13 +2554,8 @@ mod test {
 
         let pr = make_backend_proxy_request(raw).await;
 
-        let via = pr
-            .req()
-            .headers()
-            .get_header("via")
-            .next()
-            .expect("Via must be present");
-        assert_eq!(via.1.as_ref(), b"1.0 proxy.example.com");
+        let via = pr.req().headers().get_header("via").next().expect("Via must be present");
+        assert_eq!(via.1.as_ref(), b"1.0 jrpxy");
     }
 
     #[tokio::test]
@@ -2926,7 +2770,7 @@ mod test {
             ProxyFrontendError::ConnectNotSupported
         ));
 
-        let (pending, _proxy_request) = req_err.into_pending_response();
+        let pending = req_err.into_frontend_request().into_pending_response();
 
         let response = ResponseBuilder::new(4)
             .with_version(HttpVersion::Http11)
@@ -2979,7 +2823,7 @@ mod test {
             ProxyFrontendError::TraceNotSupported
         ));
 
-        let (pending, _proxy_request) = req_err.into_pending_response();
+        let pending = req_err.into_frontend_request().into_pending_response();
 
         let response = ResponseBuilder::new(4)
             .with_version(HttpVersion::Http11)
