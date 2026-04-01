@@ -1257,7 +1257,7 @@ impl<FR, FW> BackendProxyRequest<FR, FW> {
     /// [`BackendRequestError::into_backend_request`].
     ///
     /// [`read_backend_response`]: ResponseReader::read_backend_response
-    pub async fn write<BR, BW>(
+    pub async fn forward<BR, BW>(
         self,
         backend_connection: BackendConnection<BR, BW>,
     ) -> Result<ResponseReader<FR, FW, BR, BW>, BackendRequestError<FR, FW>>
@@ -1525,7 +1525,7 @@ mod test {
         let backend_connection = bp.get_connection().await.expect("no backend connection");
         let did_be_write = did_fe_read
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed");
 
@@ -1721,7 +1721,7 @@ mod test {
         let backend_connection = bp.get_connection().await.expect("no backend connection");
         let did_be_write = did_fe_read
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed");
 
@@ -1806,7 +1806,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1867,7 +1867,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -1937,7 +1937,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2001,7 +2001,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2068,7 +2068,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2137,7 +2137,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2205,7 +2205,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2286,7 +2286,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2332,7 +2332,7 @@ mod test {
             .await
             .expect("second start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("second backend write failed")
             .read_backend_response()
@@ -2404,7 +2404,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
@@ -2451,7 +2451,7 @@ mod test {
             .await
             .expect("client start failed")
             .into_backend_request()
-            .write(backend_connection)
+            .forward(backend_connection)
             .await
             .expect("backend write failed")
             .read_backend_response()
