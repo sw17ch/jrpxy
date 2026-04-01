@@ -109,17 +109,17 @@ where
             }
         };
 
-        let proxy_request = ProxyRequest::new(req, &options.received_by);
-        let method = proxy_request.req().method();
+        let frontend_request = FrontendProxyRequest::new(req);
+        let method = frontend_request.req().method();
         let is_head = method == b"HEAD".as_slice();
-        let version = proxy_request.req().version();
+        let version = frontend_request.req().version();
 
         if method == b"CONNECT".as_slice() {
             return Err(FrontendRequestError::new_request(
                 frontend_writer,
                 options,
                 version,
-                proxy_request,
+                frontend_request,
                 ProxyFrontendError::ConnectNotSupported,
             ));
         }
@@ -128,13 +128,13 @@ where
                 frontend_writer,
                 options,
                 version,
-                proxy_request,
+                frontend_request,
                 ProxyFrontendError::TraceNotSupported,
             ));
         }
 
         Ok(RequestReceived {
-            proxy_request,
+            frontend_request,
             pending: PendingFrontendResponse {
                 frontend_writer,
                 options,
@@ -149,16 +149,16 @@ where
 /// will transition to [`RequestForwarded`] on success or
 /// [`BackendRequestError`] on failure.
 pub struct RequestReceived<FR, FW> {
-    proxy_request: ProxyRequest<FR>,
+    frontend_request: FrontendProxyRequest<FR>,
     pending: PendingFrontendResponse<FW>,
 }
 
 impl<FR, FW> RequestReceived<FR, FW> {
-    pub fn as_proxy_request(&self) -> &ProxyRequest<FR> {
-        &self.proxy_request
+    pub fn as_frontend_request(&self) -> &FrontendProxyRequest<FR> {
+        &self.frontend_request
     }
-    pub fn as_proxy_request_mut(&mut self) -> &mut ProxyRequest<FR> {
-        &mut self.proxy_request
+    pub fn as_frontend_request_mut(&mut self) -> &mut FrontendProxyRequest<FR> {
+        &mut self.frontend_request
     }
 }
 
@@ -185,34 +185,32 @@ where
         BW: AsyncWriteExt + Unpin,
     {
         let Self {
-            proxy_request,
+            frontend_request,
             pending,
         } = self;
 
         let (backend_reader, backend_writer) = backend_connection;
-        let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
+        let backend_request = frontend_request.prepare(&pending.options.received_by);
 
-        let write_result = match frontend_body_reader.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(&backend_request).await,
+        let write_result = match backend_request.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(backend_request.req()).await,
             BodyReadMode::ContentLength(cl) => {
                 backend_writer
-                    .send_as_content_length(&backend_request, cl)
+                    .send_as_content_length(backend_request.req(), cl)
                     .await
             }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&backend_request).await,
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(backend_request.req()).await,
         };
 
         match write_result {
             Ok(backend_body_writer) => Ok(RequestForwarded {
                 request: backend_request,
-                frontend_body_reader,
                 pending,
                 backend_reader,
                 backend_body_writer,
             }),
             Err(error) => Err(BackendRequestError {
                 request: backend_request,
-                frontend_body_reader,
                 pending,
                 error,
             }),
@@ -234,7 +232,7 @@ impl<FR, FW> FrontendRequestError<FR, FW> {
         frontend_writer: FrontendWriter<FW>,
         options: ProxyOptions,
         version: HttpVersion,
-        proxy_request: ProxyRequest<FR>,
+        frontend_request: FrontendProxyRequest<FR>,
         error: ProxyFrontendError,
     ) -> FrontendRequestError<FR, FW> {
         Self::Request(FrontendRequestErrorKindRequest {
@@ -246,7 +244,7 @@ impl<FR, FW> FrontendRequestError<FR, FW> {
                     version,
                 },
             },
-            reader: proxy_request,
+            reader: frontend_request,
             error,
         })
     }
@@ -313,7 +311,7 @@ impl<FW> FrontendRequestErrorKindRead<FW> {
 /// and optionally drain the body so that we can keep the connection open.
 pub struct FrontendRequestErrorKindRequest<FR, FW> {
     pending: PendingFrontendResponse<FW>,
-    reader: ProxyRequest<FR>,
+    reader: FrontendProxyRequest<FR>,
     error: ProxyFrontendError,
 }
 
@@ -323,10 +321,10 @@ impl<FR, FW> FrontendRequestErrorKindRequest<FR, FW> {
     }
 
     /// Consumes the error and returns a [`PendingFrontendResponse`] along with
-    /// the [`FrontendBodyReader`] so the caller can send an error response to
+    /// the [`FrontendProxyRequest`] so the caller can send an error response to
     /// the frontend client. This also allows the user to possibly drain the
     /// request from the client so that the connection can be reused.
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, ProxyRequest<FR>) {
+    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, FrontendProxyRequest<FR>) {
         let Self {
             pending,
             reader,
@@ -348,8 +346,7 @@ impl<FR, FW> FrontendRequestErrorKindRequest<FR, FW> {
 pub struct BackendRequestError<FR, FW> {
     /// The request that was being forwarded, with hop-by-hop headers removed
     /// and proxy headers (e.g. `Via`) already merged in.
-    request: Request,
-    frontend_body_reader: FrontendBodyReader<FR>,
+    request: BackendProxyRequest<FR>,
     pending: PendingFrontendResponse<FW>,
     error: BackendError,
 }
@@ -375,11 +372,11 @@ impl<FR, FW> BackendRequestError<FR, FW> {
     }
 
     /// Consumes the error and returns a [`PendingFrontendResponse`] and the
-    /// frontend body reader. The body reader is returned separately so the
-    /// caller can decide whether to drain it (for connection reuse) or drop it
-    /// (to close the read half of the socket immediately).
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, FrontendBodyReader<FR>) {
-        (self.pending, self.frontend_body_reader)
+    /// [`BackendProxyRequest`]. The request is returned so the caller can
+    /// retry with a different backend or drain the frontend body to reuse the
+    /// frontend connection.
+    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, BackendProxyRequest<FR>) {
+        (self.pending, self.request)
     }
 }
 
@@ -394,8 +391,7 @@ impl<FR, FW> BackendRequestError<FR, FW> {
 /// [`into_pending_response`]: BackendResponseError::into_pending_response
 pub struct BackendResponseError<FR, FW> {
     /// The request that was forwarded, ready to be sent to a different backend.
-    request: Request,
-    frontend_body_reader: FrontendBodyReader<FR>,
+    request: BackendProxyRequest<FR>,
     pending: PendingFrontendResponse<FW>,
     error: BackendError,
 }
@@ -421,11 +417,11 @@ impl<FR, FW> BackendResponseError<FR, FW> {
     }
 
     /// Consumes the error and returns a [`PendingFrontendResponse`] and the
-    /// frontend body reader. The body reader is returned separately so the
-    /// caller can decide whether to drain it (for connection reuse) or drop it
-    /// (to close the read half of the socket immediately).
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, FrontendBodyReader<FR>) {
-        (self.pending, self.frontend_body_reader)
+    /// [`BackendProxyRequest`]. The request is returned so the caller can
+    /// retry with a different backend or drain the frontend body to reuse the
+    /// frontend connection.
+    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, BackendProxyRequest<FR>) {
+        (self.pending, self.request)
     }
 }
 
@@ -801,31 +797,30 @@ where
     {
         let Self {
             request,
-            frontend_body_reader,
             pending,
             error: _,
         } = self;
 
         let (backend_reader, backend_writer) = backend_connection;
-        let write_result = match frontend_body_reader.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(&request).await,
+        let write_result = match request.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(request.req()).await,
             BodyReadMode::ContentLength(cl) => {
-                backend_writer.send_as_content_length(&request, cl).await
+                backend_writer
+                    .send_as_content_length(request.req(), cl)
+                    .await
             }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&request).await,
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(request.req()).await,
         };
 
         match write_result {
             Ok(backend_body_writer) => Ok(RequestForwarded {
                 request,
-                frontend_body_reader,
                 pending,
                 backend_reader,
                 backend_body_writer,
             }),
             Err(error) => Err(BackendResponseError {
                 request,
-                frontend_body_reader,
                 pending,
                 error,
             }),
@@ -855,31 +850,30 @@ where
     {
         let Self {
             request,
-            frontend_body_reader,
             pending,
             error: _,
         } = self;
 
         let (backend_reader, backend_writer) = backend_connection;
-        let write_result = match frontend_body_reader.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(&request).await,
+        let write_result = match request.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(request.req()).await,
             BodyReadMode::ContentLength(cl) => {
-                backend_writer.send_as_content_length(&request, cl).await
+                backend_writer
+                    .send_as_content_length(request.req(), cl)
+                    .await
             }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&request).await,
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(request.req()).await,
         };
 
         match write_result {
             Ok(backend_body_writer) => Ok(RequestForwarded {
                 request,
-                frontend_body_reader,
                 pending,
                 backend_reader,
                 backend_body_writer,
             }),
             Err(error) => Err(BackendRequestError {
                 request,
-                frontend_body_reader,
                 pending,
                 error,
             }),
@@ -906,8 +900,7 @@ impl Default for ProxyOptions {
 }
 
 pub struct RequestForwarded<FR, FW, BR, BW> {
-    request: Request,
-    frontend_body_reader: FrontendBodyReader<FR>,
+    request: BackendProxyRequest<FR>,
     pending: PendingFrontendResponse<FW>,
     backend_reader: BackendReader<BR>,
     backend_body_writer: BackendBodyWriter<BW>,
@@ -928,7 +921,6 @@ where
     ) -> Result<ResponseStreamReceived<FR, FW, BR, BW>, BackendResponseError<FR, FW>> {
         let Self {
             request,
-            frontend_body_reader,
             pending,
             backend_reader,
             backend_body_writer,
@@ -948,12 +940,12 @@ where
                 drop(backend_body_writer);
                 return Err(BackendResponseError {
                     request,
-                    frontend_body_reader,
                     pending,
                     error,
                 });
             }
         };
+        let (_, frontend_body_reader) = request.into_parts();
         let response_stream = ProxyResponseStream::new(response_stream);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
@@ -1348,36 +1340,24 @@ fn insert_proxy_headers(headers: &mut Headers, version: HttpVersion, received_by
 /// A proxy request constructed from a [`FrontendRequest`].
 ///
 /// On construction, all hop-by-hop headers are stripped from the request and
-/// stored separately. Proxy headers are built and stored as a distinct set.
+/// stored separately. Call [`prepare`] to produce a [`BackendProxyRequest`]
+/// with proxy headers (e.g. `Via`) merged in, ready to forward to a backend.
 ///
-/// The three header sets exposed by this type are:
-///
-/// - **original headers**: the end-to-end headers remaining after hop-by-hop
-///   removal.
-/// - **hop-by-hop headers**: the headers that were removed.
-/// - **proxy headers**: headers added by this proxy.
-pub struct ProxyRequest<I> {
+/// [`prepare`]: FrontendProxyRequest::prepare
+pub struct FrontendProxyRequest<I> {
     frontend: FrontendRequest<I>,
     hop_by_hop: Headers,
-    proxy_headers: Headers,
 }
 
-impl<I> ProxyRequest<I> {
-    /// Construct a [`ProxyRequest`] from a [`FrontendRequest`].
+impl<I> FrontendProxyRequest<I> {
+    /// Construct a [`FrontendProxyRequest`] from a [`FrontendRequest`].
     ///
-    /// `received_by` is the proxy identifier inserted into the `Via` header
-    /// per RFC 9110 7.6.3 (e.g. a hostname or pseudonym).
-    pub fn new(mut frontend: FrontendRequest<I>, received_by: &str) -> Self {
-        let version = frontend.req().version();
+    /// All hop-by-hop headers are stripped on construction.
+    pub fn new(mut frontend: FrontendRequest<I>) -> Self {
         let hop_by_hop = strip_hop_by_hop_headers(frontend.req_mut().headers_mut());
-
-        let mut proxy_headers = Headers::with_capacity(1);
-        insert_proxy_headers(&mut proxy_headers, version, received_by);
-
         Self {
             frontend,
             hop_by_hop,
-            proxy_headers,
         }
     }
 
@@ -1392,41 +1372,60 @@ impl<I> ProxyRequest<I> {
     }
 
     /// The hop-by-hop headers that were removed from the request on
-    /// construction. These are here to be referenced in case they are required
-    /// for some other internal proxy state, or if the user wants to add them
-    /// back into the backend response.
+    /// construction.
     pub fn hop_by_hop_headers(&self) -> &Headers {
         &self.hop_by_hop
     }
 
-    /// A reference to headers added by this proxy (e.g. `Via`). This allows the
-    /// user to inspect the proxy headers.
-    pub fn proxy_headers(&self) -> &Headers {
-        &self.proxy_headers
-    }
-
-    /// A mutable reference to the proxy headers that will be added to the
-    /// request before forwarding to the next hop. This allows the user to add
-    /// or remove proxy headers before forwarding.
-    pub fn proxy_headers_mut(&mut self) -> &mut Headers {
-        &mut self.proxy_headers
-    }
-
-    /// Convert the [`ProxyRequest`] into a request with all the hop-by-hop
-    /// headers removed, and proxy headers added.
-    fn into_backend_request(self) -> (Request, FrontendBodyReader<I>) {
+    /// Prepare the request for forwarding to a backend.
+    ///
+    /// `received_by` is the proxy identifier inserted into the `Via` header
+    /// per RFC 9110 §7.6.3. Proxy headers are merged into the request and the
+    /// result is split into a [`BackendProxyRequest`] ready to write.
+    pub fn prepare(self, received_by: &str) -> BackendProxyRequest<I> {
         let Self {
             mut frontend,
             hop_by_hop: _,
-            proxy_headers,
         } = self;
+        let version = frontend.req().version();
+        insert_proxy_headers(frontend.req_mut().headers_mut(), version, received_by);
+        let (request, body_reader) = frontend.into_parts();
+        BackendProxyRequest {
+            request,
+            body_reader,
+        }
+    }
+}
 
-        // merge the proxy headers into the request
-        let current_headers = frontend.req_mut().headers_mut();
-        current_headers.merge(&proxy_headers);
+/// A backend request produced by [`FrontendProxyRequest::prepare`].
+///
+/// Proxy headers (e.g. `Via`) have been merged in. Holds the prepared request
+/// together with the frontend body reader so both can be passed to a backend
+/// writer or recovered intact for retry on error.
+pub struct BackendProxyRequest<I> {
+    request: Request,
+    body_reader: FrontendBodyReader<I>,
+}
 
-        // then we can return the pieces normally
-        frontend.into_parts()
+impl<I> BackendProxyRequest<I> {
+    /// The underlying [`Request`] with hop-by-hop headers removed and proxy
+    /// headers merged in.
+    pub fn req(&self) -> &Request {
+        &self.request
+    }
+
+    /// The underlying [`Request`] as mutable.
+    pub fn req_mut(&mut self) -> &mut Request {
+        &mut self.request
+    }
+
+    /// The framing mode derived from the frontend body reader.
+    pub fn mode(&self) -> BodyReadMode {
+        self.body_reader.mode()
+    }
+
+    pub fn into_parts(self) -> (Request, FrontendBodyReader<I>) {
+        (self.request, self.body_reader)
     }
 }
 
@@ -1582,8 +1581,8 @@ mod test {
     };
 
     use super::{
-        ProxyInformationalResponse, ProxyRequest, ProxyResponse, ProxyResponseStream,
-        ProxyStreamReader,
+        BackendProxyRequest, FrontendProxyRequest, ProxyInformationalResponse, ProxyResponse,
+        ProxyResponseStream, ProxyStreamReader,
     };
 
     fn into_response<I>(s: ProxyResponseStream<I>) -> ProxyResponse<I> {
@@ -1602,10 +1601,16 @@ mod test {
         }
     }
 
-    async fn make_proxy_request(raw: &[u8]) -> ProxyRequest<&[u8]> {
+    async fn make_frontend_proxy_request(raw: &[u8]) -> FrontendProxyRequest<&[u8]> {
         let reader = FrontendReader::new(raw, 8192);
         let frontend = reader.read().await.expect("valid request");
-        ProxyRequest::new(frontend, "proxy.example.com")
+        FrontendProxyRequest::new(frontend)
+    }
+
+    async fn make_backend_proxy_request(raw: &[u8]) -> BackendProxyRequest<&[u8]> {
+        make_frontend_proxy_request(raw)
+            .await
+            .prepare("proxy.example.com")
     }
 
     async fn make_proxy_response(raw: &[u8]) -> ProxyResponseStream<&[u8]> {
@@ -2610,7 +2615,7 @@ mod test {
             0\r\n\
             \r\n";
 
-        let pr = make_proxy_request(raw).await;
+        let pr = make_frontend_proxy_request(raw).await;
 
         let names: Vec<_> = pr.req().headers().iter().map(|(n, _)| n.clone()).collect();
         assert!(names.iter().all(|n| !n.eq_ignore_ascii_case(b"connection")));
@@ -2648,7 +2653,7 @@ mod test {
             Connection: x-custom-hop-1\r\n\
             \r\n";
 
-        let pr = make_proxy_request(raw).await;
+        let pr = make_frontend_proxy_request(raw).await;
 
         let names: Vec<_> = pr.req().headers().iter().map(|(n, _)| n.clone()).collect();
         assert!(
@@ -2680,10 +2685,11 @@ mod test {
             Host: example.com\r\n\
             \r\n";
 
-        let pr = make_proxy_request(raw).await;
+        let pr = make_backend_proxy_request(raw).await;
 
         let via = pr
-            .proxy_headers()
+            .req()
+            .headers()
             .get_header("via")
             .next()
             .expect("Via must be present");
@@ -2697,10 +2703,11 @@ mod test {
             Host: example.com\r\n\
             \r\n";
 
-        let pr = make_proxy_request(raw).await;
+        let pr = make_backend_proxy_request(raw).await;
 
         let via = pr
-            .proxy_headers()
+            .req()
+            .headers()
             .get_header("via")
             .next()
             .expect("Via must be present");
