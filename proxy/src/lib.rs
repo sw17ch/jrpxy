@@ -511,10 +511,8 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
 /// [`PendingFrontendResponse`].
 ///
 /// Carries [`ProxyOptions`] through the body-write cycle so that
-/// [`forward_response`] can recover them for [`ProxyClient`] construction
+/// [`BodyExchanger::finish`] can recover them for [`ProxyClient`] construction
 /// without needing to clone before consuming [`PendingFrontendResponse`].
-///
-/// [`forward_response`]: BackendResponse::forward_response
 pub struct PendingFrontendResponseBodyWriter<FW> {
     body_writer: FrontendBodyWriter<FW>,
     options: ProxyOptions,
@@ -882,23 +880,25 @@ where
         &mut self.proxy_response
     }
 
-    pub async fn forward_response(
-        self,
-    ) -> ProxyResult<(ProxyClient<FR, FW>, BackendConnection<BR, BW>)> {
+    /// Send the response head to the frontend and return a [`BodyExchanger`]
+    /// ready to drive the body copy in both directions.
+    ///
+    /// Use [`BodyExchanger::finish`] to drive the copy internally, or
+    /// [`BodyExchanger::into_parts`] to take ownership of the body readers
+    /// and writers and drive the copy yourself.
+    pub async fn forward_response_head(self) -> Result<BodyExchanger<FR, FW, BR, BW>, ProxyError> {
         let Self {
-            mut frontend_body_reader,
+            frontend_body_reader,
             pending,
             proxy_response,
-            mut backend_body_writer,
+            backend_body_writer,
         } = self;
 
         // TODO: use client_options to decide if we need to buffer the response
         // (chunk-encoded) or if we can send back a content-length.
         let is_head = pending.client_options.is_head;
-        let body_chunk_size = pending.options.body_chunk_size;
-
         let (response, backend_body_reader) = proxy_response.into_frontend_response();
-        let pending_body_writer = match backend_body_reader.mode() {
+        let frontend_body_writer = match backend_body_reader.mode() {
             BodyReadMode::Chunk => pending.send_as_chunked(response).await?,
             BodyReadMode::ContentLength(cl) => pending.send_as_content_length(response, cl).await?,
             BodyReadMode::Bodyless => {
@@ -913,6 +913,81 @@ where
                 }
             }
         };
+
+        Ok(BodyExchanger {
+            frontend_body_reader,
+            backend_body_writer,
+            backend_body_reader,
+            frontend_body_writer,
+        })
+    }
+}
+
+/// Drives the bidirectional body exchange between the frontend and backend
+/// after the response head has been forwarded.
+///
+/// Produced by [`BackendResponse::forward_response_head`].
+pub struct BodyExchanger<FR, FW, BR, BW> {
+    frontend_body_reader: FrontendBodyReader<FR>,
+    backend_body_writer: BackendBodyWriter<BW>,
+    backend_body_reader: BackendBodyReader<BR>,
+    frontend_body_writer: PendingFrontendResponseBodyWriter<FW>,
+}
+
+/// The individual body readers and writers that make up a [`BodyExchanger`].
+///
+/// Produced by [`BodyExchanger::into_parts`]. The caller is responsible for
+/// driving the body copies concurrently. This is typically done using
+/// `tokio::select!` or `tokio::spawn`. See [`BodyExchanger::finish`] for a
+/// reference implementation.
+pub struct BodyExchangerParts<FR, FW, BR, BW> {
+    /// Reads the request body from the frontend (f2b source).
+    pub frontend_body_reader: FrontendBodyReader<FR>,
+    /// Writes the request body to the backend (f2b sink).
+    pub backend_body_writer: BackendBodyWriter<BW>,
+    /// Reads the response body from the backend (b2f source).
+    pub backend_body_reader: BackendBodyReader<BR>,
+    /// Writes the response body to the frontend (b2f sink).
+    pub frontend_body_writer: PendingFrontendResponseBodyWriter<FW>,
+}
+
+impl<FR, FW, BR, BW> BodyExchanger<FR, FW, BR, BW>
+where
+    FR: AsyncReadExt + Unpin,
+    FW: AsyncWriteExt + Unpin,
+    BR: AsyncReadExt + Unpin,
+    BW: AsyncWriteExt + Unpin,
+{
+    /// Decompose into the individual body readers and writers. The caller is
+    /// responsible for driving the f2b and b2f copies concurrently.
+    pub fn into_parts(self) -> BodyExchangerParts<FR, FW, BR, BW> {
+        let Self {
+            frontend_body_reader,
+            backend_body_writer,
+            backend_body_reader,
+            frontend_body_writer,
+        } = self;
+        BodyExchangerParts {
+            frontend_body_reader,
+            backend_body_writer,
+            backend_body_reader,
+            frontend_body_writer,
+        }
+    }
+
+    /// Drive the body copy in both directions concurrently and return a
+    /// [`ProxyClient`] ready for the next request.
+    pub async fn finish(self) -> ProxyResult<(ProxyClient<FR, FW>, BackendConnection<BR, BW>)> {
+        let Self {
+            mut frontend_body_reader,
+            mut backend_body_writer,
+            backend_body_reader,
+            frontend_body_writer,
+        } = self;
+
+        let (options, mut frontend_kind) = frontend_body_writer.into_kind();
+        let body_chunk_size = options.body_chunk_size;
+        let mut backend_kind = backend_body_reader.into_kind();
 
         let f2b_fut = async move {
             let ret;
@@ -957,9 +1032,6 @@ where
             }
             ret
         };
-
-        let (options, mut frontend_kind) = pending_body_writer.into_kind();
-        let mut backend_kind = backend_body_reader.into_kind();
 
         let b2f_fut = async move {
             let ret;
@@ -1650,7 +1722,10 @@ mod test {
         );
 
         let (client, (backend_reader, backend_writer)) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
         bp.give_connection(backend_reader, backend_writer);
@@ -1757,7 +1832,10 @@ mod test {
 
         // Normal responses can be forwarded to HTTP/1.0 clients.
         let (client, _backend_connection) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
 
@@ -1819,7 +1897,10 @@ mod test {
         };
 
         let (client, _backend_connection) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
 
@@ -1890,7 +1971,10 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("expected final response"),
         };
 
-        rbr.forward_response()
+        rbr.forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
 
@@ -1950,7 +2034,10 @@ mod test {
         };
 
         let (client, (_backend_reader, backend_writer)) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
         let _ = client;
@@ -2014,7 +2101,10 @@ mod test {
         };
 
         let (_client, (_backend_reader, backend_writer)) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
         let backend_writer = backend_writer.into_inner();
@@ -2081,7 +2171,10 @@ mod test {
         };
 
         let (_client, (_backend_reader, backend_writer)) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
         let backend_writer = backend_writer.into_inner();
@@ -2150,7 +2243,10 @@ mod test {
         };
 
         let (client, _backend_connection) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
 
@@ -2218,7 +2314,10 @@ mod test {
         };
 
         let (client, _backend_connection) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
 
@@ -2299,7 +2398,10 @@ mod test {
         };
 
         let (client, backend_connection) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
 
@@ -2344,7 +2446,13 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let (client, _) = rbr.forward_response().await.expect("second forward failed");
+        let (client, _) = rbr
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
+            .await
+            .expect("second forward failed");
 
         let (_, fw) = client.into_parts();
 
@@ -2417,7 +2525,10 @@ mod test {
         };
 
         let (client, backend_connection) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
 
@@ -2464,7 +2575,10 @@ mod test {
         };
 
         let (client, _backend_connection) = rbr
-            .forward_response()
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
             .await
             .expect("failed to forward response");
 
