@@ -382,7 +382,7 @@ impl<FR, FW> BackendStreamError<FR, FW> {
 /// can be reused or closed.
 ///
 /// The required proxy headers (e.g. `Via`) are injected automatically by each
-/// `send_as_*` method — the caller does not need to add them manually.
+/// `send_as_*` method - the caller does not need to add them manually.
 pub struct PendingFrontendResponse<FW> {
     frontend_writer: FrontendWriter<FW>,
     options: ProxyOptions,
@@ -394,7 +394,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     /// injected automatically.
     ///
     /// Unlike the terminal `send_as_*` methods, this returns a fresh
-    /// [`PendingFrontendResponse`] because a 1xx response is non-terminal —
+    /// [`PendingFrontendResponse`] because a 1xx response is non-terminal -
     /// the frontend is still awaiting the final response to the same request.
     pub async fn send_informational(
         self,
@@ -525,7 +525,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponseBodyWriter<FW> {
     }
 
     /// Finish writing the response body. Returns the underlying
-    /// [`FrontendWriter`] — the terminal response is complete, and the
+    /// [`FrontendWriter`] - the terminal response is complete, and the
     /// frontend is no longer expecting a response on this request.
     pub async fn finish(self) -> Result<FrontendWriter<FW>, FrontendError> {
         self.body_writer.finish().await
@@ -1132,13 +1132,13 @@ where
 /// Headers that are always connection-scoped and must be removed before
 /// forwarding. See RFC 9110 and RFC 9112.
 ///
-/// - `Connection` — RFC 9110 7.6.1
-/// - `Keep-Alive` — RFC 9112 9.3
-/// - `Proxy-Authenticate` — RFC 9110 11.7.1 (consumed by the receiving proxy)
-/// - `Proxy-Authorization` — RFC 9110 11.7.2 (consumed by the receiving proxy)
-/// - `TE` — RFC 9110 10.1.4 (explicitly defined as a hop-by-hop field)
-/// - `Transfer-Encoding` — RFC 9112 6.1 (HTTP/1.1 transfer coding)
-/// - `Upgrade` — RFC 9110 7.8
+/// - `Connection` - RFC 9110 7.6.1
+/// - `Keep-Alive` - RFC 9112 9.3
+/// - `Proxy-Authenticate` - RFC 9110 11.7.1 (consumed by the receiving proxy)
+/// - `Proxy-Authorization` - RFC 9110 11.7.2 (consumed by the receiving proxy)
+/// - `TE` - RFC 9110 10.1.4 (explicitly defined as a hop-by-hop field)
+/// - `Transfer-Encoding` - RFC 9112 6.1 (HTTP/1.1 transfer coding)
+/// - `Upgrade` - RFC 9110 7.8
 const HOP_BY_HOP_HEADERS: &[&[u8]] = &[
     b"connection",
     b"keep-alive",
@@ -2408,7 +2408,7 @@ mod test {
         // Release the mutable borrow on frontend_writer before asserting.
         let (frontend_reader, _) = client.into_parts();
 
-        // content-length must be forwarded (RFC 9110 §15.4.5).
+        // content-length must be forwarded (RFC 9110 section 15.4.5).
         let expected = b"\
             HTTP/1.1 304 Not Modified\r\n\
             content-length: 512\r\n\
@@ -2421,7 +2421,7 @@ mod test {
         );
 
         // The backend connection must be positioned right at the start of the
-        // next response — no body bytes were consumed from the 304.
+        // next response - no body bytes were consumed from the 304.
         let mut frontend_writer = Vec::new();
         let proxy_client = ProxyClient::new(
             frontend_reader,
@@ -3007,7 +3007,7 @@ mod test {
     /// so the proxy can write a 400 Bad Request back to the client.
     #[tokio::test]
     async fn malformed_request_can_send_error_response() {
-        // A request line with no path or HTTP version — not parseable.
+        // A request line with no path or HTTP version - not parseable.
         let frontend_reader = b"GET\r\n\r\n";
         let mut frontend_writer = Vec::new();
 
