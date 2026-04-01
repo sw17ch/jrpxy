@@ -15,10 +15,7 @@ use jrpxy_body::BodyReadMode;
 use jrpxy_frontend::{
     error::FrontendError,
     reader::{FrontendBodyReader, FrontendBodyReaderKind, FrontendReader, FrontendRequest},
-    writer::{
-        FrontendBodyWriter, FrontendBodyWriterKind, FrontendBodylessBodyWriter,
-        FrontendChunkedBodyWriter, FrontendContentLengthBodyWriter, FrontendWriter,
-    },
+    writer::{FrontendBodyWriter, FrontendBodyWriterKind, FrontendWriter},
 };
 use jrpxy_http_message::{
     header::Headers,
@@ -421,7 +418,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     pub async fn send_as_chunked(
         self,
         mut response: Response,
-    ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -430,10 +427,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
         let body_writer = frontend_writer.send_as_chunked(&response).await?;
-        Ok(PendingFrontendResponseBodyWriter {
-            body_writer,
-            options,
-        })
+        Ok((options, body_writer))
     }
 
     /// Send the response with a content-length delimited body. Proxy headers
@@ -442,7 +436,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         self,
         mut response: Response,
         body_len: u64,
-    ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -453,10 +447,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         let body_writer = frontend_writer
             .send_as_content_length(&response, body_len)
             .await?;
-        Ok(PendingFrontendResponseBodyWriter {
-            body_writer,
-            options,
-        })
+        Ok((options, body_writer))
     }
 
     /// Send the response with no body, preserving any framing headers from
@@ -465,7 +456,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     pub async fn send_as_bodyless_keep_framing(
         self,
         mut response: Response,
-    ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -476,10 +467,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         let body_writer = frontend_writer
             .send_as_bodyless_keep_framing(&response)
             .await?;
-        Ok(PendingFrontendResponseBodyWriter {
-            body_writer,
-            options,
-        })
+        Ok((options, body_writer))
     }
 
     /// Send the response with no body and no framing headers (for
@@ -491,7 +479,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     pub async fn send_as_no_content(
         self,
         mut response: Response,
-    ) -> Result<PendingFrontendResponseBodyWriter<FW>, FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -500,150 +488,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
         let body_writer = frontend_writer.send_as_no_content(&response).await?;
-        Ok(PendingFrontendResponseBodyWriter {
-            body_writer,
-            options,
-        })
-    }
-}
-
-/// A frontend body writer produced by `send_as_*` methods on
-/// [`PendingFrontendResponse`].
-///
-/// Carries [`ProxyOptions`] through the body-write cycle so that
-/// [`BodyExchanger::finish`] can recover them for [`ProxyClient`] construction
-/// without needing to clone before consuming [`PendingFrontendResponse`].
-pub struct PendingFrontendResponseBodyWriter<FW> {
-    body_writer: FrontendBodyWriter<FW>,
-    options: ProxyOptions,
-}
-
-impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponseBodyWriter<FW> {
-    /// Write a chunk of the response body.
-    pub async fn write(&mut self, buf: &[u8]) -> Result<(), FrontendError> {
-        self.body_writer.write(buf).await
-    }
-
-    /// Finish writing the response body. Returns the underlying
-    /// [`FrontendWriter`] - the terminal response is complete, and the
-    /// frontend is no longer expecting a response on this request.
-    pub async fn finish(self) -> Result<FrontendWriter<FW>, FrontendError> {
-        self.body_writer.finish().await
-    }
-
-    /// Abort the response body, closing the connection.
-    pub async fn abort(self) -> Result<(), FrontendError> {
-        self.body_writer.abort().await
-    }
-
-    /// Decompose the writer into its framing-specific kind. Useful when the
-    /// caller needs access to trailer forwarding or other framing-specific
-    /// finish methods.
-    pub fn into_kind(self) -> (ProxyOptions, PendingFrontendResponseBodyWriterKind<FW>) {
-        let Self {
-            body_writer,
-            options,
-        } = self;
-        let k =
-            match body_writer.into_kind() {
-                FrontendBodyWriterKind::Bodyless(inner) => {
-                    PendingFrontendResponseBodyWriterKind::Bodyless(
-                        PendingFrontendBodylessBodyWriter { inner },
-                    )
-                }
-                FrontendBodyWriterKind::CL(inner) => PendingFrontendResponseBodyWriterKind::CL(
-                    PendingFrontendContentLengthBodyWriter { inner },
-                ),
-                FrontendBodyWriterKind::TE(inner) => {
-                    PendingFrontendResponseBodyWriterKind::TE(PendingFrontendChunkedBodyWriter {
-                        inner,
-                    })
-                }
-            };
-        (options, k)
-    }
-}
-
-/// Proxy-layer wrapper for [`FrontendBodylessBodyWriter`].
-pub struct PendingFrontendBodylessBodyWriter<FW> {
-    inner: FrontendBodylessBodyWriter<FW>,
-}
-
-impl<FW: AsyncWriteExt + Unpin> PendingFrontendBodylessBodyWriter<FW> {
-    pub fn finish(self) -> Result<FrontendWriter<FW>, FrontendError> {
-        self.inner.finish()
-    }
-}
-
-/// Proxy-layer wrapper for [`FrontendContentLengthBodyWriter`].
-pub struct PendingFrontendContentLengthBodyWriter<FW> {
-    inner: FrontendContentLengthBodyWriter<FW>,
-}
-
-impl<FW: AsyncWriteExt + Unpin> PendingFrontendContentLengthBodyWriter<FW> {
-    pub async fn write(&mut self, buf: &[u8]) -> Result<(), FrontendError> {
-        self.inner.write(buf).await
-    }
-
-    pub async fn finish(self) -> Result<FrontendWriter<FW>, FrontendError> {
-        self.inner.finish().await
-    }
-}
-
-/// Proxy-layer wrapper for [`FrontendChunkedBodyWriter`]. Finishing with
-/// trailers forwards them to the client as chunked trailer fields.
-pub struct PendingFrontendChunkedBodyWriter<FW> {
-    inner: FrontendChunkedBodyWriter<FW>,
-}
-
-impl<FW: AsyncWriteExt + Unpin> PendingFrontendChunkedBodyWriter<FW> {
-    pub async fn write(&mut self, buf: &[u8]) -> Result<(), FrontendError> {
-        self.inner.write(buf).await
-    }
-
-    pub async fn finish_with_trailers(
-        self,
-        trailers: &Headers,
-    ) -> Result<FrontendWriter<FW>, FrontendError> {
-        self.inner.finish_with_trailers(trailers).await
-    }
-
-    pub async fn finish(self) -> Result<FrontendWriter<FW>, FrontendError> {
-        self.inner.finish().await
-    }
-}
-
-/// The framing-specific body writer kind for a pending frontend response.
-///
-/// Produced by [`PendingFrontendResponseBodyWriter::into_kind`]. Each variant
-/// carries the framing-appropriate writer; finishing any variant yields a
-/// [`FrontendWriter`].
-pub enum PendingFrontendResponseBodyWriterKind<FW> {
-    Bodyless(PendingFrontendBodylessBodyWriter<FW>),
-    CL(PendingFrontendContentLengthBodyWriter<FW>),
-    TE(PendingFrontendChunkedBodyWriter<FW>),
-}
-
-impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponseBodyWriterKind<FW> {
-    pub async fn finish(self) -> Result<FrontendWriter<FW>, FrontendError> {
-        match self {
-            PendingFrontendResponseBodyWriterKind::Bodyless(w) => w.finish(),
-            PendingFrontendResponseBodyWriterKind::CL(w) => w.finish().await,
-            PendingFrontendResponseBodyWriterKind::TE(w) => w.finish().await,
-        }
-    }
-
-    /// Write a chunk of the response body.
-    pub async fn write(&mut self, buf: &[u8]) -> Result<(), FrontendError> {
-        match self {
-            PendingFrontendResponseBodyWriterKind::Bodyless(_w) => {
-                Err(FrontendError::BodyWriteError(
-                    jrpxy_body::BodyError::BodyOverflow(buf.len() as u64),
-                ))
-            }
-            PendingFrontendResponseBodyWriterKind::CL(w) => w.write(buf).await,
-            PendingFrontendResponseBodyWriterKind::TE(w) => w.write(buf).await,
-        }
+        Ok((options, body_writer))
     }
 }
 
@@ -898,7 +743,7 @@ where
         // (chunk-encoded) or if we can send back a content-length.
         let is_head = pending.client_options.is_head;
         let (response, backend_body_reader) = proxy_response.into_frontend_response();
-        let frontend_body_writer = match backend_body_reader.mode() {
+        let (options, frontend_body_writer) = match backend_body_reader.mode() {
             BodyReadMode::Chunk => pending.send_as_chunked(response).await?,
             BodyReadMode::ContentLength(cl) => pending.send_as_content_length(response, cl).await?,
             BodyReadMode::Bodyless => {
@@ -915,6 +760,7 @@ where
         };
 
         Ok(BodyExchanger {
+            options,
             frontend_body_reader,
             backend_body_writer,
             backend_body_reader,
@@ -928,10 +774,11 @@ where
 ///
 /// Produced by [`BackendResponse::forward_response_head`].
 pub struct BodyExchanger<FR, FW, BR, BW> {
+    options: ProxyOptions,
     frontend_body_reader: FrontendBodyReader<FR>,
     backend_body_writer: BackendBodyWriter<BW>,
     backend_body_reader: BackendBodyReader<BR>,
-    frontend_body_writer: PendingFrontendResponseBodyWriter<FW>,
+    frontend_body_writer: FrontendBodyWriter<FW>,
 }
 
 /// The individual body readers and writers that make up a [`BodyExchanger`].
@@ -941,6 +788,8 @@ pub struct BodyExchanger<FR, FW, BR, BW> {
 /// `tokio::select!` or `tokio::spawn`. See [`BodyExchanger::finish`] for a
 /// reference implementation.
 pub struct BodyExchangerParts<FR, FW, BR, BW> {
+    /// ProxyOptions governing behavior so far
+    pub options: ProxyOptions,
     /// Reads the request body from the frontend (f2b source).
     pub frontend_body_reader: FrontendBodyReader<FR>,
     /// Writes the request body to the backend (f2b sink).
@@ -948,7 +797,7 @@ pub struct BodyExchangerParts<FR, FW, BR, BW> {
     /// Reads the response body from the backend (b2f source).
     pub backend_body_reader: BackendBodyReader<BR>,
     /// Writes the response body to the frontend (b2f sink).
-    pub frontend_body_writer: PendingFrontendResponseBodyWriter<FW>,
+    pub frontend_body_writer: FrontendBodyWriter<FW>,
 }
 
 impl<FR, FW, BR, BW> BodyExchanger<FR, FW, BR, BW>
@@ -962,12 +811,14 @@ where
     /// responsible for driving the f2b and b2f copies concurrently.
     pub fn into_parts(self) -> BodyExchangerParts<FR, FW, BR, BW> {
         let Self {
+            options,
             frontend_body_reader,
             backend_body_writer,
             backend_body_reader,
             frontend_body_writer,
         } = self;
         BodyExchangerParts {
+            options,
             frontend_body_reader,
             backend_body_writer,
             backend_body_reader,
@@ -979,14 +830,15 @@ where
     /// [`ProxyClient`] ready for the next request.
     pub async fn finish(self) -> ProxyResult<(ProxyClient<FR, FW>, BackendConnection<BR, BW>)> {
         let Self {
+            options,
             mut frontend_body_reader,
             mut backend_body_writer,
             backend_body_reader,
             frontend_body_writer,
         } = self;
 
-        let (options, mut frontend_kind) = frontend_body_writer.into_kind();
         let body_chunk_size = options.body_chunk_size;
+        let mut frontend_kind = frontend_body_writer.into_kind();
         let mut backend_kind = backend_body_reader.into_kind();
 
         let f2b_fut = async move {
@@ -1041,10 +893,7 @@ where
                     Ok(None) => {
                         ret = async {
                             match (backend_kind, frontend_kind) {
-                                (
-                                    BackendBodyReaderKind::TE(br),
-                                    PendingFrontendResponseBodyWriterKind::TE(fw),
-                                ) => {
+                                (BackendBodyReaderKind::TE(br), FrontendBodyWriterKind::TE(fw)) => {
                                     let (next_backend, trailers) = br.drain().await?;
                                     let next_frontend = fw.finish_with_trailers(&trailers).await?;
                                     Ok((next_backend, next_frontend))
@@ -2797,7 +2646,7 @@ mod test {
             .expect("failed to build response")
             .into();
 
-        let body_writer = pending
+        let (_, body_writer) = pending
             .send_as_content_length(response, 0)
             .await
             .expect("send failed");
@@ -2879,7 +2728,7 @@ mod test {
             },
         };
         let forwarded = info.into_frontend_response();
-        let bw = pending
+        let (_, bw) = pending
             .send_as_no_content(forwarded)
             .await
             .expect("send failed");
@@ -2932,7 +2781,7 @@ mod test {
             .expect("failed to build 405 response")
             .into();
 
-        let body_writer = pending
+        let (_, body_writer) = pending
             .send_as_content_length(response, 0)
             .await
             .expect("failed to send error response");
@@ -2985,7 +2834,7 @@ mod test {
             .expect("failed to build 405 response")
             .into();
 
-        let body_writer = pending
+        let (_, body_writer) = pending
             .send_as_content_length(response, 0)
             .await
             .expect("failed to send error response");
@@ -3033,7 +2882,7 @@ mod test {
             .expect("failed to build 400 response")
             .into();
 
-        let body_writer = pending
+        let (_, body_writer) = pending
             .send_as_content_length(response, 0)
             .await
             .expect("failed to send error response");

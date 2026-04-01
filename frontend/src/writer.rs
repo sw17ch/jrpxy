@@ -316,6 +316,16 @@ pub enum FrontendBodyWriterKind<I> {
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendBodyWriterKind<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
+        match self {
+            FrontendBodyWriterKind::Bodyless(_) => Err(FrontendError::BodyWriteError(
+                jrpxy_body::BodyError::BodyOverflow(buf.len() as u64),
+            )),
+            FrontendBodyWriterKind::CL(w) => w.write(buf).await,
+            FrontendBodyWriterKind::TE(w) => w.write(buf).await,
+        }
+    }
+
     pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
         match self {
             FrontendBodyWriterKind::Bodyless(w) => w.finish(),
