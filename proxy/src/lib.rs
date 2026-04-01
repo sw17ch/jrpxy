@@ -831,27 +831,26 @@ where
     pub async fn finish(self) -> ProxyResult<(ProxyClient<FR, FW>, BackendConnection<BR, BW>)> {
         let Self {
             options,
-            mut frontend_body_reader,
-            mut backend_body_writer,
+            frontend_body_reader,
+            backend_body_writer,
             backend_body_reader,
             frontend_body_writer,
         } = self;
 
         let body_chunk_size = options.body_chunk_size;
-        let mut frontend_kind = frontend_body_writer.into_kind();
-        let mut backend_kind = backend_body_reader.into_kind();
+        let mut frontend_reader_kind = frontend_body_reader.into_kind();
+        let mut frontend_writer_kind = frontend_body_writer.into_kind();
+        let mut backend_reader_kind = backend_body_reader.into_kind();
+        let mut backend_writer_kind = backend_body_writer.into_kind();
 
         let f2b_fut = async move {
             let ret;
             loop {
-                let buf = match frontend_body_reader.read(body_chunk_size).await {
+                let buf = match frontend_reader_kind.read(body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
-                        let frontend_kind = frontend_body_reader.into_kind();
-                        let backend_kind = backend_body_writer.into_kind();
-
                         ret = async {
-                            match (frontend_kind, backend_kind) {
+                            match (frontend_reader_kind, backend_writer_kind) {
                                 (FrontendBodyReaderKind::TE(fr), BackendBodyWriterKind::TE(bw)) => {
                                     let (next_reader, trailers) = fr.drain().await?;
                                     let next_backend = bw.finish_with_trailers(&trailers).await?;
@@ -872,7 +871,7 @@ where
                         break;
                     }
                 };
-                match backend_body_writer.write(&buf).await {
+                match backend_writer_kind.write(&buf).await {
                     Ok(()) => {
                         // successfuly wrote buffer; loop around for another one
                     }
@@ -888,11 +887,11 @@ where
         let b2f_fut = async move {
             let ret;
             loop {
-                let buf = match backend_kind.read(body_chunk_size).await {
+                let buf = match backend_reader_kind.read(body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
                         ret = async {
-                            match (backend_kind, frontend_kind) {
+                            match (backend_reader_kind, frontend_writer_kind) {
                                 (BackendBodyReaderKind::TE(br), FrontendBodyWriterKind::TE(fw)) => {
                                     let (next_backend, trailers) = br.drain().await?;
                                     let next_frontend = fw.finish_with_trailers(&trailers).await?;
@@ -913,7 +912,7 @@ where
                         break;
                     }
                 };
-                match frontend_kind.write(&buf).await {
+                match frontend_writer_kind.write(&buf).await {
                     Ok(()) => {}
                     Err(e) => {
                         ret = Err(ProxyCopyError::from(e));

@@ -179,6 +179,16 @@ pub enum BackendBodyWriterKind<I> {
 }
 
 impl<I: AsyncWriteExt + Unpin> BackendBodyWriterKind<I> {
+    pub async fn write(&mut self, buf: &bytes::Bytes) -> BackendResult<()> {
+        match self {
+            BackendBodyWriterKind::Bodyless(_) => Err(BackendError::BodyWriteError(
+                jrpxy_body::BodyError::BodyOverflow(buf.len() as u64),
+            )),
+            BackendBodyWriterKind::CL(w) => w.write(buf).await,
+            BackendBodyWriterKind::TE(w) => w.write(buf).await,
+        }
+    }
+
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
         match self {
             BackendBodyWriterKind::Bodyless(w) => w.finish(),
