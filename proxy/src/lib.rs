@@ -32,6 +32,310 @@ pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
 pub use crate::error::ProxyFrontendError;
 
+/// Options used to govern the behavior of a [`ProxyClient`]
+#[derive(Debug)]
+pub struct ProxyOptions {
+    pub max_backend_head_length: usize,
+    pub body_chunk_size: usize,
+    /// TODO: make a builder for ProxyOptions so that we can validate
+    /// `received_by` doesn't contain something like \r\n which would do bad
+    /// things when inserting it into the `Via` header.
+    pub received_by: Cow<'static, str>,
+}
+
+/// Initial state of a proxied request. It transitions to either
+/// [`RequestReceived`] or [`FrontendRequestError`] by calling the
+/// [`ProxyClient::start()`] method.
+///
+/// The contained frontend writer is fully flushed, and the frontend reader is
+/// expected to be fully drained. Assuming a well behaved client and server, it
+/// is safe to extract the reader and writer using
+/// [`ProxyClient::into_parts()`].
+pub struct ProxyClient<FR, FW> {
+    frontend_reader: FrontendReader<FR>,
+    frontend_writer: FrontendWriter<FW>,
+    options: ProxyOptions,
+}
+
+impl<FR, FW> ProxyClient<FR, FW> {
+    pub fn into_parts(self) -> (FrontendReader<FR>, FrontendWriter<FW>) {
+        let Self {
+            frontend_reader,
+            frontend_writer,
+            options: _,
+        } = self;
+        (frontend_reader, frontend_writer)
+    }
+}
+
+impl<FR, FW> ProxyClient<FR, FW>
+where
+    FR: AsyncReadExt + Unpin,
+    FW: AsyncWriteExt + Unpin,
+{
+    /// Create a new [`ProxyClient`] from a frontend reader that is aligned to
+    /// the start of a new request, and a frontend writer that is fully flushed.
+    pub fn new(
+        frontend_reader: FrontendReader<FR>,
+        frontend_writer: FrontendWriter<FW>,
+        options: ProxyOptions,
+    ) -> Self {
+        Self {
+            frontend_reader,
+            frontend_writer,
+            options,
+        }
+    }
+
+    /// Start the proxy transaction by attempting to read and verify a request
+    /// from the frontend reader. Transitions to [`RequestReceived`] on success,
+    /// or [`FrontendRequestError`] on failure.
+    pub async fn start(self) -> Result<RequestReceived<FR, FW>, FrontendRequestError<FR, FW>> {
+        let Self {
+            frontend_reader,
+            frontend_writer,
+            options,
+        } = self;
+
+        let req = match frontend_reader.read().await {
+            Ok(req) => req,
+            Err(error) => {
+                return Err(FrontendRequestError::new_frontend(
+                    frontend_writer,
+                    options,
+                    HttpVersion::Http11,
+                    error,
+                ));
+            }
+        };
+
+        let proxy_request = ProxyRequest::new(req, &options.received_by);
+        let method = proxy_request.req().method();
+        let is_head = method == b"HEAD".as_slice();
+        let version = proxy_request.req().version();
+
+        if method == b"CONNECT".as_slice() {
+            return Err(FrontendRequestError::new_request(
+                frontend_writer,
+                options,
+                version,
+                proxy_request,
+                ProxyFrontendError::ConnectNotSupported,
+            ));
+        }
+        if method == b"TRACE".as_slice() {
+            return Err(FrontendRequestError::new_request(
+                frontend_writer,
+                options,
+                version,
+                proxy_request,
+                ProxyFrontendError::TraceNotSupported,
+            ));
+        }
+
+        Ok(RequestReceived {
+            proxy_request,
+            pending: PendingFrontendResponse {
+                frontend_writer,
+                options,
+                client_options: ClientOptions { is_head, version },
+            },
+        })
+    }
+}
+
+/// A valid request has been received from the frontend. We can forward this
+/// request to a backend using [`RequestReceived::write_backend_request`]. This
+/// will transition to [`RequestForwarded`] on success or
+/// [`BackendRequestError`] on failure.
+pub struct RequestReceived<FR, FW> {
+    proxy_request: ProxyRequest<FR>,
+    pending: PendingFrontendResponse<FW>,
+}
+
+impl<FR, FW> RequestReceived<FR, FW> {
+    pub fn as_proxy_request(&self) -> &ProxyRequest<FR> {
+        &self.proxy_request
+    }
+    pub fn as_proxy_request_mut(&mut self) -> &mut ProxyRequest<FR> {
+        &mut self.proxy_request
+    }
+}
+
+impl<FR, FW> RequestReceived<FR, FW>
+where
+    FW: AsyncWriteExt + Unpin,
+{
+    /// Write the request to the backend connection.
+    ///
+    /// The backend reader and writer are taken here, allowing the caller to
+    /// select the backend based on the request (e.g. by hostname or path)
+    /// after inspecting the request via [`RequestReceived::as_proxy_request`].
+    ///
+    /// On error, returns a [`BackendRequestError`] holding the request and
+    /// frontend state. Use [`BackendRequestError::retry_backend_request`] to
+    /// try a different backend, or write an error response to the client via
+    /// `frontend_writer`. The failed backend connection is discarded.
+    pub async fn write_backend_request<BR, BW>(
+        self,
+        backend_connection: BackendConnection<BR, BW>,
+    ) -> Result<RequestForwarded<FR, FW, BR, BW>, BackendRequestError<FR, FW>>
+    where
+        BR: AsyncReadExt + Unpin,
+        BW: AsyncWriteExt + Unpin,
+    {
+        let Self {
+            proxy_request,
+            pending,
+        } = self;
+
+        let (backend_reader, backend_writer) = backend_connection;
+        let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
+
+        let write_result = match frontend_body_reader.mode() {
+            BodyReadMode::Chunk => backend_writer.send_as_chunked(&backend_request).await,
+            BodyReadMode::ContentLength(cl) => {
+                backend_writer
+                    .send_as_content_length(&backend_request, cl)
+                    .await
+            }
+            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&backend_request).await,
+        };
+
+        match write_result {
+            Ok(backend_body_writer) => Ok(RequestForwarded {
+                request: backend_request,
+                frontend_body_reader,
+                pending,
+                backend_reader,
+                backend_body_writer,
+            }),
+            Err(error) => Err(BackendRequestError {
+                request: backend_request,
+                frontend_body_reader,
+                pending,
+                error,
+            }),
+        }
+    }
+}
+
+/// Returned when [`ProxyClient::start`] fails.
+pub enum FrontendRequestError<FR, FW> {
+    /// The frontend sent a request that could not be parsed.
+    Frontend(FrontendRequestErrorKindRead<FW>),
+    /// The frontend sent a valid request that the proxy refuses to handle.
+    Request(FrontendRequestErrorKindRequest<FR, FW>),
+}
+
+impl<FR, FW> FrontendRequestError<FR, FW> {
+    /// Convenience method to construct a new request error.
+    fn new_request(
+        frontend_writer: FrontendWriter<FW>,
+        options: ProxyOptions,
+        version: HttpVersion,
+        proxy_request: ProxyRequest<FR>,
+        error: ProxyFrontendError,
+    ) -> FrontendRequestError<FR, FW> {
+        Self::Request(FrontendRequestErrorKindRequest {
+            pending: PendingFrontendResponse {
+                frontend_writer,
+                options,
+                client_options: ClientOptions {
+                    is_head: false,
+                    version,
+                },
+            },
+            reader: proxy_request,
+            error,
+        })
+    }
+
+    fn new_frontend(
+        frontend_writer: FrontendWriter<FW>,
+        options: ProxyOptions,
+        version: HttpVersion,
+        error: FrontendError,
+    ) -> FrontendRequestError<FR, FW> {
+        FrontendRequestError::Frontend(FrontendRequestErrorKindRead {
+            pending: PendingFrontendResponse {
+                frontend_writer,
+                options,
+                client_options: ClientOptions {
+                    is_head: false,
+                    version,
+                },
+            },
+            error,
+        })
+    }
+}
+
+impl<FR, FW> std::fmt::Debug for FrontendRequestError<FR, FW> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Frontend(arg0) => f.debug_tuple("Frontend").field(&arg0.error).finish(),
+            Self::Request(arg0) => f.debug_tuple("Request").field(&arg0.error).finish(),
+        }
+    }
+}
+
+impl<FR, FW> From<FrontendRequestError<FR, FW>> for ProxyError {
+    fn from(value: FrontendRequestError<FR, FW>) -> Self {
+        match value {
+            FrontendRequestError::Frontend(read) => ProxyError::FrontendError(read.error),
+            FrontendRequestError::Request(request) => ProxyError::ProxyFrontend(request.error),
+        }
+    }
+}
+
+/// An error occurred while reading the request from the frontend. We cannot
+/// recover the reader, but we can write something back.
+pub struct FrontendRequestErrorKindRead<FW> {
+    pending: PendingFrontendResponse<FW>,
+    error: FrontendError,
+}
+
+impl<FW> FrontendRequestErrorKindRead<FW> {
+    pub fn error(&self) -> &FrontendError {
+        &self.error
+    }
+
+    /// Consumes the error and returns a [`PendingFrontendResponse`] so the
+    /// caller can send an error response to the frontend client.
+    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
+        self.pending
+    }
+}
+
+/// A valid request was received from the frontend, but there is a semantic
+/// problem exists with that request. We can still send back an error message,
+/// and optionally drain the body so that we can keep the connection open.
+pub struct FrontendRequestErrorKindRequest<FR, FW> {
+    pending: PendingFrontendResponse<FW>,
+    reader: ProxyRequest<FR>,
+    error: ProxyFrontendError,
+}
+
+impl<FR, FW> FrontendRequestErrorKindRequest<FR, FW> {
+    pub fn error(&self) -> &ProxyFrontendError {
+        &self.error
+    }
+
+    /// Consumes the error and returns a [`PendingFrontendResponse`] along with
+    /// the [`FrontendBodyReader`] so the caller can send an error response to
+    /// the frontend client. This also allows the user to possibly drain the
+    /// request from the client so that the connection can be reused.
+    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, ProxyRequest<FR>) {
+        let Self {
+            pending,
+            reader,
+            error: _,
+        } = self;
+        (pending, reader)
+    }
+}
+
 /// Returned when writing the request head to the backend fails.
 ///
 /// Holds the decomposed request so the caller can retry with a different
@@ -585,113 +889,6 @@ where
 
 type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
 
-/// Returned when [`ProxyClient::start`] fails.
-pub enum FrontendRequestError<FR, FW> {
-    /// The frontend sent a request that could not be parsed.
-    Frontend(FrontendRequestErrorKindRead<FW>),
-    /// The frontend sent a valid request that the proxy refuses to handle.
-    Request(FrontendRequestErrorKindRequest<FR, FW>),
-}
-
-impl<FR, FW> FrontendRequestError<FR, FW> {
-    /// Convenience method to construct a new request error.
-    fn new_request(
-        frontend_writer: FrontendWriter<FW>,
-        options: ProxyOptions,
-        version: HttpVersion,
-        proxy_request: ProxyRequest<FR>,
-        error: ProxyFrontendError,
-    ) -> FrontendRequestError<FR, FW> {
-        Self::Request(FrontendRequestErrorKindRequest {
-            pending: PendingFrontendResponse {
-                frontend_writer,
-                options,
-                client_options: ClientOptions {
-                    is_head: false,
-                    version,
-                },
-            },
-            reader: proxy_request,
-            error,
-        })
-    }
-}
-
-impl<FR, FW> std::fmt::Debug for FrontendRequestError<FR, FW> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Frontend(arg0) => f.debug_tuple("Frontend").field(&arg0.error).finish(),
-            Self::Request(arg0) => f.debug_tuple("Request").field(&arg0.error).finish(),
-        }
-    }
-}
-
-impl<FR, FW> From<FrontendRequestError<FR, FW>> for ProxyError {
-    fn from(value: FrontendRequestError<FR, FW>) -> Self {
-        match value {
-            FrontendRequestError::Frontend(read) => ProxyError::FrontendError(read.error),
-            FrontendRequestError::Request(request) => ProxyError::ProxyFrontend(request.error),
-        }
-    }
-}
-
-/// An error occurred while reading the request from the frontend. We cannot
-/// recover the reader, but we can write something back.
-pub struct FrontendRequestErrorKindRead<FW> {
-    pending: PendingFrontendResponse<FW>,
-    error: FrontendError,
-}
-
-impl<FW> FrontendRequestErrorKindRead<FW> {
-    pub fn error(&self) -> &FrontendError {
-        &self.error
-    }
-
-    /// Consumes the error and returns a [`PendingFrontendResponse`] so the
-    /// caller can send an error response to the frontend client.
-    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
-        self.pending
-    }
-}
-
-/// A valid request was received from the frontend, but there is a semantic
-/// problem exists with that request. We can still send back an error message,
-/// and optionally drain the body so that we can keep the connection open.
-pub struct FrontendRequestErrorKindRequest<FR, FW> {
-    pending: PendingFrontendResponse<FW>,
-    reader: ProxyRequest<FR>,
-    error: ProxyFrontendError,
-}
-
-impl<FR, FW> FrontendRequestErrorKindRequest<FR, FW> {
-    pub fn error(&self) -> &ProxyFrontendError {
-        &self.error
-    }
-
-    /// Consumes the error and returns a [`PendingFrontendResponse`] along with
-    /// the [`FrontendBodyReader`] so the caller can send an error response to
-    /// the frontend client. This also allows the user to possibly drain the
-    /// request from the client so that the connection can be reused.
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, ProxyRequest<FR>) {
-        let Self {
-            pending,
-            reader,
-            error: _,
-        } = self;
-        (pending, reader)
-    }
-}
-
-#[derive(Debug)]
-pub struct ProxyOptions {
-    pub max_backend_head_length: usize,
-    pub body_chunk_size: usize,
-    /// TODO: make a builder for ProxyOptions so that we can validate
-    /// `received_by` doesn't contain something like \r\n which would do bad
-    /// things when inserting it into the `Via` header.
-    pub received_by: Cow<'static, str>,
-}
-
 #[derive(Clone, Copy, Debug)]
 struct ClientOptions {
     is_head: bool,
@@ -704,173 +901,6 @@ impl Default for ProxyOptions {
             max_backend_head_length: 8192,
             body_chunk_size: 8192,
             received_by: Cow::Borrowed("jrpxy"),
-        }
-    }
-}
-
-pub struct ProxyClient<FR, FW> {
-    frontend_reader: FrontendReader<FR>,
-    frontend_writer: FrontendWriter<FW>,
-    options: ProxyOptions,
-}
-
-impl<FR, FW> ProxyClient<FR, FW> {
-    pub fn into_parts(self) -> (FrontendReader<FR>, FrontendWriter<FW>) {
-        let Self {
-            frontend_reader,
-            frontend_writer,
-            options: _,
-        } = self;
-        (frontend_reader, frontend_writer)
-    }
-}
-
-impl<FR, FW> ProxyClient<FR, FW>
-where
-    FR: AsyncReadExt + Unpin,
-    FW: AsyncWriteExt + Unpin,
-{
-    pub fn new(
-        frontend_reader: FrontendReader<FR>,
-        frontend_writer: FrontendWriter<FW>,
-        options: ProxyOptions,
-    ) -> Self {
-        Self {
-            frontend_reader,
-            frontend_writer,
-            options,
-        }
-    }
-
-    pub async fn start(self) -> Result<RequestReceived<FR, FW>, FrontendRequestError<FR, FW>> {
-        let Self {
-            frontend_reader,
-            frontend_writer,
-            options,
-        } = self;
-
-        let req = match frontend_reader.read().await {
-            Ok(req) => req,
-            Err(error) => {
-                return Err(FrontendRequestError::Frontend(
-                    FrontendRequestErrorKindRead {
-                        pending: PendingFrontendResponse {
-                            frontend_writer,
-                            options,
-                            client_options: ClientOptions {
-                                is_head: false,
-                                version: HttpVersion::Http11,
-                            },
-                        },
-                        error,
-                    },
-                ));
-            }
-        };
-
-        let proxy_request = ProxyRequest::new(req, &options.received_by);
-        let method = proxy_request.req().method();
-        let is_head = method == b"HEAD".as_slice();
-        let version = proxy_request.req().version();
-
-        if method == b"CONNECT".as_slice() {
-            return Err(FrontendRequestError::new_request(
-                frontend_writer,
-                options,
-                version,
-                proxy_request,
-                ProxyFrontendError::ConnectNotSupported,
-            ));
-        }
-        if method == b"TRACE".as_slice() {
-            return Err(FrontendRequestError::new_request(
-                frontend_writer,
-                options,
-                version,
-                proxy_request,
-                ProxyFrontendError::TraceNotSupported,
-            ));
-        }
-
-        Ok(RequestReceived {
-            proxy_request,
-            pending: PendingFrontendResponse {
-                frontend_writer,
-                options,
-                client_options: ClientOptions { is_head, version },
-            },
-        })
-    }
-}
-
-pub struct RequestReceived<FR, FW> {
-    proxy_request: ProxyRequest<FR>,
-    pending: PendingFrontendResponse<FW>,
-}
-
-impl<FR, FW> RequestReceived<FR, FW> {
-    pub fn as_proxy_request(&self) -> &ProxyRequest<FR> {
-        &self.proxy_request
-    }
-    pub fn as_proxy_request_mut(&mut self) -> &mut ProxyRequest<FR> {
-        &mut self.proxy_request
-    }
-}
-
-impl<FR, FW> RequestReceived<FR, FW>
-where
-    FW: AsyncWriteExt + Unpin,
-{
-    /// Write the request to the backend connection.
-    ///
-    /// The backend reader and writer are taken here, allowing the caller to
-    /// select the backend based on the request (e.g. by hostname or path)
-    /// after inspecting the request via [`RequestReceived::as_proxy_request`].
-    ///
-    /// On error, returns a [`BackendRequestError`] holding the request and
-    /// frontend state. Use [`BackendRequestError::retry_backend_request`] to
-    /// try a different backend, or write an error response to the client via
-    /// `frontend_writer`. The failed backend connection is discarded.
-    pub async fn write_backend_request<BR, BW>(
-        self,
-        backend_connection: BackendConnection<BR, BW>,
-    ) -> Result<RequestForwarded<FR, FW, BR, BW>, BackendRequestError<FR, FW>>
-    where
-        BR: AsyncReadExt + Unpin,
-        BW: AsyncWriteExt + Unpin,
-    {
-        let Self {
-            proxy_request,
-            pending,
-        } = self;
-
-        let (backend_reader, backend_writer) = backend_connection;
-        let (backend_request, frontend_body_reader) = proxy_request.into_backend_request();
-
-        let write_result = match frontend_body_reader.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(&backend_request).await,
-            BodyReadMode::ContentLength(cl) => {
-                backend_writer
-                    .send_as_content_length(&backend_request, cl)
-                    .await
-            }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&backend_request).await,
-        };
-
-        match write_result {
-            Ok(backend_body_writer) => Ok(RequestForwarded {
-                request: backend_request,
-                frontend_body_reader,
-                pending,
-                backend_reader,
-                backend_body_writer,
-            }),
-            Err(error) => Err(BackendRequestError {
-                request: backend_request,
-                frontend_body_reader,
-                pending,
-                error,
-            }),
         }
     }
 }
