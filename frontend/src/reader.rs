@@ -21,8 +21,8 @@
 //!         abcde";
 //!
 //!     // Read the first request in the pipeline
-//!     let frontend_reader = FrontendReader::new(&buf[..], 8192);
-//!     let frontend_request = frontend_reader.read().await.expect("invalid request");
+//!     let frontend_reader = FrontendReader::new(&buf[..]);
+//!     let frontend_request = frontend_reader.read(8192).await.expect("invalid request");
 //!     let (request, mut frontend_body_reader) = frontend_request.into_parts();
 //!
 //!     let body = frontend_body_reader.read(20).await.unwrap().unwrap();
@@ -30,7 +30,7 @@
 //!     let frontend_reader = frontend_body_reader.drain().await.unwrap();
 //!
 //!     // Read the second request in the pipeline
-//!     let frontend_request = frontend_reader.read().await.expect("invalid request");
+//!     let frontend_request = frontend_reader.read(128).await.expect("invalid request");
 //!     let (request, mut frontend_body_reader) = frontend_request.into_parts();
 //!
 //!     let body = frontend_body_reader.read(20).await.unwrap().unwrap();
@@ -59,7 +59,6 @@ use crate::error::{FrontendError, FrontendResult};
 #[derive(Debug)]
 pub struct FrontendReader<I> {
     io_buffer: IoBuffer<I>,
-    max_head_length: usize,
     parse_slots: ParseSlots,
 }
 
@@ -67,7 +66,6 @@ impl<I> FrontendReader<I> {
     pub fn into_inner(self) -> IoBuffer<I> {
         let Self {
             io_buffer,
-            max_head_length: _,
             parse_slots: _,
         } = self;
         io_buffer
@@ -87,24 +85,20 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
     const MAX_HEADERS: usize = 256;
     const HEAD_FILL_LEN: usize = 4096;
 
-    /// Createa a new [`FrontendReader`].
-    pub fn new(io: I, max_head_length: usize) -> Self {
-        Self::new_with_buffer(
-            IoBuffer::new_with_fill_len(io, Self::HEAD_FILL_LEN),
-            max_head_length,
-        )
+    /// Create a new [`FrontendReader`].
+    pub fn new(io: I) -> Self {
+        Self::new_with_buffer(IoBuffer::new_with_fill_len(io, Self::HEAD_FILL_LEN))
     }
 
-    pub fn new_with_buffer(io: IoBuffer<I>, max_head_length: usize) -> FrontendReader<I> {
+    pub fn new_with_buffer(io: IoBuffer<I>) -> FrontendReader<I> {
         Self {
             io_buffer: io,
-            max_head_length,
             parse_slots: ParseSlots::new(Self::MAX_HEADERS),
         }
     }
 
-    /// Wait for the full frontend head to be available
-    pub(crate) async fn head(&mut self) -> FrontendResult<Request> {
+    /// Wait for the full frontend head to be available.
+    pub(crate) async fn head(&mut self, max_head_length: usize) -> FrontendResult<Request> {
         loop {
             if let Some(req) = self
                 .parse_slots
@@ -112,17 +106,17 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
                 .map_err(FrontendError::HttpRequestParseError)?
             {
                 return Ok(req);
-            } else if self.io_buffer.len() >= self.max_head_length {
+            } else if self.io_buffer.len() >= max_head_length {
                 return Err(FrontendError::MaxHeadLenExceeded(
                     self.io_buffer.len(),
-                    self.max_head_length,
+                    max_head_length,
                 ));
             }
 
             let first_read = self.io_buffer.is_empty();
 
             // read some data into the buffer
-            let target_read_len = self.max_head_length.saturating_sub(self.io_buffer.len());
+            let target_read_len = max_head_length.saturating_sub(self.io_buffer.len());
             let len = self
                 .io_buffer
                 .read_with_len(target_read_len)
@@ -142,33 +136,23 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
     }
 
     /// Read a request from the frontend.
-    pub async fn read(mut self) -> FrontendResult<FrontendRequest<I>> {
-        let req = self.head().await?;
+    pub async fn read(mut self, max_head_length: usize) -> FrontendResult<FrontendRequest<I>> {
+        let req = self.head(max_head_length).await?;
         let Self {
             io_buffer,
-            max_head_length,
             parse_slots,
         } = self;
 
         let reader = match req.framing()? {
-            ParsedFraming::Length(cl) => FrontendBodyReader::new(
-                io_buffer,
-                max_head_length,
-                BodyReadMode::ContentLength(cl),
-                parse_slots,
-            ),
-            ParsedFraming::Chunked => FrontendBodyReader::new(
-                io_buffer,
-                max_head_length,
-                BodyReadMode::Chunk,
-                parse_slots,
-            ),
-            ParsedFraming::NoFraming => FrontendBodyReader::new(
-                io_buffer,
-                max_head_length,
-                BodyReadMode::Bodyless,
-                parse_slots,
-            ),
+            ParsedFraming::Length(cl) => {
+                FrontendBodyReader::new(io_buffer, BodyReadMode::ContentLength(cl), parse_slots)
+            }
+            ParsedFraming::Chunked => {
+                FrontendBodyReader::new(io_buffer, BodyReadMode::Chunk, parse_slots)
+            }
+            ParsedFraming::NoFraming => {
+                FrontendBodyReader::new(io_buffer, BodyReadMode::Bodyless, parse_slots)
+            }
         };
 
         Ok(FrontendRequest { req, reader })
@@ -212,26 +196,17 @@ impl<I> FrontendRequest<I> {
 /// Frontend wrapper for [`BodylessBodyReader`].
 pub struct FrontendBodylessBodyReader<I> {
     inner: BodylessBodyReader<I>,
-    max_head_length: usize,
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendBodylessBodyReader<I> {
     pub fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        let Self {
-            inner,
-            max_head_length,
-        } = self;
-        Ok(FrontendReader::new_with_buffer(
-            inner.drain(),
-            max_head_length,
-        ))
+        Ok(FrontendReader::new_with_buffer(self.inner.drain()))
     }
 }
 
 /// Frontend wrapper for [`ContentLengthBodyReader`].
 pub struct FrontendContentLengthBodyReader<I> {
     inner: ContentLengthBodyReader<I>,
-    max_head_length: usize,
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendContentLengthBodyReader<I> {
@@ -243,12 +218,12 @@ impl<I: AsyncReadExt + Unpin> FrontendContentLengthBodyReader<I> {
     }
 
     pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        let Self {
-            inner,
-            max_head_length,
-        } = self;
-        let io = inner.drain().await.map_err(FrontendError::BodyReadError)?;
-        Ok(FrontendReader::new_with_buffer(io, max_head_length))
+        let io = self
+            .inner
+            .drain()
+            .await
+            .map_err(FrontendError::BodyReadError)?;
+        Ok(FrontendReader::new_with_buffer(io))
     }
 }
 
@@ -256,7 +231,6 @@ impl<I: AsyncReadExt + Unpin> FrontendContentLengthBodyReader<I> {
 /// new [`FrontendReader`] and the trailers from the chunked body.
 pub struct FrontendChunkedBodyReader<I> {
     inner: ChunkedBodyReader<I>,
-    max_head_length: usize,
 }
 
 impl<I> FrontendChunkedBodyReader<I> {
@@ -274,15 +248,12 @@ impl<I: AsyncReadExt + Unpin> FrontendChunkedBodyReader<I> {
     }
 
     pub async fn drain(self) -> FrontendResult<(FrontendReader<I>, Headers)> {
-        let Self {
-            inner,
-            max_head_length,
-        } = self;
-        let (io, trailers) = inner.drain().await.map_err(FrontendError::BodyReadError)?;
-        Ok((
-            FrontendReader::new_with_buffer(io, max_head_length),
-            trailers,
-        ))
+        let (io, trailers) = self
+            .inner
+            .drain()
+            .await
+            .map_err(FrontendError::BodyReadError)?;
+        Ok((FrontendReader::new_with_buffer(io), trailers))
     }
 }
 
@@ -319,7 +290,6 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReaderKind<I> {
 
 /// A frontend request body reader.
 pub struct FrontendBodyReader<I> {
-    max_head_length: usize,
     reader: BodyReader<I>,
 }
 
@@ -329,40 +299,24 @@ impl<I> FrontendBodyReader<I> {
     }
 
     pub fn into_kind(self) -> FrontendBodyReaderKind<I> {
-        let Self {
-            max_head_length,
-            reader,
-        } = self;
+        let Self { reader } = self;
         match reader.into_kind() {
             BodyReaderKind::Bodyless(inner) => {
-                FrontendBodyReaderKind::Bodyless(FrontendBodylessBodyReader {
-                    inner,
-                    max_head_length,
-                })
+                FrontendBodyReaderKind::Bodyless(FrontendBodylessBodyReader { inner })
             }
             BodyReaderKind::CL(inner) => {
-                FrontendBodyReaderKind::CL(FrontendContentLengthBodyReader {
-                    inner,
-                    max_head_length,
-                })
+                FrontendBodyReaderKind::CL(FrontendContentLengthBodyReader { inner })
             }
-            BodyReaderKind::TE(inner) => FrontendBodyReaderKind::TE(FrontendChunkedBodyReader {
-                inner,
-                max_head_length,
-            }),
+            BodyReaderKind::TE(inner) => {
+                FrontendBodyReaderKind::TE(FrontendChunkedBodyReader { inner })
+            }
         }
     }
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
-    fn new(
-        io: IoBuffer<I>,
-        max_head_length: usize,
-        mode: BodyReadMode,
-        parse_slots: ParseSlots,
-    ) -> Self {
+    fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         Self {
-            max_head_length,
             reader: BodyReader::new(io, mode, parse_slots),
         }
     }
@@ -390,26 +344,23 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
     /// Drain all remaining bytes from the body and return a new
     /// [`FrontendReader`] ready to read the next request in the pipeline.
     pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        let max_head_len = self.max_head_length;
         let io = self
             .reader
             .drain()
             .await
             .map_err(FrontendError::BodyReadError)?;
-        Ok(FrontendReader::new_with_buffer(io, max_head_len))
+        Ok(FrontendReader::new_with_buffer(io))
     }
 }
 
 /// A frontend request body reader with peek support.
 pub struct FrontendPeekableBodyReader<I> {
-    max_head_length: usize,
     reader: PeekableBodyReader<I>,
 }
 
 impl<I> FrontendPeekableBodyReader<I> {
     pub fn new(reader: FrontendBodyReader<I>) -> Self {
         Self {
-            max_head_length: reader.max_head_length,
             reader: reader.reader.peekable(),
         }
     }
@@ -447,13 +398,12 @@ impl<I: AsyncReadExt + Unpin> FrontendPeekableBodyReader<I> {
     /// Drain all remaining bytes from the body and return a new
     /// [`FrontendReader`] ready to read the next request in the pipeline.
     pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        let max_head_len = self.max_head_length;
         let io = self
             .reader
             .drain()
             .await
             .map_err(FrontendError::BodyReadError)?;
-        Ok(FrontendReader::new_with_buffer(io, max_head_len))
+        Ok(FrontendReader::new_with_buffer(io))
     }
 }
 
@@ -477,9 +427,9 @@ mod test {
             extra bytes\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         let (req, mut body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -506,9 +456,9 @@ mod test {
             extra bytes\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         let (req, body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -554,9 +504,9 @@ mod test {
             extra bytes\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         let (req, mut body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -598,9 +548,9 @@ mod test {
             01234\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         let (req, body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -610,7 +560,7 @@ mod test {
         // first request finished. get another reader out for the following request
         let reader = body.drain().await.unwrap();
         let (req, mut body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -628,9 +578,9 @@ mod test {
             Some-Header: xxx\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         assert!(matches!(
-            reader.read().await,
+            reader.read(128).await,
             Err(FrontendError::UnexpectedEOF)
         ));
     }
@@ -645,9 +595,9 @@ mod test {
             012\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         let (req, mut body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -675,9 +625,9 @@ mod test {
             3;extensions=su\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         let (_req, mut body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -696,9 +646,9 @@ mod test {
             01\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         let (_req, body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -723,9 +673,9 @@ mod test {
             first-trai\
             ";
 
-        let reader = FrontendReader::new(buf.as_slice(), 128);
+        let reader = FrontendReader::new(buf.as_slice());
         let (req, body) = reader
-            .read()
+            .read(128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -771,9 +721,9 @@ mod test {
         });
 
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
-            let reader = FrontendReader::new(right, 128);
+            let reader = FrontendReader::new(right);
             let (req, body) = reader
-                .read()
+                .read(128)
                 .await
                 .expect("can't break into parts")
                 .into_parts();
@@ -824,9 +774,9 @@ mod test {
         });
 
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
-            let reader = FrontendReader::new(right, 128);
+            let reader = FrontendReader::new(right);
             let (req, body) = reader
-                .read()
+                .read(128)
                 .await
                 .expect("can't break into parts")
                 .into_parts();
