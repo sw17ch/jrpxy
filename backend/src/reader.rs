@@ -698,7 +698,7 @@ mod test {
     #[tokio::test]
     async fn backend_has_no_framing_headers() {
         let buf = b"\
-            HTTP/1.1 200 Ok\r\n\
+            HTTP/1.1 204 No Content\r\n\
             \r\n\
             ";
 
@@ -789,6 +789,7 @@ mod test {
             \r\n\
             HTTP/1.1 200 Ok\r\n\
             x-res: 3\r\n\
+            content-length: 0\r\n\
             \r\n\
             ";
 

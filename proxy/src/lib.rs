@@ -2607,6 +2607,7 @@ mod test {
             Connection: x-server-hop\r\n\
             X-Server-Hop: value\r\n\
             X-Keep: value\r\n\
+            content-length: 0\r\n\
             \r\n";
 
         let pr = into_response(make_proxy_response(raw).await);
@@ -2914,6 +2915,7 @@ mod test {
             \r\n\
             HTTP/1.1 200 Ok\r\n\
             X-Seq: 3\r\n\
+            content-length: 0\r\n\
             \r\n";
 
         let reader = BackendReader::new(raw.as_slice(), 256);
