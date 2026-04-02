@@ -944,6 +944,9 @@ where
         // the write, but haven't yet allowed the future to resolve).
         if f2b_res.is_none() {
             match std::future::poll_fn(|cx| match f2b_fut_pinned.as_mut().poll(cx) {
+                // TODO: there's also an argument that we should drive the
+                // frontend-to-backend body to completion and rely on the origin
+                // to hang up on us if it wants to terminate early.
                 Poll::Ready(r) => Poll::Ready(Some(r)),
                 Poll::Pending => Poll::Ready(None),
             })
