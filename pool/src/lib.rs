@@ -45,7 +45,7 @@ where
     pub fn new(backend_reader: BR, backend_writer: BW) -> Self {
         Self {
             inner: Some((
-                BackendReader::new(backend_reader),
+                BackendReader::new(backend_reader, 256),
                 BackendWriter::new(backend_writer),
             )),
         }

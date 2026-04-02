@@ -1386,7 +1386,7 @@ mod test {
     async fn make_frontend_proxy_request(
         raw: &[u8],
     ) -> FrontendProxyRequest<&[u8], tokio::io::Sink> {
-        let reader = FrontendReader::new(raw);
+        let reader = FrontendReader::new(raw, 256);
         let req = reader.read(8192).await.expect("valid request");
         let is_head = req.req().method() == b"HEAD".as_slice();
         let version = req.req().version();
@@ -1405,7 +1405,7 @@ mod test {
     }
 
     async fn make_proxy_response(raw: &[u8]) -> ProxyResponseStream<&[u8]> {
-        let reader = BackendReader::new(raw);
+        let reader = BackendReader::new(raw, 256);
         let stream = reader.read(true, 8192).await.expect("valid response");
         ProxyResponseStream::new(stream)
     }
@@ -1437,7 +1437,7 @@ mod test {
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
 
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -1636,7 +1636,7 @@ mod test {
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
 
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -1723,7 +1723,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -1787,7 +1787,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -1860,7 +1860,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -1927,7 +1927,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -1997,7 +1997,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -2069,7 +2069,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -2140,7 +2140,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -2224,7 +2224,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -2351,7 +2351,7 @@ mod test {
 
         let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -2673,7 +2673,7 @@ mod test {
             Content-Length: 0\r\n\
             \r\n";
 
-        let reader = BackendReader::new(raw.as_slice());
+        let reader = BackendReader::new(raw.as_slice(), 256);
         let stream = reader.read(true, 8192).await.expect("valid response");
         let proxy_stream = ProxyResponseStream::new(stream);
 
@@ -2756,7 +2756,7 @@ mod test {
         let mut frontend_writer = Vec::new();
 
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -2809,7 +2809,7 @@ mod test {
         let mut frontend_writer = Vec::new();
 
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -2862,7 +2862,7 @@ mod test {
         let mut frontend_writer = Vec::new();
 
         let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref()),
+            FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
@@ -2913,7 +2913,7 @@ mod test {
             X-Seq: 3\r\n\
             \r\n";
 
-        let reader = BackendReader::new(raw.as_slice());
+        let reader = BackendReader::new(raw.as_slice(), 256);
         let stream = reader.read(true, 8192).await.expect("valid response");
         let proxy_stream = ProxyResponseStream::new(stream);
 

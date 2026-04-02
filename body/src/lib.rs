@@ -284,17 +284,22 @@ pub struct ContentLengthBodyReader<I> {
     offset: u64,
     /// the io associated with this body read
     io: IoBuffer<I>,
+    /// These are not ever used while processing a content-length body. They
+    /// exist here in order to allow higher level calls to reuse the slot
+    /// allocation.
+    parse_slots: ParseSlots,
 }
 
 impl<I> ContentLengthBodyReader<I>
 where
     I: AsyncReadExt + Unpin,
 {
-    fn new(length: u64, io: IoBuffer<I>) -> Self {
+    fn new(length: u64, io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
         Self {
             length,
             offset: 0,
             io,
+            parse_slots,
         }
     }
 
@@ -324,14 +329,19 @@ where
     }
 
     /// Drain the [`ContentLengthBodyReader`] and return the inner
-    /// [`IoBuffer`].`
-    pub async fn drain(mut self) -> BodyResult<IoBuffer<I>> {
+    /// [`IoBuffer`] and [`ParseSlots`].
+    pub async fn drain(mut self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
         while let Some(_buf) = self.read(DRAIN_SIZE).await? {
             // drop buffers until we get to the end of the body
         }
-        let Self { length, offset, io } = self;
+        let Self {
+            length,
+            offset,
+            io,
+            parse_slots,
+        } = self;
         debug_assert_eq!(offset, length);
-        Ok(io)
+        Ok((io, parse_slots))
     }
 }
 
@@ -420,7 +430,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
         }
     }
 
-    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, Headers)> {
+    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, ParseSlots, Headers)> {
         let Self { inner } = self;
         let Some(mut inner) = inner else {
             return Err(BodyError::ReadAfterError);
@@ -438,10 +448,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
                     }
                 }
                 ChunkedBodyChunkStream::Done(done_chunk_reader) => {
-                    let (io, parse_slots, trailers) = done_chunk_reader.into_parts();
-                    // TODO: pass these back up
-                    let _ignored_parse_slots = parse_slots;
-                    return Ok((io, trailers));
+                    return Ok(done_chunk_reader.into_parts());
                 }
             }
         }
@@ -646,12 +653,15 @@ pub enum BodyReaderKind<I> {
 }
 
 #[derive(Debug)]
-pub struct BodylessBodyReader<I>(IoBuffer<I>);
+pub struct BodylessBodyReader<I> {
+    io: IoBuffer<I>,
+    parse_slots: ParseSlots,
+}
 
 impl<I> BodylessBodyReader<I> {
-    pub fn drain(self) -> IoBuffer<I> {
-        let Self(inner) = self;
-        inner
+    pub fn drain(self) -> (IoBuffer<I>, ParseSlots) {
+        let Self { io, parse_slots } = self;
+        (io, parse_slots)
     }
 }
 
@@ -680,7 +690,9 @@ impl<I> BodyReader<I> {
 impl<I: AsyncReadExt + Unpin> BodyReader<I> {
     pub fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
         let state = match mode {
-            BodyReadMode::Bodyless => BodyReaderKind::Bodyless(BodylessBodyReader(io)),
+            BodyReadMode::Bodyless => {
+                BodyReaderKind::Bodyless(BodylessBodyReader { io, parse_slots })
+            }
             BodyReadMode::Chunk => BodyReaderKind::TE(ChunkedBodyReader {
                 inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader {
                     io,
@@ -688,7 +700,7 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
                 })),
             }),
             BodyReadMode::ContentLength(length) => {
-                BodyReaderKind::CL(ContentLengthBodyReader::new(length, io))
+                BodyReaderKind::CL(ContentLengthBodyReader::new(length, io, parse_slots))
             }
         };
         Self { state }
@@ -710,18 +722,18 @@ impl<I: AsyncReadExt + Unpin> BodyReader<I> {
         }
     }
 
-    /// Ensure the body is fully drained from the socket
-    pub async fn drain(self) -> BodyResult<IoBuffer<I>> {
+    /// Drain the body and return the underlying IO buffer along with the
+    /// [`ParseSlots`] so the caller can reuse the allocation.
+    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
         let Self { state } = self;
-        let io = match state {
-            BodyReaderKind::Bodyless(r) => r.drain(),
-            BodyReaderKind::CL(r) => r.drain().await?,
+        match state {
+            BodyReaderKind::Bodyless(r) => Ok(r.drain()),
+            BodyReaderKind::CL(r) => r.drain().await,
             BodyReaderKind::TE(r) => {
-                let (io, _trailers) = r.drain().await?;
-                io
+                let (io, parse_slots, _trailers) = r.drain().await?;
+                Ok((io, parse_slots))
             }
-        };
-        Ok(io)
+        }
     }
 }
 
@@ -784,8 +796,9 @@ impl<I: AsyncReadExt + Unpin> PeekableBodyReader<I> {
         self.inner.drained()
     }
 
-    /// Ensure the body is fully drained from the socket
-    pub async fn drain(self) -> BodyResult<IoBuffer<I>> {
+    /// Drain the body and return the underlying IO buffer along with the
+    /// [`ParseSlots`] so the caller can reuse the allocation.
+    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
         // peeked bytes have already been consumed from the underlying IO,
         // so we just need to drain the inner reader
         self.inner.drain().await
