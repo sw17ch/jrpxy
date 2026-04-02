@@ -6,15 +6,14 @@ use bytes::Bytes;
 use jrpxy_backend::{
     error::{BackendError, BackendResult},
     reader::{
-        BackendBodyReader, BackendBodyReaderKind, BackendReader,
-        BackendResponse as BackendReaderResponse, BackendStreamReader, ResponseStream,
+        BackendBodyReader, BackendReader, BackendResponse as BackendReaderResponse,
+        BackendStreamReader, ResponseStream,
     },
     writer::{BackendBodyWriter, BackendBodyWriterKind, BackendWriter},
 };
-use jrpxy_body::BodyReadMode;
 use jrpxy_frontend::{
     error::FrontendError,
-    reader::{FrontendBodyReader, FrontendBodyReaderKind, FrontendReader, FrontendRequest},
+    reader::{FrontendBodyReader, FrontendReader, FrontendRequest},
     writer::{FrontendBodyWriter, FrontendBodyWriterKind, FrontendWriter},
 };
 use jrpxy_http_message::{
@@ -745,10 +744,14 @@ where
         // (chunk-encoded) or if we can send back a content-length.
         let is_head = pending.client_options.is_head;
         let (response, backend_body_reader) = proxy_response.into_frontend_response();
-        let (options, frontend_body_writer) = match backend_body_reader.mode() {
-            BodyReadMode::Chunk => pending.send_as_chunked(response).await?,
-            BodyReadMode::ContentLength(cl) => pending.send_as_content_length(response, cl).await?,
-            BodyReadMode::Bodyless => {
+        let (options, frontend_body_writer) = match &backend_body_reader {
+            BackendBodyReader::TE(_) => pending.send_as_chunked(response).await?,
+            BackendBodyReader::CL(r) => {
+                pending
+                    .send_as_content_length(response, r.content_length())
+                    .await?
+            }
+            BackendBodyReader::Bodyless(_) => {
                 // HEAD responses and 304 Not Modified carry framing headers
                 // that describe the representation, not an actual body; those
                 // must be forwarded. All other bodyless codes (204, etc.) must
@@ -759,6 +762,10 @@ where
                     pending.send_as_no_content(response).await?
                 }
             }
+            // The backend sent an EOF-terminated body (no framing headers).
+            // Re-frame as chunked when forwarding to the frontend so the
+            // frontend connection can remain open.
+            BackendBodyReader::Eof(_) => pending.send_as_chunked(response).await?,
         };
 
         Ok(BodyExchanger {
@@ -833,27 +840,25 @@ where
     pub async fn finish(self) -> ProxyResult<(ProxyClient<FR, FW>, BackendConnection<BR, BW>)> {
         let Self {
             options,
-            frontend_body_reader,
+            mut frontend_body_reader,
             backend_body_writer,
-            backend_body_reader,
+            mut backend_body_reader,
             frontend_body_writer,
         } = self;
 
         let body_chunk_size = options.body_chunk_size;
-        let mut frontend_reader_kind = frontend_body_reader.into_kind();
         let mut frontend_writer_kind = frontend_body_writer.into_kind();
-        let mut backend_reader_kind = backend_body_reader.into_kind();
         let mut backend_writer_kind = backend_body_writer.into_kind();
 
         let f2b_fut = async move {
             let ret;
             loop {
-                let buf = match frontend_reader_kind.read(body_chunk_size).await {
+                let buf = match frontend_body_reader.read(body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
                         ret = async {
-                            match (frontend_reader_kind, backend_writer_kind) {
-                                (FrontendBodyReaderKind::TE(fr), BackendBodyWriterKind::TE(bw)) => {
+                            match (frontend_body_reader, backend_writer_kind) {
+                                (FrontendBodyReader::TE(fr), BackendBodyWriterKind::TE(bw)) => {
                                     let (next_reader, trailers) = fr.drain().await?;
                                     let next_backend = bw.finish_with_trailers(&trailers).await?;
                                     Ok((next_reader, next_backend))
@@ -889,12 +894,12 @@ where
         let b2f_fut = async move {
             let ret;
             loop {
-                let buf = match backend_reader_kind.read(body_chunk_size).await {
+                let buf = match backend_body_reader.read(body_chunk_size).await {
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
                         ret = async {
-                            match (backend_reader_kind, frontend_writer_kind) {
-                                (BackendBodyReaderKind::TE(br), FrontendBodyWriterKind::TE(fw)) => {
+                            match (backend_body_reader, frontend_writer_kind) {
+                                (BackendBodyReader::TE(br), FrontendBodyWriterKind::TE(fw)) => {
                                     let (next_backend, trailers) = br.drain().await?;
                                     let next_frontend = fw.finish_with_trailers(&trailers).await?;
                                     Ok((next_backend, next_frontend))
@@ -1149,11 +1154,6 @@ impl<FR, FW> BackendProxyRequest<FR, FW> {
         &mut self.request
     }
 
-    /// The framing mode derived from the frontend body reader.
-    pub fn mode(&self) -> BodyReadMode {
-        self.body_reader.mode()
-    }
-
     /// Return the [`FrontendBodyReader`] and the [`PendingFrontendResponse`] so
     /// the caller can send an error response to the frontend and optionally
     /// drain the request from body from the frontend so the connection can be
@@ -1191,14 +1191,14 @@ impl<FR, FW> BackendProxyRequest<FR, FW> {
         BW: AsyncWriteExt + Unpin,
     {
         let (backend_reader, backend_writer) = backend_connection;
-        let write_result = match self.body_reader.mode() {
-            BodyReadMode::Chunk => backend_writer.send_as_chunked(&self.request).await,
-            BodyReadMode::ContentLength(cl) => {
+        let write_result = match &self.body_reader {
+            FrontendBodyReader::TE(_) => backend_writer.send_as_chunked(&self.request).await,
+            FrontendBodyReader::CL(r) => {
                 backend_writer
-                    .send_as_content_length(&self.request, cl)
+                    .send_as_content_length(&self.request, r.content_length())
                     .await
             }
-            BodyReadMode::Bodyless => backend_writer.send_as_bodyless(&self.request).await,
+            FrontendBodyReader::Bodyless(_) => backend_writer.send_as_bodyless(&self.request).await,
         };
         match write_result {
             Ok(backend_body_writer) => Ok(ResponseReader {

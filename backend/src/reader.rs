@@ -1,7 +1,7 @@
 use bytes::Bytes;
 use jrpxy_body::{
-    BodyReadMode, BodyReader, BodyReaderKind, BodylessBodyReader, ChunkedBodyReader,
-    ContentLengthBodyReader, PeekableBodyReader,
+    BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader, EofBodyReader,
+    PeekableBodyReader,
 };
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::{
@@ -136,18 +136,35 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
             };
         }
 
+        // We need to spend more time looking at Message Body Length from RFC
+        // 9112 section 6.3.
+        // https://www.rfc-editor.org/rfc/rfc9112.html#name-message-body-length
+        let is_no_framing = matches!(framing, ParsedFraming::NoFraming);
+
         let reader = if !expect_body {
-            BackendBodyReader::new(io_buffer, BodyReadMode::Bodyless, parse_slots)
+            BackendBodyReader::Bodyless(BackendBodylessBodyReader {
+                inner: BodylessBodyReader::new(io_buffer, parse_slots),
+            })
+        } else if is_no_framing && expect_body {
+            // No framing headers: body is terminated by connection close.
+            // RFC 9112 section 6.3 rule 8.
+            BackendBodyReader::Eof(BackendEofBodyReader {
+                inner: EofBodyReader::new(io_buffer, parse_slots),
+            })
         } else {
             match framing {
                 ParsedFraming::Length(cl) => {
-                    BackendBodyReader::new(io_buffer, BodyReadMode::ContentLength(cl), parse_slots)
+                    BackendBodyReader::CL(BackendContentLengthBodyReader {
+                        inner: ContentLengthBodyReader::new(cl, io_buffer, parse_slots),
+                    })
                 }
-                ParsedFraming::Chunked => {
-                    BackendBodyReader::new(io_buffer, BodyReadMode::Chunk, parse_slots)
-                }
+                ParsedFraming::Chunked => BackendBodyReader::TE(BackendChunkedBodyReader {
+                    inner: ChunkedBodyReader::new(io_buffer, parse_slots),
+                }),
                 ParsedFraming::NoFraming => {
-                    BackendBodyReader::new(io_buffer, BodyReadMode::Bodyless, parse_slots)
+                    BackendBodyReader::Bodyless(BackendBodylessBodyReader {
+                        inner: BodylessBodyReader::new(io_buffer, parse_slots),
+                    })
                 }
             }
         };
@@ -234,10 +251,6 @@ impl<I> BackendResponse<I> {
         let Self { res, reader } = self;
         (res, reader)
     }
-
-    pub fn mode(&self) -> BodyReadMode {
-        self.reader.mode()
-    }
 }
 
 /// A backend response body reader.
@@ -260,6 +273,12 @@ impl<I: AsyncReadExt + Unpin> BackendBodylessBodyReader<I> {
 /// Backend wrapper for [`ContentLengthBodyReader`].
 pub struct BackendContentLengthBodyReader<I> {
     inner: ContentLengthBodyReader<I>,
+}
+
+impl<I> BackendContentLengthBodyReader<I> {
+    pub fn content_length(&self) -> u64 {
+        self.inner.content_length()
+    }
 }
 
 impl<I: AsyncReadExt + Unpin> BackendContentLengthBodyReader<I> {
@@ -314,91 +333,73 @@ impl<I: AsyncReadExt + Unpin> BackendChunkedBodyReader<I> {
     }
 }
 
-/// The body reader kind for a backend response, typed so that draining
-/// always produces a [`BackendReader`] without exposing raw IO.
-pub enum BackendBodyReaderKind<I> {
-    Bodyless(BackendBodylessBodyReader<I>),
-    CL(BackendContentLengthBodyReader<I>),
-    TE(BackendChunkedBodyReader<I>),
+/// Body reader for close-delimited response bodies.
+pub struct BackendEofBodyReader<I> {
+    inner: EofBodyReader<I>,
 }
 
-impl<I: AsyncReadExt + Unpin> BackendBodyReaderKind<I> {
+impl<I: AsyncReadExt + Unpin> BackendEofBodyReader<I> {
     pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
-        match self {
-            BackendBodyReaderKind::Bodyless(_) => Ok(None),
-            BackendBodyReaderKind::CL(r) => r.read(max_len).await,
-            BackendBodyReaderKind::TE(r) => r.read(max_len).await,
-        }
-    }
-
-    /// Drain the body and return the next [`BackendReader`], discarding
-    /// any trailers. Use the `TE` variant directly to access trailers.
-    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
-        match self {
-            BackendBodyReaderKind::Bodyless(r) => r.drain(),
-            BackendBodyReaderKind::CL(r) => r.drain().await,
-            BackendBodyReaderKind::TE(r) => {
-                let (reader, _trailers) = r.drain().await?;
-                Ok(reader)
-            }
-        }
-    }
-}
-
-pub struct BackendBodyReader<I> {
-    reader: BodyReader<I>,
-}
-
-impl<I> BackendBodyReader<I> {
-    pub fn mode(&self) -> BodyReadMode {
-        self.reader.mode()
-    }
-
-    pub fn into_kind(self) -> BackendBodyReaderKind<I> {
-        let Self { reader } = self;
-        match reader.into_kind() {
-            BodyReaderKind::Bodyless(inner) => {
-                BackendBodyReaderKind::Bodyless(BackendBodylessBodyReader { inner })
-            }
-            BodyReaderKind::CL(inner) => {
-                BackendBodyReaderKind::CL(BackendContentLengthBodyReader { inner })
-            }
-            BodyReaderKind::TE(inner) => {
-                BackendBodyReaderKind::TE(BackendChunkedBodyReader { inner })
-            }
-        }
-    }
-}
-
-impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
-    fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
-        Self {
-            reader: BodyReader::new(io, mode, parse_slots),
-        }
-    }
-
-    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
-        self.reader
+        self.inner
             .read(max_len)
             .await
             .map_err(BackendError::BodyReadError)
     }
 
+    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+        let Self { inner } = self;
+        let (io, parse_slots) = inner.drain().await.map_err(BackendError::BodyReadError)?;
+        Ok(BackendReader {
+            io_buffer: io,
+            parse_slots,
+        })
+    }
+}
+
+/// The body reader for a backend response. Each variant corresponds to a
+/// different framing mode. Draining always produces a [`BackendReader`].
+pub enum BackendBodyReader<I> {
+    Bodyless(BackendBodylessBodyReader<I>),
+    CL(BackendContentLengthBodyReader<I>),
+    TE(BackendChunkedBodyReader<I>),
+    Eof(BackendEofBodyReader<I>),
+}
+
+impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
+        match self {
+            BackendBodyReader::Bodyless(_) => Ok(None),
+            BackendBodyReader::CL(r) => r.read(max_len).await,
+            BackendBodyReader::TE(r) => r.read(max_len).await,
+            BackendBodyReader::Eof(r) => r.read(max_len).await,
+        }
+    }
+
     pub fn drained(&self) -> bool {
-        self.reader.drained()
+        match self {
+            BackendBodyReader::Bodyless(_) => true,
+            BackendBodyReader::CL(r) => r.inner.drained(),
+            BackendBodyReader::TE(r) => r.inner.drained(),
+            BackendBodyReader::Eof(r) => r.inner.drained(),
+        }
     }
 
     pub fn peekable(self) -> BackendPeekableBodyReader<I> {
         BackendPeekableBodyReader::new(self)
     }
 
+    /// Drain the body and return the next [`BackendReader`], discarding
+    /// any trailers.
     pub async fn drain(self) -> BackendResult<BackendReader<I>> {
-        let Self { reader } = self;
-        let (io, parse_slots) = reader.drain().await.map_err(BackendError::BodyReadError)?;
-        Ok(BackendReader {
-            io_buffer: io,
-            parse_slots,
-        })
+        match self {
+            BackendBodyReader::Bodyless(r) => r.drain(),
+            BackendBodyReader::CL(r) => r.drain().await,
+            BackendBodyReader::TE(r) => {
+                let (reader, _trailers) = r.drain().await?;
+                Ok(reader)
+            }
+            BackendBodyReader::Eof(r) => r.drain().await,
+        }
     }
 }
 
@@ -409,14 +410,13 @@ pub struct BackendPeekableBodyReader<I> {
 
 impl<I> BackendPeekableBodyReader<I> {
     pub fn new(reader: BackendBodyReader<I>) -> Self {
-        let BackendBodyReader { reader } = reader;
-        Self {
-            reader: reader.peekable(),
-        }
-    }
-
-    pub fn mode(&self) -> BodyReadMode {
-        self.reader.mode()
+        let inner = match reader {
+            BackendBodyReader::Bodyless(r) => PeekableBodyReader::from(r.inner),
+            BackendBodyReader::CL(r) => PeekableBodyReader::from(r.inner),
+            BackendBodyReader::TE(r) => PeekableBodyReader::from(r.inner),
+            BackendBodyReader::Eof(r) => PeekableBodyReader::from(r.inner),
+        };
+        Self { reader: inner }
     }
 }
 
@@ -712,6 +712,32 @@ mod test {
             .into_parts();
         let body = br.read(1024).await.expect("can read");
         assert!(body.is_none());
+    }
+
+    /// RFC 9112 section 6.3 point 8: when a 200 response has no framing headers,
+    /// the body is terminated by connection close. This is not yet implemented.
+    #[tokio::test]
+    async fn read_200_no_framing_eof_body() {
+        let buf = b"\
+            HTTP/1.1 200 Ok\r\n\
+            \r\n\
+            body terminated by eof\
+            ";
+
+        let reader = BackendReader::new(buf.as_slice(), 256);
+        let (_res, mut br) = reader
+            .read(true, 128)
+            .await
+            .expect("can split into parts")
+            .try_into_response()
+            .unwrap()
+            .into_parts();
+        let body = br
+            .read(1024)
+            .await
+            .expect("can read")
+            .expect("body present");
+        assert_eq!(body, &b"body terminated by eof"[..]);
     }
 
     /// RFC 9110 Section 8.6 states: "A server MUST NOT send a Content-Length

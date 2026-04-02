@@ -1,8 +1,12 @@
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::{MessageError, ParseSlots};
 use jrpxy_util::io_buffer::{IoBuffer, IoBufferError};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+pub mod peekable_reader;
+pub use peekable_reader::PeekableBodyReader;
 
 fn map_trailer_error(e: MessageError) -> BodyError {
     let trailer_error = match e {
@@ -270,16 +274,6 @@ impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
 }
 
 #[derive(Debug)]
-pub enum BodyReadMode {
-    /// The body is encoded as chunks
-    Chunk,
-    /// The body has a defined length
-    ContentLength(u64),
-    /// There is no body
-    Bodyless,
-}
-
-#[derive(Debug)]
 pub struct ContentLengthBodyReader<I> {
     /// the total body length specified by the content-length header.
     length: u64,
@@ -293,11 +287,8 @@ pub struct ContentLengthBodyReader<I> {
     parse_slots: ParseSlots,
 }
 
-impl<I> ContentLengthBodyReader<I>
-where
-    I: AsyncReadExt + Unpin,
-{
-    fn new(length: u64, io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
+impl<I> ContentLengthBodyReader<I> {
+    pub fn new(length: u64, io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
         Self {
             length,
             offset: 0,
@@ -306,6 +297,24 @@ where
         }
     }
 
+    pub fn content_length(&self) -> u64 {
+        self.length
+    }
+
+    pub fn drained(&self) -> bool {
+        self.remaining() == 0
+    }
+
+    fn remaining(&self) -> u64 {
+        debug_assert!(self.offset <= self.length);
+        self.length - self.offset
+    }
+}
+
+impl<I> ContentLengthBodyReader<I>
+where
+    I: AsyncReadExt + Unpin,
+{
     /// Read bytes and return them as a [`Bytes`].
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         let remaining = self.remaining();
@@ -324,11 +333,6 @@ where
         self.offset += at as u64;
 
         Ok(Some(self.io.split_to(at)))
-    }
-
-    fn remaining(&self) -> u64 {
-        debug_assert!(self.offset <= self.length);
-        self.length - self.offset
     }
 
     /// Drain the [`ContentLengthBodyReader`] and return the inner
@@ -387,6 +391,15 @@ impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
 }
 
 impl<I> ChunkedBodyReader<I> {
+    pub fn new(io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
+        Self {
+            inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader {
+                io,
+                parse_slots,
+            })),
+        }
+    }
+
     pub fn drained(&self) -> bool {
         matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
     }
@@ -648,11 +661,66 @@ impl<I> FinalChunkReader<I> {
     }
 }
 
+/// Body reader for responses with no framing headers where the body is
+/// terminated by connection close (RFC 9112 section 6.3 rule 8).
 #[derive(Debug)]
-pub enum BodyReaderKind<I> {
-    Bodyless(BodylessBodyReader<I>),
-    CL(ContentLengthBodyReader<I>),
-    TE(ChunkedBodyReader<I>),
+pub struct EofBodyReader<I> {
+    io: IoBuffer<I>,
+    parse_slots: ParseSlots,
+    eof: bool,
+}
+
+impl<I> EofBodyReader<I> {
+    pub fn new(io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
+        Self {
+            io,
+            parse_slots,
+            eof: false,
+        }
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> EofBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
+        if self.eof {
+            return Ok(None);
+        }
+        // Return already-buffered data first.
+        if !self.io.is_empty() {
+            let at = self.io.len().min(max_len);
+            return Ok(Some(self.io.split_to(at)));
+        }
+        // Try to read more; a zero return means the connection was closed.
+        let n = self
+            .io
+            .read_with_len(max_len)
+            .await
+            .map_err(BodyError::BodyReadError)?;
+        if n == 0 {
+            self.eof = true;
+            return Ok(None);
+        }
+        let at = self.io.len().min(max_len);
+        Ok(Some(self.io.split_to(at)))
+    }
+
+    pub fn drained(&self) -> bool {
+        self.eof
+    }
+
+    pub async fn drain(mut self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
+        while let Some(_drained) = self.read(DRAIN_SIZE).await? {
+            // discard anything we read
+        }
+        let Self {
+            io,
+            parse_slots,
+            eof: _,
+        } = self;
+        // TODO: drain should not hand back the IO. It has been closed and
+        // cannot be reused.
+        Ok((io, parse_slots))
+    }
 }
 
 #[derive(Debug)]
@@ -662,149 +730,13 @@ pub struct BodylessBodyReader<I> {
 }
 
 impl<I> BodylessBodyReader<I> {
+    pub fn new(io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
+        Self { io, parse_slots }
+    }
+
     pub fn drain(self) -> (IoBuffer<I>, ParseSlots) {
         let Self { io, parse_slots } = self;
         (io, parse_slots)
-    }
-}
-
-pub struct BodyReader<I> {
-    state: BodyReaderKind<I>,
-}
-
-impl<I> BodyReader<I> {
-    pub fn mode(&self) -> BodyReadMode {
-        match &self.state {
-            BodyReaderKind::Bodyless(_) => BodyReadMode::Bodyless,
-            BodyReaderKind::CL(r) => BodyReadMode::ContentLength(r.length),
-            BodyReaderKind::TE(_) => BodyReadMode::Chunk,
-        }
-    }
-
-    pub fn peekable(self) -> PeekableBodyReader<I> {
-        PeekableBodyReader::new(self)
-    }
-
-    pub fn into_kind(self) -> BodyReaderKind<I> {
-        self.state
-    }
-}
-
-impl<I: AsyncReadExt + Unpin> BodyReader<I> {
-    pub fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
-        let state = match mode {
-            BodyReadMode::Bodyless => {
-                BodyReaderKind::Bodyless(BodylessBodyReader { io, parse_slots })
-            }
-            BodyReadMode::Chunk => BodyReaderKind::TE(ChunkedBodyReader {
-                inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader {
-                    io,
-                    parse_slots,
-                })),
-            }),
-            BodyReadMode::ContentLength(length) => {
-                BodyReaderKind::CL(ContentLengthBodyReader::new(length, io, parse_slots))
-            }
-        };
-        Self { state }
-    }
-
-    pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
-        match &mut self.state {
-            BodyReaderKind::Bodyless(_io) => Ok(None),
-            BodyReaderKind::CL(cl) => Ok(cl.read(max_len).await?),
-            BodyReaderKind::TE(te) => Ok(te.read(max_len).await?),
-        }
-    }
-
-    pub fn drained(&self) -> bool {
-        match &self.state {
-            BodyReaderKind::Bodyless(_io) => true,
-            BodyReaderKind::CL(cl) => cl.remaining() == 0,
-            BodyReaderKind::TE(te) => te.drained(),
-        }
-    }
-
-    /// Drain the body and return the underlying IO buffer along with the
-    /// [`ParseSlots`] so the caller can reuse the allocation.
-    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
-        let Self { state } = self;
-        match state {
-            BodyReaderKind::Bodyless(r) => Ok(r.drain()),
-            BodyReaderKind::CL(r) => r.drain().await,
-            BodyReaderKind::TE(r) => {
-                let (io, parse_slots, _trailers) = r.drain().await?;
-                Ok((io, parse_slots))
-            }
-        }
-    }
-}
-
-pub struct PeekableBodyReader<I> {
-    /// a buffer in which we store data peeked off the socket, but not yet read
-    peeked: BytesMut,
-    inner: BodyReader<I>,
-}
-
-impl<I> PeekableBodyReader<I> {
-    pub fn new(reader: BodyReader<I>) -> Self {
-        Self {
-            peeked: BytesMut::new(),
-            inner: reader,
-        }
-    }
-
-    pub fn mode(&self) -> BodyReadMode {
-        self.inner.mode()
-    }
-}
-
-impl<I: AsyncReadExt + Unpin> PeekableBodyReader<I> {
-    /// Peek data from the body, and allow it to be observed, but do not remove
-    /// it from the read buffer. Always returns data starting from the first
-    /// byte not yet read. That is, repeated calls to this method with the same
-    /// length will always yield the same result unless read calls are
-    /// interspersed with peek calls.
-    pub async fn peek(&mut self, target_len: usize) -> BodyResult<(bool, &[u8])> {
-        let mut remaining_len = target_len.saturating_sub(self.peeked.len());
-        loop {
-            let complete = match self.inner.read(remaining_len).await? {
-                None => true,
-                Some(bytes) => {
-                    self.peeked.extend_from_slice(&bytes);
-                    self.inner.drained()
-                }
-            };
-
-            remaining_len = target_len.saturating_sub(self.peeked.len());
-            if !complete && remaining_len > 0 {
-                continue;
-            }
-
-            let len = self.peeked.len().min(target_len);
-            return Ok((complete, &self.peeked[0..len]));
-        }
-    }
-
-    pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
-        if !self.peeked.is_empty() {
-            // If there's already data in the peek buffer, return that first.
-            let at = self.peeked.len().min(max_len);
-            return Ok(Some(self.peeked.split_to(at).freeze()));
-        }
-        self.inner.read(max_len).await
-    }
-
-    pub fn drained(&self) -> bool {
-        self.inner.drained()
-    }
-
-    /// Drain the body and return the underlying IO buffer along with the
-    /// [`ParseSlots`] so the caller can reuse the allocation.
-    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
-        // peeked bytes have already been consumed from the underlying IO,
-        // so we just need to drain the inner reader
-        self.inner.drain().await
     }
 }
 
@@ -816,7 +748,10 @@ mod test {
     use jrpxy_util::io_buffer::IoBuffer;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{BodyError, BodyReadMode, BodyReader, ChunkedBodyWriter};
+    use crate::{
+        BodyError, BodylessBodyReader, ChunkedBodyReader, ChunkedBodyWriter,
+        ContentLengthBodyReader, PeekableBodyReader,
+    };
 
     #[tokio::test]
     async fn cl_peek_full() {
@@ -824,12 +759,11 @@ mod test {
             0123456789
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::from(ContentLengthBodyReader::new(
+            10,
             IoBuffer::new(&input[..]),
-            BodyReadMode::ContentLength(10),
             ParseSlots::default(),
-        )
-        .peekable();
+        ));
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(!complete);
         assert_eq!(b"01234", slice);
@@ -857,12 +791,11 @@ mod test {
             0123456789
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::from(ContentLengthBodyReader::new(
+            10,
             IoBuffer::new(&input[..]),
-            BodyReadMode::ContentLength(10),
             ParseSlots::default(),
-        )
-        .peekable();
+        ));
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(!complete);
         assert_eq!(b"01234", slice);
@@ -895,12 +828,11 @@ mod test {
             0123456789
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::from(ContentLengthBodyReader::new(
+            10,
             IoBuffer::new(&input[..]),
-            BodyReadMode::ContentLength(10),
             ParseSlots::default(),
-        )
-        .peekable();
+        ));
 
         // read one byte
         let buf = br
@@ -956,12 +888,11 @@ mod test {
         });
 
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
-            let mut reader = BodyReader::new(
+            let mut reader = PeekableBodyReader::from(ContentLengthBodyReader::new(
+                10,
                 IoBuffer::new(right),
-                BodyReadMode::ContentLength(10),
                 ParseSlots::default(),
-            )
-            .peekable();
+            ));
             let (complete, buf) = reader.peek(9).await.expect("can't break into parts");
 
             assert!(!complete);
@@ -992,12 +923,10 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::from(ChunkedBodyReader::new(
             IoBuffer::new(&input[..]),
-            BodyReadMode::Chunk,
             ParseSlots::default(),
-        )
-        .peekable();
+        ));
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(!complete);
         assert_eq!(b"01234", slice);
@@ -1026,12 +955,10 @@ mod test {
     async fn bodyless_peek() {
         let input = b"";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::from(BodylessBodyReader::new(
             IoBuffer::new(&input[..]),
-            BodyReadMode::Bodyless,
             ParseSlots::default(),
-        )
-        .peekable();
+        ));
         let (complete, slice) = br.peek(5).await.expect("peek works");
         assert!(complete);
         assert_eq!(b"", slice);
@@ -1051,12 +978,10 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(
+        let mut br = PeekableBodyReader::from(ChunkedBodyReader::new(
             IoBuffer::new(&input[..]),
-            BodyReadMode::Chunk,
             ParseSlots::default(),
-        )
-        .peekable();
+        ));
         let (complete, slice) = br.peek(10).await.expect("peek works");
         assert!(complete);
         assert_eq!(b"0123012", slice);
@@ -1072,11 +997,7 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(
-            IoBuffer::new(&input[..]),
-            BodyReadMode::Chunk,
-            ParseSlots::default(),
-        );
+        let mut br = ChunkedBodyReader::new(IoBuffer::new(&input[..]), ParseSlots::default());
 
         // The body bytes themselves are valid and should be readable.
         let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
@@ -1096,11 +1017,7 @@ mod test {
             \r\n\
             ";
 
-        let mut br = BodyReader::new(
-            IoBuffer::new(&input[..]),
-            BodyReadMode::Chunk,
-            ParseSlots::default(),
-        );
+        let mut br = ChunkedBodyReader::new(IoBuffer::new(&input[..]), ParseSlots::default());
 
         // The body bytes themselves are valid and should be readable.
         let chunk = br.read(4).await.expect("reading body bytes works").unwrap();

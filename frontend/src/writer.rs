@@ -337,6 +337,8 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriterKind<I> {
 
 /// A frontend response body writer.
 pub struct FrontendBodyWriter<I> {
+    // TODO: any reason not to inline the enum? we can keep the same methods,
+    // but it seems redundant to have the inner type and the into_kind method.
     kind: BodyWriterKind<I>,
 }
 

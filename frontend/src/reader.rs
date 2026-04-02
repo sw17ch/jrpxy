@@ -40,8 +40,7 @@
 
 use bytes::Bytes;
 use jrpxy_body::{
-    BodyReadMode, BodyReader, BodyReaderKind, BodylessBodyReader, ChunkedBodyReader,
-    ContentLengthBodyReader, PeekableBodyReader,
+    BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader, PeekableBodyReader,
 };
 use jrpxy_http_message::{
     framing::ParsedFraming,
@@ -146,15 +145,15 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
         } = self;
 
         let reader = match req.framing()? {
-            ParsedFraming::Length(cl) => {
-                FrontendBodyReader::new(io_buffer, BodyReadMode::ContentLength(cl), parse_slots)
-            }
-            ParsedFraming::Chunked => {
-                FrontendBodyReader::new(io_buffer, BodyReadMode::Chunk, parse_slots)
-            }
-            ParsedFraming::NoFraming => {
-                FrontendBodyReader::new(io_buffer, BodyReadMode::Bodyless, parse_slots)
-            }
+            ParsedFraming::Length(cl) => FrontendBodyReader::CL(FrontendContentLengthBodyReader {
+                inner: ContentLengthBodyReader::new(cl, io_buffer, parse_slots),
+            }),
+            ParsedFraming::Chunked => FrontendBodyReader::TE(FrontendChunkedBodyReader {
+                inner: ChunkedBodyReader::new(io_buffer, parse_slots),
+            }),
+            ParsedFraming::NoFraming => FrontendBodyReader::Bodyless(FrontendBodylessBodyReader {
+                inner: BodylessBodyReader::new(io_buffer, parse_slots),
+            }),
         };
 
         Ok(FrontendRequest { req, reader })
@@ -188,11 +187,6 @@ impl<I> FrontendRequest<I> {
         let Self { req, reader } = self;
         (req, reader)
     }
-
-    /// Indicates the mode with which the body will be read.
-    pub fn mode(&self) -> BodyReadMode {
-        self.reader.mode()
-    }
 }
 
 /// Frontend wrapper for [`BodylessBodyReader`].
@@ -213,6 +207,12 @@ impl<I: AsyncReadExt + Unpin> FrontendBodylessBodyReader<I> {
 /// Frontend wrapper for [`ContentLengthBodyReader`].
 pub struct FrontendContentLengthBodyReader<I> {
     inner: ContentLengthBodyReader<I>,
+}
+
+impl<I> FrontendContentLengthBodyReader<I> {
+    pub fn content_length(&self) -> u64 {
+        self.inner.content_length()
+    }
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendContentLengthBodyReader<I> {
@@ -272,82 +272,32 @@ impl<I: AsyncReadExt + Unpin> FrontendChunkedBodyReader<I> {
     }
 }
 
-/// The body reader kind for a frontend request, typed so that draining
-/// always produces a [`FrontendReader`] without exposing raw IO.
-pub enum FrontendBodyReaderKind<I> {
+/// A frontend request body reader. Each variant corresponds to a different
+/// framing mode.
+pub enum FrontendBodyReader<I> {
     Bodyless(FrontendBodylessBodyReader<I>),
     CL(FrontendContentLengthBodyReader<I>),
     TE(FrontendChunkedBodyReader<I>),
 }
 
-impl<I: AsyncReadExt + Unpin> FrontendBodyReaderKind<I> {
-    pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
-        match self {
-            FrontendBodyReaderKind::Bodyless(_) => Ok(None),
-            FrontendBodyReaderKind::CL(r) => r.read(max_len).await,
-            FrontendBodyReaderKind::TE(r) => r.read(max_len).await,
-        }
-    }
-
-    /// Drain the body and return the next [`FrontendReader`], discarding
-    /// any trailers. Use the `TE` variant directly to access trailers.
-    pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        match self {
-            FrontendBodyReaderKind::Bodyless(r) => r.drain(),
-            FrontendBodyReaderKind::CL(r) => r.drain().await,
-            FrontendBodyReaderKind::TE(r) => {
-                let (reader, _trailers) = r.drain().await?;
-                Ok(reader)
-            }
-        }
-    }
-}
-
-/// A frontend request body reader.
-pub struct FrontendBodyReader<I> {
-    reader: BodyReader<I>,
-}
-
-impl<I> FrontendBodyReader<I> {
-    pub fn mode(&self) -> BodyReadMode {
-        self.reader.mode()
-    }
-
-    pub fn into_kind(self) -> FrontendBodyReaderKind<I> {
-        let Self { reader } = self;
-        match reader.into_kind() {
-            BodyReaderKind::Bodyless(inner) => {
-                FrontendBodyReaderKind::Bodyless(FrontendBodylessBodyReader { inner })
-            }
-            BodyReaderKind::CL(inner) => {
-                FrontendBodyReaderKind::CL(FrontendContentLengthBodyReader { inner })
-            }
-            BodyReaderKind::TE(inner) => {
-                FrontendBodyReaderKind::TE(FrontendChunkedBodyReader { inner })
-            }
-        }
-    }
-}
-
 impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
-    fn new(io: IoBuffer<I>, mode: BodyReadMode, parse_slots: ParseSlots) -> Self {
-        Self {
-            reader: BodyReader::new(io, mode, parse_slots),
-        }
-    }
-
     /// Read up to `max_len` bytes from the body. Returns `None` when the body
     /// is complete.
     pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
-        self.reader
-            .read(max_len)
-            .await
-            .map_err(FrontendError::BodyReadError)
+        match self {
+            FrontendBodyReader::Bodyless(_) => Ok(None),
+            FrontendBodyReader::CL(r) => r.read(max_len).await,
+            FrontendBodyReader::TE(r) => r.read(max_len).await,
+        }
     }
 
     /// Returns true when the body is fully drained.
     pub fn drained(&self) -> bool {
-        self.reader.drained()
+        match self {
+            FrontendBodyReader::Bodyless(_) => true,
+            FrontendBodyReader::CL(r) => r.inner.drained(),
+            FrontendBodyReader::TE(r) => r.inner.drained(),
+        }
     }
 
     /// Convert this reader into a [`FrontendPeekableBodyReader`] that supports
@@ -359,12 +309,14 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
     /// Drain all remaining bytes from the body and return a new
     /// [`FrontendReader`] ready to read the next request in the pipeline.
     pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        let Self { reader } = self;
-        let (io, parse_slots) = reader.drain().await.map_err(FrontendError::BodyReadError)?;
-        Ok(FrontendReader {
-            io_buffer: io,
-            parse_slots,
-        })
+        match self {
+            FrontendBodyReader::Bodyless(r) => r.drain(),
+            FrontendBodyReader::CL(r) => r.drain().await,
+            FrontendBodyReader::TE(r) => {
+                let (reader, _trailers) = r.drain().await?;
+                Ok(reader)
+            }
+        }
     }
 }
 
@@ -375,21 +327,17 @@ pub struct FrontendPeekableBodyReader<I> {
 
 impl<I> FrontendPeekableBodyReader<I> {
     pub fn new(reader: FrontendBodyReader<I>) -> Self {
-        let FrontendBodyReader { reader } = reader;
-        Self {
-            reader: reader.peekable(),
-        }
-    }
-
-    pub fn mode(&self) -> BodyReadMode {
-        self.reader.mode()
+        let inner = match reader {
+            FrontendBodyReader::Bodyless(r) => PeekableBodyReader::from(r.inner),
+            FrontendBodyReader::CL(r) => PeekableBodyReader::from(r.inner),
+            FrontendBodyReader::TE(r) => PeekableBodyReader::from(r.inner),
+        };
+        Self { reader: inner }
     }
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendPeekableBodyReader<I> {
-    /// Peek bytes from the body. Repeated calls to peek will start from the
-    /// same offset until the bytes are read from the body. That is, peek always
-    /// starts with the same data until that data is read out.
+    /// See [`PeekableBodyReader::peek`]
     pub async fn peek(&mut self, max_len: usize) -> FrontendResult<(bool, &[u8])> {
         self.reader
             .peek(max_len)
