@@ -104,7 +104,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         // an unconditional GET. RFC 9110 section 8.6 says the same about 304
         // and content-length. Therefor, we only reject status codes with
         // framing that are 100..=199 and 204.
-        let expect_body = allow_body && !matches!(res.code(), 100..200 | 204 | 304);
+        let expect_body = allow_body && !matches!(res.code(), 100..=199 | 204 | 304);
 
         if let Some(info_code) = is_informational {
             return match info_code {
