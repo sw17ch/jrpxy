@@ -271,8 +271,11 @@ impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
 
 #[derive(Debug)]
 pub enum BodyReadMode {
+    /// The body is encoded as chunks
     Chunk,
+    /// The body has a defined length
     ContentLength(u64),
+    /// There is no body
     Bodyless,
 }
 
