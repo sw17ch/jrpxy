@@ -9,12 +9,12 @@ use jrpxy_backend::{
         BackendBodyReader, BackendReader, BackendResponse as BackendReaderResponse,
         BackendStreamReader, ResponseStream,
     },
-    writer::{BackendBodyWriter, BackendBodyWriterKind, BackendWriter},
+    writer::{BackendBodyWriter, BackendWriter},
 };
 use jrpxy_frontend::{
     error::FrontendError,
     reader::{FrontendBodyReader, FrontendReader, FrontendRequest},
-    writer::{FrontendBodyWriter, FrontendBodyWriterKind, FrontendWriter},
+    writer::{FrontendBodyWriter, FrontendWriter},
 };
 use jrpxy_http_message::{
     header::Headers,
@@ -843,14 +843,12 @@ where
         let Self {
             options,
             mut frontend_body_reader,
-            backend_body_writer,
+            mut backend_body_writer,
             mut backend_body_reader,
-            frontend_body_writer,
+            mut frontend_body_writer,
         } = self;
 
         let body_chunk_size = options.body_chunk_size;
-        let mut frontend_writer_kind = frontend_body_writer.into_kind();
-        let mut backend_writer_kind = backend_body_writer.into_kind();
 
         let f2b_fut = async move {
             let ret;
@@ -859,8 +857,8 @@ where
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
                         ret = async {
-                            match (frontend_body_reader, backend_writer_kind) {
-                                (FrontendBodyReader::TE(fr), BackendBodyWriterKind::TE(bw)) => {
+                            match (frontend_body_reader, backend_body_writer) {
+                                (FrontendBodyReader::TE(fr), BackendBodyWriter::TE(bw)) => {
                                     let (next_reader, trailers) = fr.drain().await?;
                                     let next_backend = bw.finish_with_trailers(&trailers).await?;
                                     Ok((next_reader, next_backend))
@@ -880,7 +878,7 @@ where
                         break;
                     }
                 };
-                match backend_writer_kind.write(&buf).await {
+                match backend_body_writer.write(&buf).await {
                     Ok(()) => {
                         // successfuly wrote buffer; loop around for another one
                     }
@@ -900,8 +898,8 @@ where
                     Ok(Some(buf)) => buf,
                     Ok(None) => {
                         ret = async {
-                            match (backend_body_reader, frontend_writer_kind) {
-                                (BackendBodyReader::TE(br), FrontendBodyWriterKind::TE(fw)) => {
+                            match (backend_body_reader, frontend_body_writer) {
+                                (BackendBodyReader::TE(br), FrontendBodyWriter::TE(fw)) => {
                                     let (next_backend, trailers) = br.drain().await?;
                                     let next_frontend = fw.finish_with_trailers(&trailers).await?;
                                     Ok((Some(next_backend), next_frontend))
@@ -921,7 +919,7 @@ where
                         break;
                     }
                 };
-                match frontend_writer_kind.write(&buf).await {
+                match frontend_body_writer.write(&buf).await {
                     Ok(()) => {}
                     Err(e) => {
                         ret = Err(ProxyCopyError::from(e));

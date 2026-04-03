@@ -1,5 +1,4 @@
 use jrpxy_body::is_framing_header;
-pub use jrpxy_body::writer::BodyWriterKind;
 use jrpxy_body::writer::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter};
 use jrpxy_http_message::{framing::WriteFraming, header::Headers, message::Request};
 use tokio::io::{self, AsyncWriteExt};
@@ -19,9 +18,9 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         write_request_to(request, WriteFraming::Chunked, &mut io)
             .await
             .map_err(BackendError::WriteError)?;
-        Ok(BackendBodyWriter {
-            kind: BodyWriterKind::TE(ChunkedBodyWriter::new(io)),
-        })
+        Ok(BackendBodyWriter::TE(BackendChunkedBodyWriter {
+            inner: ChunkedBodyWriter::new(io),
+        }))
     }
 
     pub async fn send_as_content_length(
@@ -33,9 +32,9 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         write_request_to(request, WriteFraming::Length(body_len), &mut io)
             .await
             .map_err(BackendError::WriteError)?;
-        Ok(BackendBodyWriter {
-            kind: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len, io)),
-        })
+        Ok(BackendBodyWriter::CL(BackendContentLengthBodyWriter {
+            inner: ContentLengthBodyWriter::new(body_len, io),
+        }))
     }
 
     /// Send the response to the backend as bodyless. There's no mechanism for
@@ -49,9 +48,9 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         write_request_to(request, WriteFraming::PreserveFraming, &mut io)
             .await
             .map_err(BackendError::WriteError)?;
-        Ok(BackendBodyWriter {
-            kind: BodyWriterKind::Bodyless(BodylessBodyWriter::new(io)),
-        })
+        Ok(BackendBodyWriter::Bodyless(BackendBodylessBodyWriter {
+            inner: BodylessBodyWriter::new(io),
+        }))
     }
 
     pub fn into_inner(self) -> I {
@@ -167,71 +166,45 @@ impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyWriter<I> {
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
         self.finish_with_trailers(&Default::default()).await
     }
+
+    pub async fn abort(self) -> BackendResult<()> {
+        let Self { inner } = self;
+        inner.abort().await.map_err(BackendError::BodyWriteError)?;
+        Ok(())
+    }
 }
 
-/// The body writer kind for a backend connection, typed so that finishing
+/// The body writer for a backend connection; it is typed so that finishing
 /// always produces a [`BackendWriter`] without exposing raw IO.
-pub enum BackendBodyWriterKind<I> {
+pub enum BackendBodyWriter<I> {
     Bodyless(BackendBodylessBodyWriter<I>),
     CL(BackendContentLengthBodyWriter<I>),
     TE(BackendChunkedBodyWriter<I>),
 }
 
-impl<I: AsyncWriteExt + Unpin> BackendBodyWriterKind<I> {
-    pub async fn write(&mut self, buf: &bytes::Bytes) -> BackendResult<()> {
+impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
         match self {
-            BackendBodyWriterKind::Bodyless(_) => Err(BackendError::BodyWriteError(
+            BackendBodyWriter::Bodyless(_) => Err(BackendError::BodyWriteError(
                 jrpxy_body::error::BodyError::BodyOverflow(buf.len() as u64),
             )),
-            BackendBodyWriterKind::CL(w) => w.write(buf).await,
-            BackendBodyWriterKind::TE(w) => w.write(buf).await,
+            BackendBodyWriter::CL(w) => w.write(buf).await,
+            BackendBodyWriter::TE(w) => w.write(buf).await,
         }
     }
 
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
         match self {
-            BackendBodyWriterKind::Bodyless(w) => w.finish(),
-            BackendBodyWriterKind::CL(w) => w.finish().await,
-            BackendBodyWriterKind::TE(w) => w.finish().await,
+            BackendBodyWriter::Bodyless(w) => w.finish(),
+            BackendBodyWriter::CL(w) => w.finish().await,
+            BackendBodyWriter::TE(w) => w.finish().await,
         }
-    }
-}
-
-pub struct BackendBodyWriter<I> {
-    kind: BodyWriterKind<I>,
-}
-
-impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
-    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
-        self.kind
-            .write(buf)
-            .await
-            .map_err(BackendError::BodyWriteError)
     }
 
     pub async fn abort(self) -> BackendResult<()> {
-        let Self { kind } = self;
-        kind.abort().await.map_err(BackendError::BodyWriteError)
-    }
-
-    pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
-        let Self { kind } = self;
-        let io = kind.finish().await.map_err(BackendError::BodyWriteError)?;
-        Ok(BackendWriter { io })
-    }
-
-    pub fn into_kind(self) -> BackendBodyWriterKind<I> {
-        let Self { kind } = self;
-        match kind {
-            BodyWriterKind::Bodyless(inner) => {
-                BackendBodyWriterKind::Bodyless(BackendBodylessBodyWriter { inner })
-            }
-            BodyWriterKind::CL(inner) => {
-                BackendBodyWriterKind::CL(BackendContentLengthBodyWriter { inner })
-            }
-            BodyWriterKind::TE(inner) => {
-                BackendBodyWriterKind::TE(BackendChunkedBodyWriter { inner })
-            }
+        match self {
+            BackendBodyWriter::Bodyless(_) | BackendBodyWriter::CL(_) => Ok(()),
+            BackendBodyWriter::TE(w) => w.abort().await,
         }
     }
 }

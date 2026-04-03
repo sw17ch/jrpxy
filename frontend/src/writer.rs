@@ -65,9 +65,7 @@
 //! ```
 
 use jrpxy_body::is_framing_header;
-use jrpxy_body::writer::{
-    BodyWriterKind, BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter,
-};
+use jrpxy_body::writer::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter};
 use jrpxy_http_message::framing::WriteFraming;
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::Response;
@@ -110,9 +108,9 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         write_response_to(response, WriteFraming::Chunked, &mut io)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter {
-            kind: BodyWriterKind::TE(ChunkedBodyWriter::new(io)),
-        })
+        Ok(FrontendBodyWriter::TE(FrontendChunkedBodyWriter {
+            inner: ChunkedBodyWriter::new(io),
+        }))
     }
 
     /// Send the specified response with a content-length delimited response
@@ -127,9 +125,9 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         write_response_to(response, WriteFraming::Length(body_len), &mut io)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter {
-            kind: BodyWriterKind::CL(ContentLengthBodyWriter::new(body_len, io)),
-        })
+        Ok(FrontendBodyWriter::CL(FrontendContentLengthBodyWriter {
+            inner: ContentLengthBodyWriter::new(body_len, io),
+        }))
     }
 
     /// Send the response to the frontend with no body, preserving any framing
@@ -146,9 +144,9 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         write_response_to(response, WriteFraming::PreserveFraming, &mut io)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter {
-            kind: BodyWriterKind::Bodyless(BodylessBodyWriter::new(io)),
-        })
+        Ok(FrontendBodyWriter::Bodyless(FrontendBodylessBodyWriter {
+            inner: BodylessBodyWriter::new(io),
+        }))
     }
 
     /// Send the response to the frontend with no body, stripping any framing
@@ -174,9 +172,9 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         write_response_to(response, WriteFraming::StripFraming, &mut io)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter {
-            kind: BodyWriterKind::Bodyless(BodylessBodyWriter::new(io)),
-        })
+        Ok(FrontendBodyWriter::Bodyless(FrontendBodylessBodyWriter {
+            inner: BodylessBodyWriter::new(io),
+        }))
     }
 }
 
@@ -304,74 +302,45 @@ impl<I: AsyncWriteExt + Unpin> FrontendChunkedBodyWriter<I> {
     pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
         self.finish_with_trailers(&Default::default()).await
     }
+
+    pub async fn abort(self) -> FrontendResult<()> {
+        let Self { inner } = self;
+        inner.abort().await.map_err(FrontendError::BodyWriteError)?;
+        Ok(())
+    }
 }
 
-/// The body writer kind for a frontend connection, typed so that finishing
+/// /// The body writer for a frontend connection; it is typed so that finishing
 /// always produces a [`FrontendWriter`] without exposing raw IO.
-pub enum FrontendBodyWriterKind<I> {
+pub enum FrontendBodyWriter<I> {
     Bodyless(FrontendBodylessBodyWriter<I>),
     CL(FrontendContentLengthBodyWriter<I>),
     TE(FrontendChunkedBodyWriter<I>),
 }
 
-impl<I: AsyncWriteExt + Unpin> FrontendBodyWriterKind<I> {
-    pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
-        match self {
-            FrontendBodyWriterKind::Bodyless(_) => Err(FrontendError::BodyWriteError(
-                jrpxy_body::error::BodyError::BodyOverflow(buf.len() as u64),
-            )),
-            FrontendBodyWriterKind::CL(w) => w.write(buf).await,
-            FrontendBodyWriterKind::TE(w) => w.write(buf).await,
-        }
-    }
-
-    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
-        match self {
-            FrontendBodyWriterKind::Bodyless(w) => w.finish(),
-            FrontendBodyWriterKind::CL(w) => w.finish().await,
-            FrontendBodyWriterKind::TE(w) => w.finish().await,
-        }
-    }
-}
-
-/// A frontend response body writer.
-pub struct FrontendBodyWriter<I> {
-    // TODO: any reason not to inline the enum? we can keep the same methods,
-    // but it seems redundant to have the inner type and the into_kind method.
-    kind: BodyWriterKind<I>,
-}
-
 impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
     pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
-        self.kind
-            .write(buf)
-            .await
-            .map_err(FrontendError::BodyWriteError)
+        match self {
+            FrontendBodyWriter::Bodyless(_) => Err(FrontendError::BodyWriteError(
+                jrpxy_body::error::BodyError::BodyOverflow(buf.len() as u64),
+            )),
+            FrontendBodyWriter::CL(w) => w.write(buf).await,
+            FrontendBodyWriter::TE(w) => w.write(buf).await,
+        }
     }
 
     pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
-        let Self { kind } = self;
-        let io = kind.finish().await.map_err(FrontendError::BodyWriteError)?;
-        Ok(FrontendWriter { io })
+        match self {
+            FrontendBodyWriter::Bodyless(w) => w.finish(),
+            FrontendBodyWriter::CL(w) => w.finish().await,
+            FrontendBodyWriter::TE(w) => w.finish().await,
+        }
     }
 
     pub async fn abort(self) -> FrontendResult<()> {
-        let Self { kind } = self;
-        kind.abort().await.map_err(FrontendError::BodyWriteError)
-    }
-
-    pub fn into_kind(self) -> FrontendBodyWriterKind<I> {
-        let Self { kind } = self;
-        match kind {
-            BodyWriterKind::Bodyless(inner) => {
-                FrontendBodyWriterKind::Bodyless(FrontendBodylessBodyWriter { inner })
-            }
-            BodyWriterKind::CL(inner) => {
-                FrontendBodyWriterKind::CL(FrontendContentLengthBodyWriter { inner })
-            }
-            BodyWriterKind::TE(inner) => {
-                FrontendBodyWriterKind::TE(FrontendChunkedBodyWriter { inner })
-            }
+        match self {
+            FrontendBodyWriter::Bodyless(_) | FrontendBodyWriter::CL(_) => Ok(()),
+            FrontendBodyWriter::TE(w) => w.abort().await,
         }
     }
 }

@@ -18,53 +18,6 @@ impl<I> BodylessBodyWriter<I> {
 }
 
 #[derive(Debug)]
-pub enum BodyWriterKind<I> {
-    Bodyless(BodylessBodyWriter<I>),
-    CL(ContentLengthBodyWriter<I>),
-    TE(ChunkedBodyWriter<I>),
-}
-
-impl<I: AsyncWriteExt + Unpin> BodyWriterKind<I> {
-    pub async fn write(&mut self, buf: &[u8]) -> BodyResult<()> {
-        match self {
-            BodyWriterKind::Bodyless(_) => Err(BodyError::BodyOverflow(buf.len() as u64)),
-            BodyWriterKind::CL(w) => w.write(buf).await,
-            BodyWriterKind::TE(w) => w.write(buf).await,
-        }
-    }
-
-    pub async fn finish(self) -> BodyResult<I> {
-        match self {
-            BodyWriterKind::Bodyless(BodylessBodyWriter(mut io)) => {
-                io.flush().await.map_err(BodyError::BodyWriteError)?;
-                Ok(io)
-            }
-            BodyWriterKind::CL(w) => w.finish().await,
-            BodyWriterKind::TE(w) => w.finish().await,
-        }
-    }
-
-    /// Explicitly abort a body write. This will, for certain transfer types,
-    /// perform an invalid write which may help prevent insufficiently strict
-    /// body readers from considering the body complete.
-    pub async fn abort(self) -> BodyResult<()> {
-        match self {
-            BodyWriterKind::Bodyless(_) | BodyWriterKind::CL(_) => {
-                // drop the connection — nothing else we can do
-                Ok(())
-            }
-            BodyWriterKind::TE(w) => {
-                // there are chunked body readers out there that don't wait
-                // around for the empty chunk to consider a body complete, so we
-                // do something special.
-                let _io = w.abort().await?;
-                Ok(())
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
 pub struct ContentLengthBodyWriter<I> {
     /// the total body length specified by the content-length header.
     length: u64,
