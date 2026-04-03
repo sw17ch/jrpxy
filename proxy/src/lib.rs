@@ -406,7 +406,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
         let body_writer = frontend_writer.send_as_no_content(&response).await?;
-        let frontend_writer = body_writer.finish().await?;
+        let frontend_writer = body_writer.finish()?;
         Ok(PendingFrontendResponse {
             frontend_writer,
             options,
@@ -489,6 +489,26 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         let version = response.version();
         insert_proxy_headers(response.headers_mut(), version, &options.received_by);
         let body_writer = frontend_writer.send_as_no_content(&response).await?;
+        // re-wrap the body_writer to expose a uniform interface.
+        Ok((options, FrontendBodyWriter::Bodyless(body_writer)))
+    }
+
+    /// Send the response using EOF encoding. This should only be done when the
+    /// length of the data is not known and the client does not support chunk
+    /// encoding.
+    async fn send_as_eof(
+        self,
+        mut response: Response,
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
+        let Self {
+            frontend_writer,
+            options,
+            client_options: _,
+        } = self;
+        let version = response.version();
+        insert_proxy_headers(response.headers_mut(), version, &options.received_by);
+        let body_writer = frontend_writer.send_as_eof(&response).await?;
+        // re-wrap the body_writer to expose a uniform interface.
         Ok((options, body_writer))
     }
 }
@@ -745,7 +765,14 @@ where
         let is_head = pending.client_options.is_head;
         let (response, backend_body_reader) = proxy_response.into_frontend_response();
         let (options, frontend_body_writer) = match &backend_body_reader {
-            BackendBodyReader::TE(_) => pending.send_as_chunked(response).await?,
+            BackendBodyReader::TE(_) => {
+                let client_cannot_chunk = pending.client_options.version == HttpVersion::Http10;
+                if client_cannot_chunk {
+                    pending.send_as_eof(response).await?
+                } else {
+                    pending.send_as_chunked(response).await?
+                }
+            }
             BackendBodyReader::CL(r) => {
                 pending
                     .send_as_content_length(response, r.content_length())
@@ -839,7 +866,10 @@ where
     /// [`ProxyClient`] ready for the next request.
     pub async fn finish(
         self,
-    ) -> ProxyResult<(ProxyClient<FR, FW>, Option<BackendConnection<BR, BW>>)> {
+    ) -> ProxyResult<(
+        Option<ProxyClient<FR, FW>>,
+        Option<BackendConnection<BR, BW>>,
+    )> {
         let Self {
             options,
             mut frontend_body_reader,
@@ -902,7 +932,7 @@ where
                                 (BackendBodyReader::TE(br), FrontendBodyWriter::TE(fw)) => {
                                     let (next_backend, trailers) = br.drain().await?;
                                     let next_frontend = fw.finish_with_trailers(&trailers).await?;
-                                    Ok((Some(next_backend), next_frontend))
+                                    Ok((Some(next_backend), Some(next_frontend)))
                                 }
                                 (br, fw) => {
                                     let next_backend = br.drain().await?;
@@ -975,16 +1005,15 @@ where
             Some(Err(e)) => return Err(ProxyError::FrontendCopyError(e)),
             None => return Err(ProxyError::FrontendCopyIncomplete),
         };
-        let backend_connection = backend_reader.map(move |br| (br, backend_writer));
 
-        Ok((
-            ProxyClient {
-                frontend_reader,
-                frontend_writer,
-                options,
-            },
-            backend_connection,
-        ))
+        let backend_connection = backend_reader.map(move |br| (br, backend_writer));
+        let proxy_client = frontend_writer.map(move |frontend_writer| ProxyClient {
+            frontend_reader,
+            frontend_writer,
+            options,
+        });
+
+        Ok((proxy_client, backend_connection))
     }
 }
 
@@ -1355,7 +1384,7 @@ impl<I: std::fmt::Debug> std::fmt::Debug for ProxyResponseStream<I> {
 
 #[cfg(test)]
 mod test {
-    use jrpxy_backend::reader::BackendReader;
+    use jrpxy_backend::{reader::BackendReader, writer::BackendWriter};
     use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
     use jrpxy_pool::{BackendProxyProvider, OneshotBackend};
 
@@ -1582,6 +1611,7 @@ mod test {
             .finish()
             .await
             .expect("failed to forward response");
+        let client = client.expect("failed to recycle client");
         let (backend_reader, backend_writer) = backend_connection.unwrap();
         bp.give_connection(backend_reader, backend_writer);
 
@@ -1693,6 +1723,7 @@ mod test {
             .finish()
             .await
             .expect("failed to forward response");
+        let client = client.expect("failed to recycle client");
 
         let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
@@ -1758,6 +1789,7 @@ mod test {
             .finish()
             .await
             .expect("failed to forward response");
+        let client = client.expect("failed to recycle client");
 
         let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
@@ -2107,6 +2139,7 @@ mod test {
             .finish()
             .await
             .expect("failed to forward response");
+        let client = client.expect("failed to recycle client");
 
         let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
@@ -2120,6 +2153,84 @@ mod test {
             hello\r\n\
             0\r\n\
             \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_backend_response_downgraded_for_http10_client() {
+        // When a backend responds with 'transfer-encoding: chunked' but the
+        // frontend client is HTTP/1.0, the proxy must not forward chunked
+        // encoding (RFC 9112 section 6.1). Instead it should decode the chunks
+        // from the backend, and write the decoded stream of bytes to the
+        // frontend. The end of the body should be indicated by closing the
+        // frontend connection. The response head must have no transfer-encoding
+        // or content-length header, and the returned client must be None (the
+        // connection cannot be reused).
+        let frontend_reader = b"\
+            GET / HTTP/1.0\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let backend_reader = b"\
+            HTTP/1.1 200 Ok\r\n\
+            transfer-encoding: chunked\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            \r\n";
+        let mut backend_writer = Vec::new();
+
+        let backend_reader = BackendReader::new(backend_reader.as_ref(), 128);
+        let backend_writer = BackendWriter::new(&mut backend_writer);
+        let backend_connection = (backend_reader, backend_writer);
+
+        let proxy_client = ProxyClient::new(
+            FrontendReader::new(frontend_reader.as_ref(), 256),
+            FrontendWriter::new(&mut frontend_writer),
+            ProxyOptions::default(),
+        );
+
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .into_backend_request()
+            .forward(backend_connection)
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let (client, _backend_connection) = rbr
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
+            .await
+            .expect("failed to forward response");
+
+        // The connection must not be recycled after an EOF-framed response.
+        assert!(
+            client.is_none(),
+            "expected client to be None for HTTP/1.0 EOF response"
+        );
+
+        let expected_frontend_writer = b"\
+            HTTP/1.1 200 Ok\r\n\
+            Via: 1.1 jrpxy\r\n\
+            \r\n\
+            hello";
         assert_eq!(
             jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
             jrpxy_util::debug::AsciiDebug(&frontend_writer)
@@ -2178,6 +2289,7 @@ mod test {
             .finish()
             .await
             .expect("failed to forward response");
+        let client = client.expect("failed to recycle client");
 
         let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
@@ -2263,6 +2375,7 @@ mod test {
             .await
             .expect("failed to forward response");
         let backend_connection = backend_connection.unwrap();
+        let client = client.expect("failed to recycle client");
 
         // Release the mutable borrow on frontend_writer before asserting.
         let (frontend_reader, _) = client.into_parts();
@@ -2312,6 +2425,7 @@ mod test {
             .finish()
             .await
             .expect("second forward failed");
+        let client = client.expect("failed to recycle client");
 
         let (_, fw) = client.into_parts();
 
@@ -2391,6 +2505,7 @@ mod test {
             .await
             .expect("failed to forward response");
         let backend_connection = backend_connection.unwrap();
+        let client = client.expect("failed to recycle client");
 
         let (frontend_reader, frontend_writer) = client.into_parts();
 
@@ -2441,6 +2556,7 @@ mod test {
             .finish()
             .await
             .expect("failed to forward response");
+        let client = client.expect("failed to recycle client");
 
         let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();

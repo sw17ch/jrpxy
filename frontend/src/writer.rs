@@ -25,7 +25,11 @@
 //!        .unwrap();
 //!    frontend_body_writer.write(b"ab").await.unwrap();
 //!    frontend_body_writer.write(b"cde").await.unwrap();
-//!    let frontend_writer = frontend_body_writer.finish().await.unwrap();
+//!    let frontend_writer = frontend_body_writer
+//!        .finish()
+//!        .await
+//!        .expect("failed to finish")
+//!        .expect("failed to recycle frontend writer");
 //!
 //!    // Write the second response
 //!    let mut builder = ResponseBuilder::new(4);
@@ -99,6 +103,25 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         Self { io }
     }
 
+    /// Send the response with a body terminated by connection close (RFC 9112
+    /// section 6.3). Any framing headers from the origin are stripped. Use this
+    /// when the client cannot decode chunked transfer encoding (e.g. HTTP/1.0).
+    ///
+    /// Finishing the returned [`FrontendBodyWriter`] does not produce a
+    /// [`FrontendWriter`] - the connection must be closed after the body is
+    /// sent.
+    ///
+    /// Note that dropping this body has the same effect as finishing the body.
+    /// It is impossible for the client to determine if it received an entire
+    /// response based only on the standard headers and body.
+    pub async fn send_as_eof(self, response: &Response) -> FrontendResult<FrontendBodyWriter<I>> {
+        let Self { mut io } = self;
+        write_response_to(response, WriteFraming::StripFraming, &mut io)
+            .await
+            .map_err(FrontendError::WriteError)?;
+        Ok(FrontendBodyWriter::Close(FrontendEofBodyWriter { io }))
+    }
+
     /// Send the specified response with a chunked response body.
     pub async fn send_as_chunked(
         self,
@@ -152,9 +175,12 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
     /// Send the response to the frontend with no body, stripping any framing
     /// headers from the origin.
     ///
-    /// Use this for responses that must never carry a body by definition:
-    /// `1xx` informational responses and `204 No Content`. Forwarding a
+    /// Use this for responses that must never carry a body by definition: `1xx`
+    /// informational responses and `204 No Content`. Forwarding a
     /// `content-length` on these would corrupt the client's parser.
+    ///
+    /// Note that this returns [`FrontendBodylessBodyWriter`] rather than
+    /// [`FrontendBodyWriter`].
     ///
     /// # Panics (debug)
     /// Asserts in debug builds that the response carries no framing headers,
@@ -162,7 +188,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
     pub async fn send_as_no_content(
         self,
         response: &Response,
-    ) -> Result<FrontendBodyWriter<I>, FrontendError> {
+    ) -> Result<FrontendBodylessBodyWriter<I>, FrontendError> {
         debug_assert!(
             !response.headers().iter().any(|(n, _)| is_framing_header(n)),
             "send_as_no_content called on a response that contains framing headers \
@@ -172,9 +198,9 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         write_response_to(response, WriteFraming::StripFraming, &mut io)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter::Bodyless(FrontendBodylessBodyWriter {
+        Ok(FrontendBodylessBodyWriter {
             inner: BodylessBodyWriter::new(io),
-        }))
+        })
     }
 }
 
@@ -234,6 +260,30 @@ async fn write_response_to<W: AsyncWriteExt + Unpin>(
     w.flush().await?;
 
     Ok(())
+}
+
+/// Frontend writer for bodies terminated by connection close (RFC 9112 section
+/// 6.3).
+///
+/// Produced by [`FrontendWriter::send_as_eof`]. Finishing this writer does not
+/// return a [`FrontendWriter`] — the connection is closed once the body is
+/// sent.
+pub struct FrontendEofBodyWriter<I> {
+    io: I,
+}
+
+impl<I: AsyncWriteExt + Unpin> FrontendEofBodyWriter<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
+        self.io
+            .write_all(buf)
+            .await
+            .map_err(FrontendError::WriteError)
+    }
+
+    pub async fn finish(self) -> FrontendResult<()> {
+        let Self { mut io } = self;
+        io.flush().await.map_err(FrontendError::WriteError)
+    }
 }
 
 /// Frontend wrapper for [`BodylessBodyWriter`].
@@ -310,12 +360,13 @@ impl<I: AsyncWriteExt + Unpin> FrontendChunkedBodyWriter<I> {
     }
 }
 
-/// /// The body writer for a frontend connection; it is typed so that finishing
-/// always produces a [`FrontendWriter`] without exposing raw IO.
+/// The body writer for a frontend connection; it is typed so that finishing,
+/// when possible, can produce a [`FrontendWriter`] without exposing raw IO.
 pub enum FrontendBodyWriter<I> {
     Bodyless(FrontendBodylessBodyWriter<I>),
     CL(FrontendContentLengthBodyWriter<I>),
     TE(FrontendChunkedBodyWriter<I>),
+    Close(FrontendEofBodyWriter<I>),
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
@@ -326,20 +377,27 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
             )),
             FrontendBodyWriter::CL(w) => w.write(buf).await,
             FrontendBodyWriter::TE(w) => w.write(buf).await,
+            FrontendBodyWriter::Close(w) => w.write(buf).await,
         }
     }
 
-    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
+    pub async fn finish(self) -> FrontendResult<Option<FrontendWriter<I>>> {
         match self {
-            FrontendBodyWriter::Bodyless(w) => w.finish(),
-            FrontendBodyWriter::CL(w) => w.finish().await,
-            FrontendBodyWriter::TE(w) => w.finish().await,
+            FrontendBodyWriter::Bodyless(w) => w.finish().map(Some),
+            FrontendBodyWriter::CL(w) => w.finish().await.map(Some),
+            FrontendBodyWriter::TE(w) => w.finish().await.map(Some),
+            FrontendBodyWriter::Close(w) => {
+                let () = w.finish().await?;
+                Ok(None)
+            }
         }
     }
 
     pub async fn abort(self) -> FrontendResult<()> {
         match self {
-            FrontendBodyWriter::Bodyless(_) | FrontendBodyWriter::CL(_) => Ok(()),
+            FrontendBodyWriter::Bodyless(_)
+            | FrontendBodyWriter::CL(_)
+            | FrontendBodyWriter::Close(_) => Ok(()),
             FrontendBodyWriter::TE(w) => w.abort().await,
         }
     }
@@ -371,7 +429,12 @@ mod test {
         let cw = FrontendWriter::new(&mut buf);
         let r = cw.send_as_content_length(&res, 0).await.expect("can write");
 
-        let buf = r.finish().await.expect("failed to finish").into_inner();
+        let buf = r
+            .finish()
+            .await
+            .expect("failed to finish")
+            .unwrap()
+            .into_inner();
 
         // now we validate that the response contains what we expect. Notably:
         // - expect that the content-length has been replaced with 0
@@ -438,7 +501,12 @@ mod test {
             FrontendError::BodyWriteError(BodyError::BodyOverflow(10))
         ));
 
-        let _buf = r.finish().await.expect("failed to finish").into_inner();
+        let _buf = r
+            .finish()
+            .await
+            .expect("failed to finish")
+            .unwrap()
+            .into_inner();
     }
 
     #[tokio::test]
@@ -493,7 +561,12 @@ mod test {
             .await
             .expect("works, but shouldn't generate a chunk");
 
-        let _buf = r.finish().await.expect("failed to finish").into_inner();
+        let _buf = r
+            .finish()
+            .await
+            .expect("failed to finish")
+            .unwrap()
+            .into_inner();
     }
 
     #[tokio::test]
@@ -515,7 +588,11 @@ mod test {
             .send_as_content_length(&res, 0)
             .await
             .expect("first write works");
-        let cw = body_writer.finish().await.expect("failed to finish");
+        let cw = body_writer
+            .finish()
+            .await
+            .expect("failed to finish")
+            .expect("failed to return writer");
 
         // second response
         let mut cr = ResponseBuilder::new(8);
@@ -532,7 +609,11 @@ mod test {
             .await
             .expect("first write works");
         body_writer.write(b"01234").await.expect("failed to write");
-        let cw = body_writer.finish().await.expect("failed to finish");
+        let cw = body_writer
+            .finish()
+            .await
+            .expect("failed to finish")
+            .expect("failed to return writer");
 
         // third response
         let mut cr = ResponseBuilder::new(8);
@@ -551,7 +632,7 @@ mod test {
         let cw = body_writer.finish().await.expect("failed to finish");
 
         // check the output
-        let output_buf = cw.into_inner().as_slice();
+        let output_buf = cw.unwrap().into_inner().as_slice();
 
         let expected = b"\
             HTTP/1.1 200 Ok\r\n\
