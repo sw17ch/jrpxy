@@ -39,9 +39,7 @@
 //! ```
 
 use bytes::Bytes;
-use jrpxy_body::{
-    BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader, PeekableBodyReader,
-};
+use jrpxy_body::{BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader};
 use jrpxy_http_message::{
     framing::ParsedFraming,
     header::Headers,
@@ -53,8 +51,7 @@ use tokio::io::AsyncReadExt;
 use crate::error::{FrontendError, FrontendResult};
 
 /// Reads a request from a frontend reader. When `read()` is called, this type
-/// is consumed, and a [`FrontendRequest`] is returned. This can be used to
-/// inspect the request and peek the body.
+/// is consumed, and a [`FrontendRequest`] is returned.
 #[derive(Debug)]
 pub struct FrontendReader<I> {
     io_buffer: IoBuffer<I>,
@@ -161,8 +158,7 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
 }
 
 /// A request read from a [`FrontendReader`]. Provides access to the underlying
-/// request, and allows the request body, if any, to be peeked before it is
-/// consumed or drained.
+/// request.
 ///
 /// Use [`FrontendRequest::into_parts`] to retrieve the [`Request`] and
 /// [`FrontendBodyReader`].
@@ -300,12 +296,6 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
         }
     }
 
-    /// Convert this reader into a [`FrontendPeekableBodyReader`] that supports
-    /// peeking at body bytes without consuming them.
-    pub fn peekable(self) -> FrontendPeekableBodyReader<I> {
-        FrontendPeekableBodyReader::new(self)
-    }
-
     /// Drain all remaining bytes from the body and return a new
     /// [`FrontendReader`] ready to read the next request in the pipeline.
     pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
@@ -317,57 +307,6 @@ impl<I: AsyncReadExt + Unpin> FrontendBodyReader<I> {
                 Ok(reader)
             }
         }
-    }
-}
-
-/// A frontend request body reader with peek support.
-pub struct FrontendPeekableBodyReader<I> {
-    reader: PeekableBodyReader<I>,
-}
-
-impl<I> FrontendPeekableBodyReader<I> {
-    pub fn new(reader: FrontendBodyReader<I>) -> Self {
-        let inner = match reader {
-            FrontendBodyReader::Bodyless(r) => PeekableBodyReader::from(r.inner),
-            FrontendBodyReader::CL(r) => PeekableBodyReader::from(r.inner),
-            FrontendBodyReader::TE(r) => PeekableBodyReader::from(r.inner),
-        };
-        Self { reader: inner }
-    }
-}
-
-impl<I: AsyncReadExt + Unpin> FrontendPeekableBodyReader<I> {
-    /// See [`PeekableBodyReader::peek`]
-    pub async fn peek(&mut self, max_len: usize) -> FrontendResult<(bool, &[u8])> {
-        self.reader
-            .peek(max_len)
-            .await
-            .map_err(FrontendError::BodyReadError)
-    }
-
-    /// Read up to `max_len` bytes from the body. Returns `None` when the body
-    /// is complete.
-    pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
-        self.reader
-            .read(max_len)
-            .await
-            .map_err(FrontendError::BodyReadError)
-    }
-
-    /// Returns true when the body is fully drained.
-    pub fn drained(&self) -> bool {
-        self.reader.drained()
-    }
-
-    /// Drain all remaining bytes from the body and return a new
-    /// [`FrontendReader`] ready to read the next request in the pipeline.
-    pub async fn drain(self) -> FrontendResult<Option<FrontendReader<I>>> {
-        let Self { reader } = self;
-        let (io, parse_slots) = reader.drain().await.map_err(FrontendError::BodyReadError)?;
-        Ok(io.map(|io| FrontendReader {
-            io_buffer: io,
-            parse_slots,
-        }))
     }
 }
 
@@ -404,47 +343,6 @@ mod test {
         assert_eq!(&b"0"[..], body.read(1).await.unwrap().unwrap());
         assert_eq!(&b""[..], body.read(0).await.unwrap().unwrap());
         assert_eq!(&b"1234"[..], body.read(4).await.unwrap().unwrap());
-
-        // once the body is fully drained, always return none.
-        assert!(body.read(1).await.unwrap().is_none());
-        assert!(body.read(0).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn peek_cl_frontend() {
-        let buf = b"\
-            GET /cl HTTP/1.1\r\n\
-            Content-Length: 5\r\n\
-            \r\n\
-            01234\
-            extra bytes\
-            ";
-
-        let reader = FrontendReader::new(buf.as_slice(), 256);
-        let (req, body) = reader
-            .read(128)
-            .await
-            .expect("can't break into parts")
-            .into_parts();
-        let mut body = body.peekable();
-
-        assert_eq!(&b"GET"[..], req.method());
-        assert_eq!(&b"/cl"[..], req.path());
-
-        // same as read tests, but peek first.
-        let (complete, x) = body.peek(5).await.expect("can peek");
-        assert!(complete);
-        assert_eq!(&b"01234"[..], x);
-
-        assert_eq!(&b"0"[..], body.read(1).await.unwrap().unwrap());
-        assert_eq!(&b""[..], body.read(0).await.unwrap().unwrap());
-        assert_eq!(&b"1234"[..], body.read(4).await.unwrap().unwrap());
-
-        // peek again after reading all the data, make sure we're complete with
-        // no data.
-        let (complete, x) = body.peek(5).await.expect("can peek");
-        assert!(complete);
-        assert_eq!(&b""[..], x);
 
         // once the body is fully drained, always return none.
         assert!(body.read(1).await.unwrap().is_none());

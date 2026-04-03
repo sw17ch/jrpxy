@@ -5,9 +5,6 @@ use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::{MessageError, ParseSlots};
 use jrpxy_util::io_buffer::{IoBuffer, IoBufferError};
 
-pub mod peekable_reader;
-pub use peekable_reader::PeekableBodyReader;
-
 fn map_trailer_error(e: MessageError) -> BodyError {
     let trailer_error = match e {
         MessageError::Parse(httparse::Error::TooManyHeaders) => TrailerError::TooManyFields,
@@ -741,227 +738,10 @@ impl<I> BodylessBodyReader<I> {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
-
     use jrpxy_http_message::message::ParseSlots;
     use jrpxy_util::io_buffer::IoBuffer;
-    use tokio::io::AsyncWriteExt;
 
-    use crate::{
-        BodyError, BodylessBodyReader, ChunkedBodyReader, ChunkedBodyWriter,
-        ContentLengthBodyReader, PeekableBodyReader,
-    };
-
-    #[tokio::test]
-    async fn cl_peek_full() {
-        let input = b"\
-            0123456789
-            ";
-
-        let mut br = PeekableBodyReader::from(ContentLengthBodyReader::new(
-            10,
-            IoBuffer::new(&input[..]),
-            ParseSlots::default(),
-        ));
-        let (complete, slice) = br.peek(5).await.expect("peek works");
-        assert!(!complete);
-        assert_eq!(b"01234", slice);
-
-        let (complete, slice) = br.peek(10).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"0123456789", slice);
-
-        // peek again, but with a value longer than the total IO
-        let (complete, slice) = br.peek(11).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"0123456789", slice);
-
-        let buf = br
-            .read(10)
-            .await
-            .expect("peek works")
-            .expect("didn't get buf");
-        assert_eq!(&b"0123456789"[..], buf);
-    }
-
-    #[tokio::test]
-    async fn cl_peek_full_then_partial() {
-        let input = b"\
-            0123456789
-            ";
-
-        let mut br = PeekableBodyReader::from(ContentLengthBodyReader::new(
-            10,
-            IoBuffer::new(&input[..]),
-            ParseSlots::default(),
-        ));
-        let (complete, slice) = br.peek(5).await.expect("peek works");
-        assert!(!complete);
-        assert_eq!(b"01234", slice);
-
-        let (complete, slice) = br.peek(10).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"0123456789", slice);
-
-        // peek again, but with a value longer than the total IO
-        let (complete, slice) = br.peek(11).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"0123456789", slice);
-
-        // peek one more time, but smaller than the previous peek
-        let (complete, slice) = br.peek(1).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"0", slice);
-
-        let buf = br
-            .read(10)
-            .await
-            .expect("peek works")
-            .expect("didn't get buf");
-        assert_eq!(&b"0123456789"[..], buf);
-    }
-
-    #[tokio::test]
-    async fn cl_peek_partial() {
-        let input = b"\
-            0123456789
-            ";
-
-        let mut br = PeekableBodyReader::from(ContentLengthBodyReader::new(
-            10,
-            IoBuffer::new(&input[..]),
-            ParseSlots::default(),
-        ));
-
-        // read one byte
-        let buf = br
-            .read(1)
-            .await
-            .expect("peek works")
-            .expect("didn't get buf");
-        assert_eq!(&b"0"[..], buf);
-
-        // peek some data. doesn't contain data already read.
-        let (complete, slice) = br.peek(5).await.expect("peek works");
-        assert!(!complete);
-        assert_eq!(b"12345", slice);
-
-        // read less than the amount peeked
-        let buf = br
-            .read(4)
-            .await
-            .expect("peek works")
-            .expect("didn't get buf");
-        assert_eq!(&b"1234"[..], buf);
-
-        // peek the rest (using an oversized target length)
-        let (complete, slice) = br.peek(10).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"56789", slice);
-
-        // read the rest (again using an oversized target length)
-        let buf = br
-            .read(10)
-            .await
-            .expect("peek works")
-            .expect("didn't get buf");
-        assert_eq!(&b"56789"[..], buf);
-    }
-
-    #[tokio::test]
-    async fn trickle_peek_cl() {
-        let (mut left, right) = tokio::io::duplex(3);
-
-        // this task feeds bytes slowly
-        let w = tokio::spawn(async move {
-            let buf = b"\
-                0123456789\
-                ";
-
-            for c in buf.chunks(2) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                if left.write_all(c).await.is_err() {
-                    break;
-                }
-            }
-        });
-
-        let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
-            let mut reader = PeekableBodyReader::from(ContentLengthBodyReader::new(
-                10,
-                IoBuffer::new(right),
-                ParseSlots::default(),
-            ));
-            let (complete, buf) = reader.peek(9).await.expect("can't break into parts");
-
-            assert!(!complete);
-            assert_eq!(&b"012345678"[..], buf);
-
-            let (complete, buf) = reader.peek(10).await.expect("can't break into parts");
-
-            assert!(complete);
-            assert_eq!(&b"0123456789"[..], buf);
-        }));
-
-        let () = w.await.unwrap();
-        let () = r.await.unwrap().unwrap();
-    }
-
-    #[tokio::test]
-    async fn chunked_peek_full() {
-        let input = b"\
-            4\r\n\
-            0123\r\n\
-            3\r\n\
-            456\r\n\
-            1\r\n\
-            7\r\n\
-            2\r\n\
-            89\r\n\
-            0\r\n\
-            \r\n\
-            ";
-
-        let mut br = PeekableBodyReader::from(ChunkedBodyReader::new(
-            IoBuffer::new(&input[..]),
-            ParseSlots::default(),
-        ));
-        let (complete, slice) = br.peek(5).await.expect("peek works");
-        assert!(!complete);
-        assert_eq!(b"01234", slice);
-
-        let (complete, slice) = br.peek(10).await.expect("peek works");
-        // even though we read the entire body, the reader doesn't know that yet
-        // as we haven't yet seen the final chunk. we need to try and read one
-        // more byte to discover that we're finished.
-        assert!(!complete);
-        assert_eq!(b"0123456789", slice);
-
-        // peek again, but with a value longer than the total IO
-        let (complete, slice) = br.peek(11).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"0123456789", slice);
-
-        let buf = br
-            .read(10)
-            .await
-            .expect("peek works")
-            .expect("didn't get buf");
-        assert_eq!(&b"0123456789"[..], buf);
-    }
-
-    #[tokio::test]
-    async fn bodyless_peek() {
-        let input = b"";
-
-        let mut br = PeekableBodyReader::from(BodylessBodyReader::new(
-            IoBuffer::new(&input[..]),
-            ParseSlots::default(),
-        ));
-        let (complete, slice) = br.peek(5).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"", slice);
-    }
+    use crate::{BodyError, ChunkedBodyReader, ChunkedBodyWriter};
 
     #[tokio::test]
     async fn chunked_read_empty_chunk_extension() {
@@ -977,13 +757,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = PeekableBodyReader::from(ChunkedBodyReader::new(
-            IoBuffer::new(&input[..]),
-            ParseSlots::default(),
-        ));
-        let (complete, slice) = br.peek(10).await.expect("peek works");
-        assert!(complete);
-        assert_eq!(b"0123012", slice);
+        let mut br = ChunkedBodyReader::new(IoBuffer::new(&input[..]), ParseSlots::default());
+        let chunk = br.read(10).await.expect("read works").unwrap();
+        assert_eq!(b"0123", chunk.as_ref());
+        let chunk = br.read(10).await.expect("read works").unwrap();
+        assert_eq!(b"012", chunk.as_ref());
+        assert!(br.read(10).await.expect("read works").is_none());
     }
 
     #[tokio::test]

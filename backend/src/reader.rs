@@ -1,8 +1,5 @@
 use bytes::Bytes;
-use jrpxy_body::{
-    BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader, EofBodyReader,
-    PeekableBodyReader,
-};
+use jrpxy_body::{BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader, EofBodyReader};
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::{
     framing::ParsedFraming,
@@ -381,10 +378,6 @@ impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
         }
     }
 
-    pub fn peekable(self) -> BackendPeekableBodyReader<I> {
-        BackendPeekableBodyReader::new(self)
-    }
-
     /// Drain the body and return the next [`BackendReader`], discarding
     /// any trailers.
     pub async fn drain(self) -> BackendResult<Option<BackendReader<I>>> {
@@ -402,52 +395,6 @@ impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
                 Ok(None)
             }
         }
-    }
-}
-
-/// A backend response body reader with peek support.
-pub struct BackendPeekableBodyReader<I> {
-    reader: PeekableBodyReader<I>,
-}
-
-impl<I> BackendPeekableBodyReader<I> {
-    pub fn new(reader: BackendBodyReader<I>) -> Self {
-        let inner = match reader {
-            BackendBodyReader::Bodyless(r) => PeekableBodyReader::from(r.inner),
-            BackendBodyReader::CL(r) => PeekableBodyReader::from(r.inner),
-            BackendBodyReader::TE(r) => PeekableBodyReader::from(r.inner),
-            BackendBodyReader::Eof(r) => PeekableBodyReader::from(r.inner),
-        };
-        Self { reader: inner }
-    }
-}
-
-impl<I: AsyncReadExt + Unpin> BackendPeekableBodyReader<I> {
-    pub async fn peek(&mut self, len: usize) -> BackendResult<(bool, &[u8])> {
-        self.reader
-            .peek(len)
-            .await
-            .map_err(BackendError::BodyReadError)
-    }
-
-    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
-        self.reader
-            .read(max_len)
-            .await
-            .map_err(BackendError::BodyReadError)
-    }
-
-    pub fn drained(&self) -> bool {
-        self.reader.drained()
-    }
-
-    pub async fn drain(self) -> BackendResult<Option<BackendReader<I>>> {
-        let Self { reader } = self;
-        let (io, parse_slots) = reader.drain().await.map_err(BackendError::BodyReadError)?;
-        Ok(io.map(|io| BackendReader {
-            io_buffer: io,
-            parse_slots,
-        }))
     }
 }
 
@@ -495,54 +442,6 @@ mod test {
     }
 
     #[tokio::test]
-    async fn peek_cl_backend() {
-        let buf = b"\
-            HTTP/1.1 200 Ok\r\n\
-            x-req: second\r\n\
-            content-length: 5\r\n\
-            \r\n\
-            01234\
-            ";
-
-        let reader = BackendReader::new(buf.as_slice(), 256);
-        let (res, br) = reader
-            .read(true, 128)
-            .await
-            .expect("can split into parts")
-            .try_into_response()
-            .unwrap()
-            .into_parts();
-        let mut br = br.peekable();
-
-        assert_eq!(HttpVersion::Http11, res.version());
-        assert_eq!(200, res.code());
-        assert_eq!(&b"Ok"[..], res.reason());
-
-        // same as read tests, but peek first.
-        let (complete, x) = br.peek(5).await.expect("can peek");
-        assert!(complete);
-        assert_eq!(&b"01234"[..], x);
-
-        let x = br.read(3).await.expect("can read").unwrap();
-        assert_eq!(Bytes::from_static(b"012"), x);
-        let x = br.read(3).await.expect("can read").unwrap();
-        assert_eq!(Bytes::from_static(b"34"), x);
-
-        // peek again after reading all the data, make sure we're complete with
-        // no data.
-        let (complete, x) = br.peek(5).await.expect("can peek");
-        assert!(complete);
-        assert_eq!(&b""[..], x);
-
-        let reader = br.drain().await.expect("failed to drian");
-
-        let io_buffer = reader.unwrap().into_parts();
-        let (rest_unread, rest_buffered) = io_buffer.into_parts();
-        assert!(rest_unread.is_empty());
-        assert!(rest_buffered.is_empty());
-    }
-
-    #[tokio::test]
     async fn read_te_backend() {
         let buf = b"\
             HTTP/1.1 200 Ok\r\n\
@@ -574,60 +473,6 @@ mod test {
         assert_eq!(Bytes::from_static(b"012"), x);
         let x = br.read(3).await.expect("can read").unwrap();
         assert_eq!(Bytes::from_static(b"345"), x);
-
-        let reader = br.drain().await.expect("failed to drian");
-
-        let io_buffer = reader.unwrap().into_parts();
-        let (rest_unread, rest_buffered) = io_buffer.into_parts();
-        assert!(rest_unread.is_empty());
-        assert!(rest_buffered.is_empty());
-    }
-
-    #[tokio::test]
-    async fn peek_te_backend() {
-        let buf = b"\
-            HTTP/1.1 200 Ok\r\n\
-            x-req: second\r\n\
-            transfer-encoding: chunked\r\n\
-            \r\n\
-            3\r\n\
-            012\r\n\
-            3\r\n\
-            345\r\n\
-            0\r\n\
-            \r\n\
-            ";
-
-        let reader = BackendReader::new(buf.as_slice(), 256);
-        let (res, br) = reader
-            .read(true, 128)
-            .await
-            .expect("can split into parts")
-            .try_into_response()
-            .unwrap()
-            .into_parts();
-        let mut br = br.peekable();
-
-        assert_eq!(HttpVersion::Http11, res.version());
-        assert_eq!(200, res.code());
-        assert_eq!(&b"Ok"[..], res.reason());
-
-        // same as read tests, but peek first. peek one extra byte so we know
-        // it's complete.
-        let (complete, x) = br.peek(7).await.expect("can peek");
-        assert!(complete);
-        assert_eq!(&b"012345"[..], x);
-
-        let x = br.read(3).await.expect("can read").unwrap();
-        assert_eq!(Bytes::from_static(b"012"), x);
-        let x = br.read(3).await.expect("can read").unwrap();
-        assert_eq!(Bytes::from_static(b"345"), x);
-
-        // peek again after reading all the data, make sure we're complete with
-        // no data.
-        let (complete, x) = br.peek(7).await.expect("can peek");
-        assert!(complete);
-        assert_eq!(&b""[..], x);
 
         let reader = br.drain().await.expect("failed to drian");
 
