@@ -33,15 +33,21 @@ impl<I: AsyncReadExt + Unpin> PeekableInner<I> {
         }
     }
 
-    async fn drain(self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
+    async fn drain(self) -> BodyResult<(Option<IoBuffer<I>>, ParseSlots)> {
         match self {
-            PeekableInner::Bodyless(r) => Ok(r.drain()),
-            PeekableInner::CL(r) => r.drain().await,
+            PeekableInner::Bodyless(r) => {
+                let (io, parse_slots) = r.drain();
+                Ok((Some(io), parse_slots))
+            }
+            PeekableInner::CL(r) => {
+                let (io, parse_slots) = r.drain().await?;
+                Ok((Some(io), parse_slots))
+            }
             PeekableInner::TE(r) => {
                 let (io, parse_slots, _trailers) = r.drain().await?;
-                Ok((io, parse_slots))
+                Ok((Some(io), parse_slots))
             }
-            PeekableInner::Eof(r) => r.drain().await,
+            PeekableInner::Eof(r) => Ok((None, r.drain().await?)),
         }
     }
 }
@@ -130,7 +136,7 @@ impl<I: AsyncReadExt + Unpin> PeekableBodyReader<I> {
 
     /// Drain the body and return the underlying IO buffer along with the
     /// [`ParseSlots`] so the caller can reuse the allocation.
-    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
+    pub async fn drain(self) -> BodyResult<(Option<IoBuffer<I>>, ParseSlots)> {
         // peeked bytes have already been consumed from the underlying IO,
         // so we just need to drain the inner reader
         self.inner.drain().await

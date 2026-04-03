@@ -361,13 +361,13 @@ impl<I: AsyncReadExt + Unpin> FrontendPeekableBodyReader<I> {
 
     /// Drain all remaining bytes from the body and return a new
     /// [`FrontendReader`] ready to read the next request in the pipeline.
-    pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
+    pub async fn drain(self) -> FrontendResult<Option<FrontendReader<I>>> {
         let Self { reader } = self;
         let (io, parse_slots) = reader.drain().await.map_err(FrontendError::BodyReadError)?;
-        Ok(FrontendReader {
+        Ok(io.map(|io| FrontendReader {
             io_buffer: io,
             parse_slots,
-        })
+        }))
     }
 }
 

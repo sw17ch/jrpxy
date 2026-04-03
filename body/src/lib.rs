@@ -708,18 +708,17 @@ impl<I: AsyncReadExt + Unpin> EofBodyReader<I> {
         self.eof
     }
 
-    pub async fn drain(mut self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
+    pub async fn drain(mut self) -> BodyResult<ParseSlots> {
         while let Some(_drained) = self.read(DRAIN_SIZE).await? {
             // discard anything we read
         }
         let Self {
-            io,
+            // drop the IO. we can't use it again as it has reached EOF.
+            io: _,
             parse_slots,
             eof: _,
         } = self;
-        // TODO: drain should not hand back the IO. It has been closed and
-        // cannot be reused.
-        Ok((io, parse_slots))
+        Ok(parse_slots)
     }
 }
 

@@ -346,13 +346,10 @@ impl<I: AsyncReadExt + Unpin> BackendEofBodyReader<I> {
             .map_err(BackendError::BodyReadError)
     }
 
-    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+    pub async fn drain(self) -> BackendResult<ParseSlots> {
         let Self { inner } = self;
-        let (io, parse_slots) = inner.drain().await.map_err(BackendError::BodyReadError)?;
-        Ok(BackendReader {
-            io_buffer: io,
-            parse_slots,
-        })
+        let parse_slots = inner.drain().await.map_err(BackendError::BodyReadError)?;
+        Ok(parse_slots)
     }
 }
 
@@ -390,15 +387,20 @@ impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
 
     /// Drain the body and return the next [`BackendReader`], discarding
     /// any trailers.
-    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+    pub async fn drain(self) -> BackendResult<Option<BackendReader<I>>> {
         match self {
-            BackendBodyReader::Bodyless(r) => r.drain(),
-            BackendBodyReader::CL(r) => r.drain().await,
+            BackendBodyReader::Bodyless(r) => r.drain().map(Some),
+            BackendBodyReader::CL(r) => r.drain().await.map(Some),
             BackendBodyReader::TE(r) => {
                 let (reader, _trailers) = r.drain().await?;
-                Ok(reader)
+                Ok(Some(reader))
             }
-            BackendBodyReader::Eof(r) => r.drain().await,
+            BackendBodyReader::Eof(r) => {
+                // TODO: we could probably figure out a way to reuse these
+                // instead of dropping them.
+                let _parse_slots = r.drain().await?;
+                Ok(None)
+            }
         }
     }
 }
@@ -439,13 +441,13 @@ impl<I: AsyncReadExt + Unpin> BackendPeekableBodyReader<I> {
         self.reader.drained()
     }
 
-    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+    pub async fn drain(self) -> BackendResult<Option<BackendReader<I>>> {
         let Self { reader } = self;
         let (io, parse_slots) = reader.drain().await.map_err(BackendError::BodyReadError)?;
-        Ok(BackendReader {
+        Ok(io.map(|io| BackendReader {
             io_buffer: io,
             parse_slots,
-        })
+        }))
     }
 }
 
@@ -486,7 +488,7 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let io_buffer = reader.into_parts();
+        let io_buffer = reader.unwrap().into_parts();
         let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
@@ -534,7 +536,7 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let io_buffer = reader.into_parts();
+        let io_buffer = reader.unwrap().into_parts();
         let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
@@ -575,7 +577,7 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let io_buffer = reader.into_parts();
+        let io_buffer = reader.unwrap().into_parts();
         let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
@@ -629,7 +631,7 @@ mod test {
 
         let reader = br.drain().await.expect("failed to drian");
 
-        let io_buffer = reader.into_parts();
+        let io_buffer = reader.unwrap().into_parts();
         let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
@@ -659,7 +661,7 @@ mod test {
         assert!(br.read(5).await.expect("can read").is_none());
         let reader = br.drain().await.expect("failed to drian");
 
-        let io_buffer = reader.into_parts();
+        let io_buffer = reader.unwrap().into_parts();
         let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
@@ -689,7 +691,7 @@ mod test {
         assert!(br.read(5).await.expect("can read").is_none());
         let reader = br.drain().await.expect("failed to drian");
 
-        let io_buffer = reader.into_parts();
+        let io_buffer = reader.unwrap().into_parts();
         let (rest_unread, rest_buffered) = io_buffer.into_parts();
         assert!(rest_unread.is_empty());
         assert!(rest_buffered.is_empty());
@@ -867,7 +869,7 @@ mod test {
         assert!(body.is_none());
         let reader = body_reader.drain().await.expect("failed to drain");
 
-        let io_buffer = reader.into_parts();
+        let io_buffer = reader.unwrap().into_parts();
         let (rest_unread, rest_buffered) = io_buffer.into_parts();
         let rest = rest_unread
             .iter()

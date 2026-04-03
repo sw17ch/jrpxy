@@ -837,7 +837,9 @@ where
 
     /// Drive the body copy in both directions concurrently and return a
     /// [`ProxyClient`] ready for the next request.
-    pub async fn finish(self) -> ProxyResult<(ProxyClient<FR, FW>, BackendConnection<BR, BW>)> {
+    pub async fn finish(
+        self,
+    ) -> ProxyResult<(ProxyClient<FR, FW>, Option<BackendConnection<BR, BW>>)> {
         let Self {
             options,
             mut frontend_body_reader,
@@ -902,7 +904,7 @@ where
                                 (BackendBodyReader::TE(br), FrontendBodyWriterKind::TE(fw)) => {
                                     let (next_backend, trailers) = br.drain().await?;
                                     let next_frontend = fw.finish_with_trailers(&trailers).await?;
-                                    Ok((next_backend, next_frontend))
+                                    Ok((Some(next_backend), next_frontend))
                                 }
                                 (br, fw) => {
                                     let next_backend = br.drain().await?;
@@ -975,6 +977,7 @@ where
             Some(Err(e)) => return Err(ProxyError::FrontendCopyError(e)),
             None => return Err(ProxyError::FrontendCopyIncomplete),
         };
+        let backend_connection = backend_reader.map(move |br| (br, backend_writer));
 
         Ok((
             ProxyClient {
@@ -982,7 +985,7 @@ where
                 frontend_writer,
                 options,
             },
-            (backend_reader, backend_writer),
+            backend_connection,
         ))
     }
 }
@@ -1574,13 +1577,14 @@ mod test {
                 .is_none()
         );
 
-        let (client, (backend_reader, backend_writer)) = rbr
+        let (client, backend_connection) = rbr
             .forward_response_head()
             .await
             .expect("forward_response_head failed")
             .finish()
             .await
             .expect("failed to forward response");
+        let (backend_reader, backend_writer) = backend_connection.unwrap();
         bp.give_connection(backend_reader, backend_writer);
 
         // split up the client into pieces, and make sure they all reflect
@@ -1886,13 +1890,14 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let (client, (_backend_reader, backend_writer)) = rbr
+        let (client, backend_connection) = rbr
             .forward_response_head()
             .await
             .expect("forward_response_head failed")
             .finish()
             .await
             .expect("failed to forward response");
+        let (_backend_reader, backend_writer) = backend_connection.unwrap();
         let _ = client;
         let backend_writer = backend_writer.into_inner();
 
@@ -1953,13 +1958,14 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let (_client, (_backend_reader, backend_writer)) = rbr
+        let (_client, backend_connection) = rbr
             .forward_response_head()
             .await
             .expect("forward_response_head failed")
             .finish()
             .await
             .expect("failed to forward response");
+        let (_backend_reader, backend_writer) = backend_connection.unwrap();
         let backend_writer = backend_writer.into_inner();
 
         let expected_backend_writer = b"\
@@ -2023,13 +2029,14 @@ mod test {
             BackendResponseStream::Informational(_) => panic!("unexpected informational"),
         };
 
-        let (_client, (_backend_reader, backend_writer)) = rbr
+        let (_client, backend_connection) = rbr
             .forward_response_head()
             .await
             .expect("forward_response_head failed")
             .finish()
             .await
             .expect("failed to forward response");
+        let (_backend_reader, backend_writer) = backend_connection.unwrap();
         let backend_writer = backend_writer.into_inner();
 
         let expected_backend_writer = b"\
@@ -2257,6 +2264,7 @@ mod test {
             .finish()
             .await
             .expect("failed to forward response");
+        let backend_connection = backend_connection.unwrap();
 
         // Release the mutable borrow on frontend_writer before asserting.
         let (frontend_reader, _) = client.into_parts();
@@ -2384,6 +2392,7 @@ mod test {
             .finish()
             .await
             .expect("failed to forward response");
+        let backend_connection = backend_connection.unwrap();
 
         let (frontend_reader, frontend_writer) = client.into_parts();
 
