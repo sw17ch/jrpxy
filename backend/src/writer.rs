@@ -1,7 +1,6 @@
-pub use jrpxy_body::BodyWriterKind;
-use jrpxy_body::{
-    BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter, is_framing_header,
-};
+use jrpxy_body::is_framing_header;
+pub use jrpxy_body::writer::BodyWriterKind;
+use jrpxy_body::writer::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter};
 use jrpxy_http_message::{framing::WriteFraming, header::Headers, message::Request};
 use tokio::io::{self, AsyncWriteExt};
 
@@ -182,7 +181,7 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriterKind<I> {
     pub async fn write(&mut self, buf: &bytes::Bytes) -> BackendResult<()> {
         match self {
             BackendBodyWriterKind::Bodyless(_) => Err(BackendError::BodyWriteError(
-                jrpxy_body::BodyError::BodyOverflow(buf.len() as u64),
+                jrpxy_body::error::BodyError::BodyOverflow(buf.len() as u64),
             )),
             BackendBodyWriterKind::CL(w) => w.write(buf).await,
             BackendBodyWriterKind::TE(w) => w.write(buf).await,
@@ -239,7 +238,7 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
 
 #[cfg(test)]
 mod test {
-    use jrpxy_body::BodyError;
+    use jrpxy_body::error::BodyError;
     use jrpxy_http_message::{message::RequestBuilder, version::HttpVersion};
 
     use crate::{error::BackendError, writer::BackendWriter};

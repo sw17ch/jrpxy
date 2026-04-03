@@ -1,5 +1,7 @@
 use bytes::Bytes;
-use jrpxy_body::{BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader, EofBodyReader};
+use jrpxy_body::reader::{
+    BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader, EofBodyReader,
+};
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::{
     framing::ParsedFraming,

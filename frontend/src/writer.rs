@@ -64,11 +64,10 @@
 //! }
 //! ```
 
-use jrpxy_body::BodyWriterKind;
-use jrpxy_body::BodylessBodyWriter;
-use jrpxy_body::ChunkedBodyWriter;
-use jrpxy_body::ContentLengthBodyWriter;
 use jrpxy_body::is_framing_header;
+use jrpxy_body::writer::{
+    BodyWriterKind, BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter,
+};
 use jrpxy_http_message::framing::WriteFraming;
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::Response;
@@ -319,7 +318,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriterKind<I> {
     pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
         match self {
             FrontendBodyWriterKind::Bodyless(_) => Err(FrontendError::BodyWriteError(
-                jrpxy_body::BodyError::BodyOverflow(buf.len() as u64),
+                jrpxy_body::error::BodyError::BodyOverflow(buf.len() as u64),
             )),
             FrontendBodyWriterKind::CL(w) => w.write(buf).await,
             FrontendBodyWriterKind::TE(w) => w.write(buf).await,
@@ -379,7 +378,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
 
 #[cfg(test)]
 mod test {
-    use jrpxy_body::BodyError;
+    use jrpxy_body::error::BodyError;
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
     use jrpxy_util::debug::AsciiDebug;
 

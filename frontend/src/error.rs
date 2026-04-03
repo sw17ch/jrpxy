@@ -1,6 +1,6 @@
 use jrpxy_http_message::{header::HeaderError, message::MessageError};
 
-use jrpxy_body::BodyError;
+use jrpxy_body::error::BodyError;
 use tokio::io;
 
 /// Possible errors from interacting with frontends.

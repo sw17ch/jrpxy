@@ -39,7 +39,7 @@
 //! ```
 
 use bytes::Bytes;
-use jrpxy_body::{BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader};
+use jrpxy_body::reader::{BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader};
 use jrpxy_http_message::{
     framing::ParsedFraming,
     header::Headers,
@@ -315,7 +315,7 @@ mod test {
     use std::time::Duration;
 
     use bytes::BytesMut;
-    use jrpxy_body::BodyError;
+    use jrpxy_body::error::BodyError;
     use tokio::io::AsyncWriteExt;
 
     use crate::{error::FrontendError, reader::FrontendReader};

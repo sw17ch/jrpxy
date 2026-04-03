@@ -1,4 +1,4 @@
-use jrpxy_body::BodyError;
+use jrpxy_body::error::BodyError;
 use jrpxy_http_message::{header::HeaderError, message::MessageError};
 use tokio::io;
 
