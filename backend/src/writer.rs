@@ -1,6 +1,9 @@
-use jrpxy_body::is_framing_header;
 use jrpxy_body::writer::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter};
-use jrpxy_http_message::{framing::WriteFraming, header::Headers, message::Request};
+use jrpxy_http_message::{
+    framing::{WriteFraming, is_framing_header},
+    header::Headers,
+    message::Request,
+};
 use tokio::io::{self, AsyncWriteExt};
 
 use crate::error::{BackendError, BackendResult};

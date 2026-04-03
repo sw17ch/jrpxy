@@ -68,9 +68,9 @@
 //! }
 //! ```
 
-use jrpxy_body::is_framing_header;
 use jrpxy_body::writer::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter};
 use jrpxy_http_message::framing::WriteFraming;
+use jrpxy_http_message::framing::is_framing_header;
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::Response;
 use tokio::io;

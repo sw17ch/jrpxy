@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 jrpxy-backend = { workspace = true }
-jrpxy-body = { workspace = true }
 jrpxy-frontend = { workspace = true }
 jrpxy-http-message = { workspace = true }
 

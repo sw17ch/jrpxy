@@ -76,7 +76,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "jrpxy-backend",
- "jrpxy-body",
  "jrpxy-frontend",
  "jrpxy-http-message",
  "jrpxy-pool",
