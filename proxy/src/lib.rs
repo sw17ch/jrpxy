@@ -760,13 +760,11 @@ where
             backend_body_writer,
         } = self;
 
-        // TODO: use client_options to decide if we need to buffer the response
-        // (chunk-encoded) or if we can send back a content-length.
         let is_head = pending.client_options.is_head;
+        let client_cannot_chunk = pending.client_options.version == HttpVersion::Http10;
         let (response, backend_body_reader) = proxy_response.into_frontend_response();
         let (options, frontend_body_writer) = match &backend_body_reader {
             BackendBodyReader::TE(_) => {
-                let client_cannot_chunk = pending.client_options.version == HttpVersion::Http10;
                 if client_cannot_chunk {
                     pending.send_as_eof(response).await?
                 } else {
@@ -789,10 +787,16 @@ where
                     pending.send_as_no_content(response).await?
                 }
             }
-            // The backend sent an EOF-terminated body (no framing headers).
-            // Re-frame as chunked when forwarding to the frontend so the
-            // frontend connection can remain open.
-            BackendBodyReader::Eof(_) => pending.send_as_chunked(response).await?,
+            // The backend sent an EOF-terminated body (no framing headers). If
+            // supported, re-frame as chunked when forwarding to the frontend so
+            // the frontend connection can remain open.
+            BackendBodyReader::Eof(_) => {
+                if client_cannot_chunk {
+                    pending.send_as_eof(response).await?
+                } else {
+                    pending.send_as_chunked(response).await?
+                }
+            }
         };
 
         Ok(BodyExchanger {
@@ -2229,6 +2233,75 @@ mod test {
         let expected_frontend_writer = b"\
             HTTP/1.1 200 Ok\r\n\
             Via: 1.1 jrpxy\r\n\
+            \r\n\
+            hello";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(&frontend_writer)
+        );
+    }
+
+    #[tokio::test]
+    async fn eof_from_backend_needs_to_be_eof_for_http10_client() {
+        // When a backend sends us an EOF encoded response, and we have a
+        // request from an HTTP/1.0 client, we need to use EOF encoding to the
+        // client as well.
+        let frontend_reader = b"\
+            GET / HTTP/1.0\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let backend_reader = b"\
+            HTTP/1.0 200 Ok\r\n\
+            \r\n\
+            hello";
+        let mut backend_writer = Vec::new();
+
+        let backend_reader = BackendReader::new(backend_reader.as_ref(), 128);
+        let backend_writer = BackendWriter::new(&mut backend_writer);
+        let backend_connection = (backend_reader, backend_writer);
+
+        let proxy_client = ProxyClient::new(
+            FrontendReader::new(frontend_reader.as_ref(), 256),
+            FrontendWriter::new(&mut frontend_writer),
+            ProxyOptions::default(),
+        );
+
+        let be_res_stat = proxy_client
+            .start()
+            .await
+            .expect("client start failed")
+            .into_backend_request()
+            .forward(backend_connection)
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Response(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let (client, _backend_connection) = rbr
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
+            .await
+            .expect("failed to forward response");
+
+        // The connection must not be recycled after an EOF-framed response.
+        assert!(
+            client.is_none(),
+            "expected client to be None for HTTP/1.0 EOF response"
+        );
+
+        let expected_frontend_writer = b"\
+            HTTP/1.1 200 Ok\r\n\
+            Via: 1.0 jrpxy\r\n\
             \r\n\
             hello";
         assert_eq!(
