@@ -163,6 +163,9 @@ impl Headers {
         }
     }
 
+    /// Remove all the headers identified by `pred` and return the removed
+    /// headers as a new [`Headers`]. The non-removed headers are retained in
+    /// `self`.
     pub fn remove<P>(&mut self, mut pred: P) -> Self
     where
         P: FnMut(&(Bytes, Bytes)) -> bool,

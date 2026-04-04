@@ -7,6 +7,7 @@ edition = "2024"
 jrpxy-backend = { workspace = true }
 jrpxy-frontend = { workspace = true }
 jrpxy-http-message = { workspace = true }
+jrpxy-util = { workspace = true }
 
 bytes = { workspace = true }
 tokio = { workspace = true }
@@ -14,4 +15,3 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 jrpxy-pool = { workspace = true }
-jrpxy-util = { workspace = true }

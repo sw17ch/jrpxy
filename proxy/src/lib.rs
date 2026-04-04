@@ -2,9 +2,9 @@ use std::borrow::Cow;
 use std::future::Future;
 use std::task::Poll;
 
-use bytes::Bytes;
+use bytes::{Buf, Bytes};
 use jrpxy_backend::{
-    error::{BackendError, BackendResult},
+    error::BackendError,
     reader::{
         BackendBodyReader, BackendReader, BackendResponse as BackendReaderResponse,
         BackendStreamReader, ResponseStream,
@@ -12,7 +12,6 @@ use jrpxy_backend::{
     writer::{BackendBodyWriter, BackendWriter},
 };
 use jrpxy_frontend::{
-    error::FrontendError,
     reader::{FrontendBodyReader, FrontendReader, FrontendRequest},
     writer::{FrontendBodyWriter, FrontendWriter},
 };
@@ -21,11 +20,13 @@ use jrpxy_http_message::{
     message::{Request, Response},
     version::HttpVersion,
 };
+use jrpxy_util::parse::is_valid_tchar;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 pub mod error;
 pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
+use crate::error::ProxyBackendError;
 pub use crate::error::ProxyFrontendError;
 
 /// Options used to govern the behavior of a [`ProxyClient`]
@@ -112,19 +113,30 @@ where
                     frontend_writer,
                     options,
                     HttpVersion::Http11,
-                    error,
+                    error.into(),
                 ));
             }
         };
 
         let is_head = req.req().method() == b"HEAD".as_slice();
         let version = req.req().version();
+        let connection_tokens = match get_connection_tokens(req.req().headers()) {
+            Ok(c) => c,
+            Err(e) => {
+                return Err(FrontendRequestError::new_frontend(
+                    frontend_writer,
+                    options,
+                    version,
+                    e.into(),
+                ));
+            }
+        };
         let pending = PendingFrontendResponse {
             frontend_writer,
             options,
             client_options: ClientOptions { is_head, version },
         };
-        let frontend_request = FrontendProxyRequest::new(req, pending);
+        let frontend_request = FrontendProxyRequest::new(req, pending, &connection_tokens);
 
         let method = frontend_request.req().method();
         if method == b"CONNECT".as_slice() {
@@ -169,7 +181,7 @@ impl<FR, FW> FrontendRequestError<FR, FW> {
         frontend_writer: FrontendWriter<FW>,
         options: ProxyOptions,
         version: HttpVersion,
-        error: FrontendError,
+        error: ProxyFrontendError,
     ) -> FrontendRequestError<FR, FW> {
         FrontendRequestError::Frontend(FrontendRequestErrorKindRead {
             pending: PendingFrontendResponse {
@@ -197,7 +209,7 @@ impl<FR, FW> std::fmt::Debug for FrontendRequestError<FR, FW> {
 impl<FR, FW> From<FrontendRequestError<FR, FW>> for ProxyError {
     fn from(value: FrontendRequestError<FR, FW>) -> Self {
         match value {
-            FrontendRequestError::Frontend(read) => ProxyError::FrontendError(read.error),
+            FrontendRequestError::Frontend(read) => ProxyError::ProxyFrontend(read.error),
             FrontendRequestError::Request(request) => ProxyError::ProxyFrontend(request.error),
         }
     }
@@ -207,11 +219,11 @@ impl<FR, FW> From<FrontendRequestError<FR, FW>> for ProxyError {
 /// recover the reader, but we can write something back.
 pub struct FrontendRequestErrorKindRead<FW> {
     pending: PendingFrontendResponse<FW>,
-    error: FrontendError,
+    error: ProxyFrontendError,
 }
 
 impl<FW> FrontendRequestErrorKindRead<FW> {
-    pub fn error(&self) -> &FrontendError {
+    pub fn error(&self) -> &ProxyFrontendError {
         &self.error
     }
 
@@ -267,7 +279,7 @@ impl<FR, FW> std::fmt::Debug for BackendRequestError<FR, FW> {
 
 impl<FR, FW> From<BackendRequestError<FR, FW>> for ProxyError {
     fn from(e: BackendRequestError<FR, FW>) -> Self {
-        ProxyError::BackendError(e.error)
+        ProxyError::ProxyBackend(e.error.into())
     }
 }
 
@@ -295,7 +307,7 @@ impl<FR, FW> BackendRequestError<FR, FW> {
 /// [`into_backend_request`]: BackendResponseError::into_backend_request
 pub struct BackendResponseError<FR, FW> {
     request: BackendProxyRequest<FR, FW>,
-    error: BackendError,
+    error: ProxyBackendError,
 }
 
 impl<FR, FW> std::fmt::Debug for BackendResponseError<FR, FW> {
@@ -308,13 +320,13 @@ impl<FR, FW> std::fmt::Debug for BackendResponseError<FR, FW> {
 
 impl<FR, FW> From<BackendResponseError<FR, FW>> for ProxyError {
     fn from(e: BackendResponseError<FR, FW>) -> Self {
-        ProxyError::BackendError(e.error)
+        ProxyError::ProxyBackend(e.error)
     }
 }
 
 impl<FR, FW> BackendResponseError<FR, FW> {
     /// Returns the backend error that caused this failure.
-    pub fn error(&self) -> &BackendError {
+    pub fn error(&self) -> &ProxyBackendError {
         &self.error
     }
 
@@ -336,7 +348,7 @@ impl<FR, FW> BackendResponseError<FR, FW> {
 pub struct BackendStreamError<FR, FW> {
     frontend_body_reader: FrontendBodyReader<FR>,
     pending: PendingFrontendResponse<FW>,
-    error: BackendError,
+    error: ProxyBackendError,
 }
 
 impl<FR, FW> std::fmt::Debug for BackendStreamError<FR, FW> {
@@ -349,13 +361,13 @@ impl<FR, FW> std::fmt::Debug for BackendStreamError<FR, FW> {
 
 impl<FR, FW> From<BackendStreamError<FR, FW>> for ProxyError {
     fn from(e: BackendStreamError<FR, FW>) -> Self {
-        ProxyError::BackendError(e.error)
+        ProxyError::ProxyBackend(e.error)
     }
 }
 
 impl<FR, FW> BackendStreamError<FR, FW> {
     /// Returns the backend error that caused this failure.
-    pub fn error(&self) -> &BackendError {
+    pub fn error(&self) -> &ProxyBackendError {
         &self.error
     }
 
@@ -397,7 +409,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     pub async fn send_informational(
         self,
         mut response: Response,
-    ) -> Result<PendingFrontendResponse<FW>, FrontendError> {
+    ) -> Result<PendingFrontendResponse<FW>, ProxyFrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -419,7 +431,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     pub async fn send_as_chunked(
         self,
         mut response: Response,
-    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), ProxyFrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -437,7 +449,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
         self,
         mut response: Response,
         body_len: u64,
-    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), ProxyFrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -457,7 +469,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     pub async fn send_as_bodyless_keep_framing(
         self,
         mut response: Response,
-    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), ProxyFrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -480,7 +492,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     pub async fn send_as_no_content(
         self,
         mut response: Response,
-    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), ProxyFrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -499,7 +511,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
     async fn send_as_eof(
         self,
         mut response: Response,
-    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), FrontendError> {
+    ) -> Result<(ProxyOptions, FrontendBodyWriter<FW>), ProxyFrontendError> {
         let Self {
             frontend_writer,
             options,
@@ -526,7 +538,7 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
 /// [`Frontend`]: InformationalForwardError::Frontend
 /// [`Backend`]: InformationalForwardError::Backend
 pub enum InformationalForwardError<FR, FW> {
-    Frontend(FrontendError),
+    Frontend(ProxyFrontendError),
     Backend(BackendStreamError<FR, FW>),
 }
 
@@ -542,8 +554,8 @@ impl<FR, FW> std::fmt::Debug for InformationalForwardError<FR, FW> {
 impl<FR, FW> From<InformationalForwardError<FR, FW>> for ProxyError {
     fn from(e: InformationalForwardError<FR, FW>) -> Self {
         match e {
-            InformationalForwardError::Frontend(e) => ProxyError::FrontendError(e),
-            InformationalForwardError::Backend(e) => ProxyError::BackendError(e.error),
+            InformationalForwardError::Frontend(e) => ProxyError::ProxyFrontend(e),
+            InformationalForwardError::Backend(e) => ProxyError::ProxyBackend(e.error),
         }
     }
 }
@@ -593,11 +605,19 @@ where
                 // backend_reader and backend_body_writer are both discarded;
                 // the backend connection is broken.
                 drop(backend_body_writer);
-                return Err(BackendResponseError { request, error });
+                return Err(BackendResponseError {
+                    request,
+                    error: error.into(),
+                });
+            }
+        };
+        let response_stream = match ProxyResponseStream::new(response_stream) {
+            Ok(s) => s,
+            Err(e) => {
+                return Err(BackendResponseError { request, error: e });
             }
         };
         let (_, frontend_body_reader, pending) = request.into_parts();
-        let response_stream = ProxyResponseStream::new(response_stream);
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 BackendResponseStream::Response(BackendResponse {
@@ -1021,6 +1041,83 @@ where
     }
 }
 
+#[derive(Debug)]
+pub enum ConnectionTokenParserError {
+    IllegalChar(u8),
+}
+
+impl std::error::Error for ConnectionTokenParserError {}
+
+impl std::fmt::Display for ConnectionTokenParserError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ConnectionTokenParserError::IllegalChar(c) => {
+                for c in std::ascii::escape_default(*c) {
+                    write!(f, "{c}")?;
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+struct TokenParser(Bytes);
+
+impl Iterator for TokenParser {
+    type Item = Result<Bytes, ConnectionTokenParserError>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        fn skip_whitespace(val: &mut Bytes) {
+            while let Some(&b) = val.first() {
+                if matches!(b, b'\t' | b' ') {
+                    let _discard_whitespace = val.get_u8();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        let Self(inner) = self;
+        loop {
+            if inner.is_empty() {
+                return None;
+            }
+            let ix_first_non_tok_char = inner
+                .iter()
+                .enumerate()
+                .find(|(_ix, b)| !is_valid_tchar(**b))
+                .map(|(ix, _b)| ix)
+                .unwrap_or(inner.len());
+
+            // capture the token
+            let tok = inner.split_to(ix_first_non_tok_char);
+
+            // skip whitespace, get a comma, and skip whitepace again. See RFC9110
+            // 5.6.1 and 7.6.1
+            skip_whitespace(inner);
+            if let Some(&next) = inner.first() {
+                if next != b',' {
+                    return Some(Err(ConnectionTokenParserError::IllegalChar(next)));
+                }
+                let _discard_comma = inner.get_u8();
+            }
+            skip_whitespace(inner);
+
+            // if the token is empty (as would be the case with `connection: ,
+            // `), try again. we may also want to turn this into an error.
+            if tok.is_empty() {
+                // TODO: are empty tokens legal?
+                continue;
+            }
+
+            // now the inner is aligned with the end of the buffer, or the next
+            // token.
+
+            return Some(Ok(tok));
+        }
+    }
+}
+
 /// Headers that are always connection-scoped and must be removed before
 /// forwarding. See RFC 9110 and RFC 9112.
 ///
@@ -1050,24 +1147,23 @@ fn is_standard_hop_by_hop(name: &[u8]) -> bool {
         .any(|h| h.eq_ignore_ascii_case(name))
 }
 
-/// Remove all hop-by-hop headers from `headers` (RFC 9110 7.6.1, RFC 9112).
-///
-/// Returns the removed headers.
-fn strip_hop_by_hop_headers(headers: &mut Headers) -> Headers {
+fn get_connection_tokens(headers: &Headers) -> Result<Vec<Bytes>, ConnectionTokenParserError> {
     let mut connection_tokens = Vec::new();
 
     // Collect any extra hop-by-hop names listed in any Connection header.
     for (_h, v) in headers.get_header("connection") {
-        // TODO: let's make this an actual parser eventually
-        let tokens = v
-            .split(|&b| b == b',')
-            .map(|s| Bytes::copy_from_slice(s.trim_ascii()))
-            .filter(|s| !s.is_empty());
-        for tok in tokens {
-            connection_tokens.push(tok);
+        for tok in TokenParser(v.clone()) {
+            connection_tokens.push(tok?);
         }
     }
 
+    Ok(connection_tokens)
+}
+
+/// Remove all hop-by-hop headers from `headers` (RFC 9110 7.6.1, RFC 9112).
+///
+/// Returns the removed headers.
+fn strip_hop_by_hop_headers(headers: &mut Headers, connection_tokens: &[Bytes]) -> Headers {
     headers.remove(|(name, _)| {
         is_standard_hop_by_hop(name)
             || connection_tokens
@@ -1107,8 +1203,13 @@ pub struct FrontendProxyRequest<FR, FW> {
 }
 
 impl<FR, FW> FrontendProxyRequest<FR, FW> {
-    fn new(mut frontend: FrontendRequest<FR>, pending: PendingFrontendResponse<FW>) -> Self {
-        let hop_by_hop = strip_hop_by_hop_headers(frontend.req_mut().headers_mut());
+    fn new(
+        mut frontend: FrontendRequest<FR>,
+        pending: PendingFrontendResponse<FW>,
+        connection_tokens: &[Bytes],
+    ) -> Self {
+        let hop_by_hop =
+            strip_hop_by_hop_headers(frontend.req_mut().headers_mut(), connection_tokens);
         Self {
             frontend,
             hop_by_hop,
@@ -1339,9 +1440,10 @@ pub struct ProxyStreamReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> ProxyStreamReader<I> {
-    pub async fn read(self) -> BackendResult<ProxyResponseStream<I>> {
+    pub async fn read(self) -> Result<ProxyResponseStream<I>, ProxyBackendError> {
         let stream = self.reader.read().await?;
-        Ok(ProxyResponseStream::new(stream))
+        let stream = ProxyResponseStream::new(stream)?;
+        Ok(stream)
     }
 }
 
@@ -1357,21 +1459,24 @@ pub enum ProxyResponseStream<I> {
 }
 
 impl<I> ProxyResponseStream<I> {
-    fn new(stream: ResponseStream<I>) -> Self {
+    fn new(stream: ResponseStream<I>) -> Result<Self, ProxyBackendError> {
         match stream {
             ResponseStream::Response(mut backend) => {
-                let hop_by_hop = strip_hop_by_hop_headers(backend.res_mut().headers_mut());
-                ProxyResponseStream::Response(ProxyResponse {
+                let connection_tokens = get_connection_tokens(backend.res().headers())?;
+                let hop_by_hop =
+                    strip_hop_by_hop_headers(backend.res_mut().headers_mut(), &connection_tokens);
+                Ok(ProxyResponseStream::Response(ProxyResponse {
                     backend,
                     hop_by_hop,
-                })
+                }))
             }
             ResponseStream::Informational(mut res, reader) => {
-                let hop_by_hop = strip_hop_by_hop_headers(res.headers_mut());
-                ProxyResponseStream::Informational(
+                let connection_tokens = get_connection_tokens(res.headers())?;
+                let hop_by_hop = strip_hop_by_hop_headers(res.headers_mut(), &connection_tokens);
+                Ok(ProxyResponseStream::Informational(
                     ProxyInformationalResponse { res, hop_by_hop },
                     ProxyStreamReader { reader },
-                )
+                ))
             }
         }
     }
@@ -1396,7 +1501,7 @@ mod test {
 
     use crate::{
         BackendResponseStream, ClientOptions, FrontendRequestError, PendingFrontendResponse,
-        ProxyClient, ProxyFrontendError, ProxyOptions,
+        ProxyClient, ProxyFrontendError, ProxyOptions, get_connection_tokens,
     };
 
     use super::{
@@ -1432,7 +1537,9 @@ mod test {
             options: ProxyOptions::default(),
             client_options: ClientOptions { is_head, version },
         };
-        FrontendProxyRequest::new(req, pending)
+        let connection_tokens =
+            get_connection_tokens(req.req().headers()).expect("failed to get connection tokens");
+        FrontendProxyRequest::new(req, pending, &connection_tokens)
     }
 
     async fn make_backend_proxy_request(raw: &[u8]) -> BackendProxyRequest<&[u8], tokio::io::Sink> {
@@ -1444,7 +1551,7 @@ mod test {
     async fn make_proxy_response(raw: &[u8]) -> ProxyResponseStream<&[u8]> {
         let reader = BackendReader::new(raw, 256);
         let stream = reader.read(true, 8192).await.expect("valid response");
-        ProxyResponseStream::new(stream)
+        ProxyResponseStream::new(stream).expect("failed to build response stream")
     }
 
     #[tokio::test]
@@ -2875,7 +2982,7 @@ mod test {
 
         let reader = BackendReader::new(raw.as_slice(), 256);
         let stream = reader.read(true, 8192).await.expect("valid response");
-        let proxy_stream = ProxyResponseStream::new(stream);
+        let proxy_stream = ProxyResponseStream::new(stream).expect("failed to build proxy stream");
 
         let (info, next_reader) = into_informational(proxy_stream);
 
@@ -3116,7 +3223,7 @@ mod test {
 
         let reader = BackendReader::new(raw.as_slice(), 256);
         let stream = reader.read(true, 8192).await.expect("valid response");
-        let proxy_stream = ProxyResponseStream::new(stream);
+        let proxy_stream = ProxyResponseStream::new(stream).expect("failed to build proxy stream");
 
         let (info1, r1) = into_informational(proxy_stream);
         assert_eq!(info1.res().code(), 100);

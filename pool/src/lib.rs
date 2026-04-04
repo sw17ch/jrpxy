@@ -11,7 +11,7 @@ pub enum PoolError {
     NoBackendConnection,
 }
 
-pub type PoolResult<T> = Result<T,PoolError>;
+pub type PoolResult<T> = Result<T, PoolError>;
 
 pub trait BackendProxyProvider {
     /// The backend reader inner type
