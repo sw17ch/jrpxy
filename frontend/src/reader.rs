@@ -96,7 +96,7 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
     }
 
     /// Wait for the full frontend head to be available.
-    pub(crate) async fn head(&mut self, max_head_length: usize) -> FrontendResult<Request> {
+    async fn head(&mut self, max_head_length: usize) -> FrontendResult<Request> {
         loop {
             if let Some(req) = self
                 .parse_slots

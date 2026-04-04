@@ -82,7 +82,7 @@ use crate::error::FrontendResult;
 /// Writes a response to a frontend.
 #[derive(Debug)]
 pub struct FrontendWriter<I> {
-    pub(crate) io: I,
+    io: I,
 }
 
 impl<I> FrontendWriter<I> {
