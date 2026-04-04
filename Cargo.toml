@@ -5,6 +5,7 @@ members = [
     "body",
     "frontend",
     "http-message",
+    "pool",
     "util",
 ]
 
@@ -13,9 +14,11 @@ jrpxy-backend = { path = "backend" }
 jrpxy-body = { path = "body" }
 jrpxy-frontend = { path = "frontend" }
 jrpxy-http-message = { path = "http-message" }
+jrpxy-pool = { path = "pool" }
 jrpxy-util = { path = "util" }
 
 bytes = "1.11.0"
 httparse = "1.10.1"
+pin-project-lite = "0.2.17"
 thiserror = "2.0.17"
 tokio = { version = "1.48.0", features = ["io-util", "macros", "net", "rt", "time"] }
