@@ -12,6 +12,3 @@ jrpxy-util = { workspace = true }
 bytes = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
-
-[dev-dependencies]
-jrpxy-pool = { workspace = true }

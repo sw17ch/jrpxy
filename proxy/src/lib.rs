@@ -1495,8 +1495,6 @@ impl<I: std::fmt::Debug> std::fmt::Debug for ProxyResponseStream<I> {
 mod test {
     use jrpxy_backend::{reader::BackendReader, writer::BackendWriter};
     use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
-    use jrpxy_pool::{BackendProxyProvider, OneshotBackend};
-
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 
     use crate::{
@@ -1578,8 +1576,6 @@ mod test {
 
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
-
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
@@ -1588,7 +1584,10 @@ mod test {
 
         let did_fe_read = proxy_client.start().await.expect("client start failed");
 
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let did_be_write = did_fe_read
             .into_backend_request()
             .forward(backend_connection)
@@ -1723,14 +1722,12 @@ mod test {
             .await
             .expect("failed to forward response");
         let client = client.expect("failed to recycle client");
-        let (backend_reader, backend_writer) = backend_connection.unwrap();
-        bp.give_connection(backend_reader, backend_writer);
+        let (_backend_reader, backend_writer) = backend_connection.unwrap();
 
         // split up the client into pieces, and make sure they all reflect
         // what's expected.
         let (_frontend_reader, frontend_writer) = client.into_parts();
         let frontend_writer = frontend_writer.into_inner();
-        let (_backend_reader, backend_writer) = bp.inner.unwrap();
         let backend_writer = backend_writer.into_inner();
 
         let expected_backend_writer = b"\
@@ -1779,8 +1776,6 @@ mod test {
 
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
-
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
@@ -1789,7 +1784,10 @@ mod test {
 
         let did_fe_read = proxy_client.start().await.expect("client start failed");
 
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let did_be_write = did_fe_read
             .into_backend_request()
             .forward(backend_connection)
@@ -1868,14 +1866,15 @@ mod test {
             hello";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
-
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let be_res_stat = proxy_client
             .start()
             .await
@@ -1933,14 +1932,16 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
 
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
@@ -2006,14 +2007,16 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
 
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
         let be_res_stat = proxy_client
             .start()
             .await
@@ -2074,14 +2077,15 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
-
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let be_res_stat = proxy_client
             .start()
             .await
@@ -2145,14 +2149,15 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
-
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let be_res_stat = proxy_client
             .start()
             .await
@@ -2218,14 +2223,15 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
-
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let be_res_stat = proxy_client
             .start()
             .await
@@ -2437,14 +2443,15 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
-
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let be_res_stat = proxy_client
             .start()
             .await
@@ -2522,14 +2529,15 @@ mod test {
             hello";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
-
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let be_res_stat = proxy_client
             .start()
             .await
@@ -2652,14 +2660,15 @@ mod test {
             01234";
         let mut backend_writer = Vec::new();
 
-        let mut bp = OneshotBackend::new(backend_reader.as_ref(), &mut backend_writer);
         let proxy_client = ProxyClient::new(
             FrontendReader::new(frontend_reader.as_ref(), 256),
             FrontendWriter::new(&mut frontend_writer),
             ProxyOptions::default(),
         );
-
-        let backend_connection = bp.get_connection().await.expect("no backend connection");
+        let backend_connection = (
+            BackendReader::new(backend_reader.as_ref(), 256),
+            BackendWriter::new(&mut backend_writer),
+        );
         let be_res_stat = proxy_client
             .start()
             .await

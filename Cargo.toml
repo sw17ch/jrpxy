@@ -5,7 +5,6 @@ members = [
     "body",
     "frontend",
     "http-message",
-    "pool",
     "proxy",
     "util",
 ]
@@ -15,7 +14,6 @@ jrpxy-backend = { path = "backend" }
 jrpxy-body = { path = "body" }
 jrpxy-frontend = { path = "frontend" }
 jrpxy-http-message = { path = "http-message" }
-jrpxy-pool = { path = "pool" }
 jrpxy-proxy = { path = "proxy" }
 jrpxy-util = { path = "util" }
 
