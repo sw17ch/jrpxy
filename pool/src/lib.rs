@@ -1,10 +1,17 @@
 use std::task::Poll;
 
 use jrpxy_backend::{reader::BackendReader, writer::BackendWriter};
-use jrpxy_proxy::{ProxyError, ProxyResult};
 use tokio::io::{AsyncReadExt, AsyncWrite};
 
 type BackendConnection<BR, BW> = (BackendReader<BR>, BackendWriter<BW>);
+
+#[derive(thiserror::Error, Debug)]
+pub enum PoolError {
+    #[error("No available backend connection")]
+    NoBackendConnection,
+}
+
+pub type PoolResult<T> = Result<T,PoolError>;
 
 pub trait BackendProxyProvider {
     /// The backend reader inner type
@@ -16,7 +23,7 @@ pub trait BackendProxyProvider {
     /// is not available, one can be created, or an error is returned.
     fn get_connection(
         &mut self,
-    ) -> impl Future<Output = ProxyResult<BackendConnection<Self::BR, Self::BW>>>;
+    ) -> impl Future<Output = PoolResult<BackendConnection<Self::BR, Self::BW>>>;
 
     /// Return a connection to the provider. The connection *must* be clean.
     /// That is, the connection must be fully drained, and should remain idle
@@ -53,7 +60,7 @@ where
 }
 
 impl<BR: Unpin, BW: Unpin> Future for OneshotConnector<BR, BW> {
-    type Output = ProxyResult<(BR, BW)>;
+    type Output = PoolResult<(BR, BW)>;
 
     fn poll(
         self: std::pin::Pin<&mut Self>,
@@ -64,7 +71,7 @@ impl<BR: Unpin, BW: Unpin> Future for OneshotConnector<BR, BW> {
         if let Some(bp) = inner.take() {
             Poll::Ready(Ok(bp))
         } else {
-            Poll::Ready(Err(ProxyError::NoBackendConnection))
+            Poll::Ready(Err(PoolError::NoBackendConnection))
         }
     }
 }
@@ -75,7 +82,7 @@ impl<BR: Unpin, BW: Unpin> BackendProxyProvider for OneshotBackend<BR, BW> {
 
     fn get_connection(
         &mut self,
-    ) -> impl Future<Output = ProxyResult<BackendConnection<Self::BR, Self::BW>>> {
+    ) -> impl Future<Output = PoolResult<BackendConnection<Self::BR, Self::BW>>> {
         OneshotConnector {
             inner: self.inner.take(),
         }

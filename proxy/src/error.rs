@@ -8,8 +8,6 @@ pub enum ProxyError {
     FrontendError(#[from] FrontendError),
     #[error("Backend Error: {0}")]
     BackendError(#[from] BackendError),
-    #[error("No available backend connection")]
-    NoBackendConnection,
     #[error("Invalid request framing: {0}")]
     InvalidRequestFraming(HeaderError),
     #[error("Body copy error: {0}")]

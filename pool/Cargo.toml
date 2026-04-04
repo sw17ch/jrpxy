@@ -7,5 +7,6 @@ edition = "2024"
 jrpxy-backend = { workspace = true }
 jrpxy-proxy = { workspace = true }
 
+thiserror = { workspace = true }
 tokio = { workspace = true }
 pin-project-lite = { workspace = true }

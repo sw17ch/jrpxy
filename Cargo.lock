@@ -67,6 +67,7 @@ dependencies = [
  "jrpxy-backend",
  "jrpxy-proxy",
  "pin-project-lite",
+ "thiserror",
  "tokio",
 ]
 
