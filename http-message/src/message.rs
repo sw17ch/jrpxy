@@ -242,7 +242,7 @@ impl Span {
 }
 
 #[derive(Copy, Clone)]
-pub struct HeaderOffset {
+struct HeaderOffset {
     name: Span,
     value: Span,
 }
