@@ -593,11 +593,10 @@ where
             backend_body_writer,
         } = self;
 
+        let allow_body = !request.pending.client_options.is_head;
+        let max_backend_head_length = request.pending.options.max_backend_head_length;
         let response_stream = match backend_reader
-            .read(
-                !request.pending.client_options.is_head,
-                request.pending.options.max_backend_head_length,
-            )
+            .read(allow_body, max_backend_head_length)
             .await
         {
             Ok(r) => r,
@@ -611,6 +610,21 @@ where
                 });
             }
         };
+
+        // TODO: we need to drive the frontend request body to the origin at the
+        // same time as we're waiting for the response to come back in case the
+        // origin will not reply to us until its receives the fully body.
+        //
+        // This does also expose that, once we start trying to read the request
+        // from the origin, we cannot recover the client at this stage. If the
+        // backend read fails, we have to discard all connections. This implies
+        // that `BackendResponseError` will go away.
+        //
+        // Since we need to maintain the state, we should make a new type of
+        // forwarder that can be incrementally driven until the response comes
+        // back, and the remainder of the work can be passed around in the
+        // BackendResponseStream to be completed by the BodyExchanger.
+
         let response_stream = match ProxyResponseStream::new(response_stream) {
             Ok(s) => s,
             Err(e) => {
@@ -3242,5 +3256,121 @@ mod test {
 
         let final_res = into_response(r2.read().await.expect("read final"));
         assert_eq!(final_res.res().code(), 200);
+    }
+
+    /// A backend that will not respond until it has received the complete request
+    /// body. The proxy must pump the request body to the backend concurrently
+    /// with waiting for the response head, otherwise both sides deadlock.
+    ///
+    /// This test is expected to fail (timeout) until that concurrency is
+    /// implemented.
+    #[tokio::test]
+    async fn proxy_completes_when_backend_requires_full_request_body_before_responding() {
+        use std::time::Duration;
+        use tokio::io::AsyncWriteExt;
+
+        // frontend_client is the "browser" side; frontend_server connects to the proxy.
+        let (mut frontend_client, frontend_server) = tokio::io::duplex(4096);
+        // backend_client connects to the proxy; backend_server is the "origin".
+        let (backend_client, backend_server) = tokio::io::duplex(4096);
+
+        // Write the request (head + body) into the frontend pipe. The 4096-byte
+        // pipe buffer is large enough to hold it without blocking.
+        frontend_client
+            .write_all(
+                b"POST / HTTP/1.1\r\n\
+                  Host: example.com\r\n\
+                  Content-Length: 5\r\n\
+                  \r\n\
+                  hello",
+            )
+            .await
+            .unwrap();
+
+        // Keep frontend_client alive so the proxy's write-back path doesn't get a
+        // broken-pipe when it eventually sends the response.
+        let _frontend_client = frontend_client;
+
+        // Mock origin server: reads the full request body before responding.
+        // Uses FrontendReader because from the server's perspective it is
+        // receiving an HTTP request from the proxy.
+        let backend_task = tokio::spawn(async move {
+            let (backend_server_r, mut backend_server_w) = tokio::io::split(backend_server);
+
+            let req = FrontendReader::new(backend_server_r, 256)
+                .read(8192)
+                .await
+                .expect("backend: failed to read request head");
+            let (_, mut body_reader) = req.into_parts();
+
+            // Block until the proxy delivers the complete request body.
+            loop {
+                match body_reader.read(8192).await.unwrap() {
+                    Some(_) => {}
+                    None => break,
+                }
+            }
+
+            // Only after the full body is received do we send a response.
+            backend_server_w
+                .write_all(
+                    b"HTTP/1.1 200 Ok\r\n\
+                      content-length: 0\r\n\
+                      \r\n",
+                )
+                .await
+                .unwrap();
+            backend_server_w.flush().await.unwrap();
+        });
+
+        // Proxy task: runs the full proxy transaction end-to-end.
+        let proxy_task = tokio::spawn(async move {
+            let (frontend_server_r, frontend_server_w) = tokio::io::split(frontend_server);
+            let (backend_client_r, backend_client_w) = tokio::io::split(backend_client);
+
+            let proxy_client = ProxyClient::new(
+                FrontendReader::new(frontend_server_r, 256),
+                FrontendWriter::new(frontend_server_w),
+                ProxyOptions::default(),
+            );
+            let backend_connection = (
+                BackendReader::new(backend_client_r, 256),
+                BackendWriter::new(backend_client_w),
+            );
+
+            let be_res_stat = proxy_client
+                .start()
+                .await
+                .expect("client start failed")
+                .into_backend_request()
+                .forward(backend_connection)
+                .await
+                .expect("backend write failed")
+                .read_backend_response()
+                .await
+                .expect("failed to read backend response");
+
+            let rbr = match be_res_stat {
+                BackendResponseStream::Response(rbr) => rbr,
+                BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+            };
+
+            rbr.forward_response_head()
+                .await
+                .expect("forward_response_head failed")
+                .finish()
+                .await
+                .expect("failed to finish");
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), async move {
+            proxy_task.await.unwrap();
+            backend_task.await.unwrap();
+        })
+        .await
+        .expect(
+            "timed out — proxy deadlocked waiting for backend response \
+             before forwarding the request body",
+        );
     }
 }
