@@ -7,23 +7,23 @@ use jrpxy_http_message::{
     framing::ParsedFraming,
     message::{ParseSlots, Response},
 };
-use jrpxy_util::io_buffer::IoBuffer;
+use jrpxy_util::io_buffer::BytesReader;
 use tokio::io::AsyncReadExt;
 
 use crate::error::{BackendError, BackendResult};
 
 #[derive(Debug)]
 pub struct BackendReader<I> {
-    io_buffer: IoBuffer<I>,
+    io_buffer: BytesReader<I>,
     parse_slots: ParseSlots,
 }
 
 impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     pub fn new(io: I, max_headers: usize) -> Self {
-        Self::new_with_iobuffer(IoBuffer::new(io), max_headers)
+        Self::new_with_iobuffer(BytesReader::new(io), max_headers)
     }
 
-    pub fn new_with_iobuffer(io_buffer: IoBuffer<I>, max_headers: usize) -> Self {
+    pub fn new_with_iobuffer(io_buffer: BytesReader<I>, max_headers: usize) -> Self {
         Self {
             io_buffer,
             parse_slots: ParseSlots::new(max_headers),
@@ -34,7 +34,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         loop {
             if let Some(res) = self
                 .parse_slots
-                .parse_response(self.io_buffer.as_buffer_mut())
+                .parse_response(&mut self.io_buffer)
                 .map_err(BackendError::HttpResponseParseError)?
             {
                 return Ok(res);
@@ -171,7 +171,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         Ok(ResponseStream::Response(BackendResponse { res, reader }))
     }
 
-    pub fn into_parts(self) -> IoBuffer<I> {
+    pub fn into_parts(self) -> BytesReader<I> {
         let Self {
             io_buffer,
             parse_slots: _,

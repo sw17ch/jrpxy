@@ -2,7 +2,7 @@ use std::mem::MaybeUninit;
 
 use bytes::{Bytes, BytesMut};
 use httparse::{Request as HttparseRequest, Response as HttparseResponse};
-use jrpxy_util::{buffer::Buffer, parse::is_valid_tchar};
+use jrpxy_util::{io_buffer::BytesReader, parse::is_valid_tchar};
 
 pub use httparse::Error as HttpParseError;
 
@@ -141,15 +141,15 @@ impl ParseSlots {
         }
     }
 
-    pub fn parse_request(&mut self, buf: &mut Buffer) -> MessageResult<Option<Request>> {
+    pub fn parse_request<I>(&mut self, buf: &mut BytesReader<I>) -> MessageResult<Option<Request>> {
         let Self {
             parse_headers,
             out_headers,
         } = self;
-        match RequestOffset::parse(&*buf, parse_headers, out_headers)? {
+        match RequestOffset::parse(buf.as_bytes(), parse_headers, out_headers)? {
             None => Ok(None),
             Some((req, head_len)) => {
-                let head_buf = buf.split_to(head_len).freeze();
+                let head_buf = buf.split_to(head_len);
                 let method = req.method.slice_from(&head_buf);
                 let path = req.path.slice_from(&head_buf);
                 let version = req.version;
@@ -166,15 +166,18 @@ impl ParseSlots {
         }
     }
 
-    pub fn parse_response(&mut self, buf: &mut Buffer) -> MessageResult<Option<Response>> {
+    pub fn parse_response<I>(
+        &mut self,
+        buf: &mut BytesReader<I>,
+    ) -> MessageResult<Option<Response>> {
         let Self {
             parse_headers,
             out_headers,
         } = self;
-        match ResponseOffset::parse(&*buf, parse_headers, out_headers)? {
+        match ResponseOffset::parse(buf.as_bytes(), parse_headers, out_headers)? {
             None => Ok(None),
             Some((res, head_len)) => {
-                let head_buf = buf.split_to(head_len).freeze();
+                let head_buf = buf.split_to(head_len);
                 let version = res.version;
                 let code = res.code;
                 let reason = res.reason.slice_from(&head_buf);
@@ -191,17 +194,18 @@ impl ParseSlots {
         }
     }
 
-    pub fn parse_headers(&mut self, buf: &mut Buffer) -> MessageResult<Option<Headers>> {
+    pub fn parse_headers<I>(&mut self, buf: &mut BytesReader<I>) -> MessageResult<Option<Headers>> {
         let Self {
             parse_headers,
             out_headers,
         } = self;
-        match header_buf::parse_headers(buf, parse_headers)? {
+        match header_buf::parse_headers(buf.as_bytes(), parse_headers)? {
             httparse::Status::Partial => Ok(None),
             httparse::Status::Complete((len, headers)) => {
                 let out_headers = &mut out_headers[..headers.len()];
-                let header_offsets = populate_header_offsets(&buf[..len], out_headers, headers);
-                let header_buf = buf.split_to(len).freeze();
+                let header_offsets =
+                    populate_header_offsets(&buf.as_bytes()[..len], out_headers, headers);
+                let header_buf = buf.split_to(len);
                 let headers = populate_headers(header_offsets, &header_buf);
                 Ok(Some(headers))
             }
