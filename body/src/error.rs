@@ -1,4 +1,4 @@
-use jrpxy_util::io_buffer::IoBufferError;
+use jrpxy_util::io_buffer::ReaderBufferError;
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrailerError {
@@ -30,11 +30,11 @@ pub enum BodyError {
     ReadAfterError,
 }
 
-impl From<IoBufferError> for BodyError {
-    fn from(e: IoBufferError) -> Self {
+impl From<ReaderBufferError> for BodyError {
+    fn from(e: ReaderBufferError) -> Self {
         match e {
-            IoBufferError::Io(e) => BodyError::BodyReadError(e),
-            IoBufferError::UnexpectedEOF => BodyError::UnexpectedEOF,
+            ReaderBufferError::Io(e) => BodyError::BodyReadError(e),
+            ReaderBufferError::UnexpectedEOF => BodyError::UnexpectedEOF,
         }
     }
 }

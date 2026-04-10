@@ -3,11 +3,12 @@ use tokio::io::AsyncReadExt;
 
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::{MessageError, ParseSlots};
-use jrpxy_util::io_buffer::IoBuffer;
+use jrpxy_util::io_buffer::BytesReader;
 
 use crate::error::{BodyError, BodyResult, TrailerError};
 
 const DRAIN_SIZE: usize = 4096;
+const IO_FILL_LEN: usize = 4096;
 
 fn map_trailer_error(e: MessageError) -> BodyError {
     let trailer_error = match e {
@@ -25,7 +26,7 @@ pub struct ContentLengthBodyReader<I> {
     /// the amount of the body already read
     offset: u64,
     /// the io associated with this body read
-    io: IoBuffer<I>,
+    io: BytesReader<I>,
     /// These are not ever used while processing a content-length body. They
     /// exist here in order to allow higher level calls to reuse the slot
     /// allocation.
@@ -33,7 +34,7 @@ pub struct ContentLengthBodyReader<I> {
 }
 
 impl<I> ContentLengthBodyReader<I> {
-    pub fn new(length: u64, io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
+    pub fn new(length: u64, io: BytesReader<I>, parse_slots: ParseSlots) -> Self {
         Self {
             length,
             offset: 0,
@@ -67,7 +68,7 @@ where
             return Ok(None);
         }
 
-        self.io.ensure().await?;
+        self.io.ensure(IO_FILL_LEN).await?;
 
         let at = remaining
             .try_into()
@@ -82,7 +83,7 @@ where
 
     /// Drain the [`ContentLengthBodyReader`] and return the inner
     /// [`IoBuffer`] and [`ParseSlots`].
-    pub async fn drain(mut self) -> BodyResult<(IoBuffer<I>, ParseSlots)> {
+    pub async fn drain(mut self) -> BodyResult<(BytesReader<I>, ParseSlots)> {
         while let Some(_buf) = self.read(DRAIN_SIZE).await? {
             // drop buffers until we get to the end of the body
         }
@@ -99,7 +100,7 @@ where
 
 /// The extensions attached to a chunk header. Currently opaque; full parsing
 /// is a TODO.
-pub struct ChunkExtensions;
+pub struct ChunkExtensions(pub Bytes);
 
 /// Positioned at the start of the next chunk (or the terminal chunk). Owns
 /// the underlying IO for the duration of inter-chunk parsing.
@@ -136,7 +137,7 @@ impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
 }
 
 impl<I> ChunkedBodyReader<I> {
-    pub fn new(io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
+    pub fn new(io: BytesReader<I>, parse_slots: ParseSlots) -> Self {
         Self {
             inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader {
                 io,
@@ -191,7 +192,7 @@ impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
         }
     }
 
-    pub async fn drain(self) -> BodyResult<(IoBuffer<I>, ParseSlots, Headers)> {
+    pub async fn drain(self) -> BodyResult<(BytesReader<I>, ParseSlots, Headers)> {
         let Self { inner } = self;
         let Some(mut inner) = inner else {
             return Err(BodyError::ReadAfterError);
@@ -227,7 +228,7 @@ enum ChunkBodyState {
 /// Positioned within a single chunk. Holds the chunk's declared size and any
 /// extensions. Owns the IO for the duration of reading this chunk.
 pub struct ChunkBodyReader<I> {
-    io: IoBuffer<I>,
+    io: BytesReader<I>,
     parse_slots: ParseSlots,
     size: u64,
     extensions: ChunkExtensions,
@@ -269,13 +270,13 @@ impl<I: AsyncReadExt + Unpin> ChunkBodyReader<I> {
                         self.state = ChunkBodyState::InFooterNeedCR;
                         continue;
                     }
-                    self.io.ensure().await?;
+                    self.io.ensure(IO_FILL_LEN).await?;
                     let at = self.remaining.min(self.io.len() as u64).min(max_len as u64) as usize;
                     self.remaining -= at as u64;
                     return Ok(Some(self.io.split_to(at)));
                 }
                 ChunkBodyState::InFooterNeedCR => {
-                    self.io.ensure().await?;
+                    self.io.ensure(IO_FILL_LEN).await?;
                     match self.io.get_u8() {
                         b'\r' => {
                             self.state = ChunkBodyState::InFooterNeedLF;
@@ -286,7 +287,7 @@ impl<I: AsyncReadExt + Unpin> ChunkBodyReader<I> {
                     }
                 }
                 ChunkBodyState::InFooterNeedLF => {
-                    self.io.ensure().await?;
+                    self.io.ensure(IO_FILL_LEN).await?;
                     match self.io.get_u8() {
                         b'\n' => {
                             self.state = ChunkBodyState::Done;
@@ -324,7 +325,7 @@ pub enum NextChunk<I> {
 }
 
 pub struct ChunkHeadReader<I> {
-    io: IoBuffer<I>,
+    io: BytesReader<I>,
     parse_slots: ParseSlots,
 }
 
@@ -337,29 +338,27 @@ where
             mut io,
             mut parse_slots,
         } = self;
-        io.ensure().await?;
+        io.ensure(IO_FILL_LEN).await?;
         loop {
             match httparse::parse_chunk_size(io.as_bytes())
                 .map_err(BodyError::InvalidChunkHeader)?
             {
                 httparse::Status::Partial => {
-                    io.extend().await?;
+                    io.extend(IO_FILL_LEN).await?;
                     continue;
                 }
                 httparse::Status::Complete((header_len, chunk_size)) => {
-                    // TODO: these ignored bytes contain the chunk extensions we
-                    // want to preserve eventually
-                    let _ignored_chunk_header_bytes = io.split_to(header_len);
+                    let chunk_header_bytes = io.split_to(header_len);
                     if chunk_size == 0 {
                         // terminal chunk: drain the trailer section
                         let trailers = loop {
-                            io.ensure().await?;
+                            io.ensure(IO_FILL_LEN).await?;
                             match parse_slots
-                                .parse_headers(io.as_buffer_mut())
+                                .parse_headers(&mut io)
                                 .map_err(map_trailer_error)?
                             {
                                 None => {
-                                    io.extend().await?;
+                                    io.extend(IO_FILL_LEN).await?;
                                 }
                                 Some(trailers) => break trailers,
                             }
@@ -374,7 +373,7 @@ where
                             io,
                             parse_slots,
                             size: chunk_size,
-                            extensions: ChunkExtensions,
+                            extensions: ChunkExtensions(chunk_header_bytes),
                             remaining: chunk_size,
                             state: ChunkBodyState::InBody,
                         }));
@@ -386,7 +385,7 @@ where
 }
 
 pub struct FinalChunkReader<I> {
-    io: IoBuffer<I>,
+    io: BytesReader<I>,
     parse_slots: ParseSlots,
     trailers: Headers,
 }
@@ -396,7 +395,7 @@ impl<I> FinalChunkReader<I> {
         &self.trailers
     }
 
-    pub fn into_parts(self) -> (IoBuffer<I>, ParseSlots, Headers) {
+    pub fn into_parts(self) -> (BytesReader<I>, ParseSlots, Headers) {
         let Self {
             io,
             parse_slots,
@@ -409,7 +408,7 @@ impl<I> FinalChunkReader<I> {
 #[cfg(test)]
 mod test {
     use jrpxy_http_message::message::ParseSlots;
-    use jrpxy_util::io_buffer::IoBuffer;
+    use jrpxy_util::io_buffer::BytesReader;
 
     use crate::error::BodyError;
 
@@ -429,7 +428,7 @@ mod test {
             \r\n\
             ";
 
-        let mut br = ChunkedBodyReader::new(IoBuffer::new(&input[..]), ParseSlots::default());
+        let mut br = ChunkedBodyReader::new(BytesReader::new(&input[..]), ParseSlots::default());
         let chunk = br.read(10).await.expect("read works").unwrap();
         assert_eq!(b"0123", chunk.as_ref());
         let chunk = br.read(10).await.expect("read works").unwrap();
@@ -447,7 +446,7 @@ mod test {
             \r\n\
             ";
 
-        let mut br = ChunkedBodyReader::new(IoBuffer::new(&input[..]), ParseSlots::default());
+        let mut br = ChunkedBodyReader::new(BytesReader::new(&input[..]), ParseSlots::default());
 
         // The body bytes themselves are valid and should be readable.
         let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
@@ -467,7 +466,7 @@ mod test {
             \r\n\
             ";
 
-        let mut br = ChunkedBodyReader::new(IoBuffer::new(&input[..]), ParseSlots::default());
+        let mut br = ChunkedBodyReader::new(BytesReader::new(&input[..]), ParseSlots::default());
 
         // The body bytes themselves are valid and should be readable.
         let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
@@ -485,13 +484,13 @@ mod test {
 /// terminated by connection close (RFC 9112 section 6.3 rule 8).
 #[derive(Debug)]
 pub struct EofBodyReader<I> {
-    io: IoBuffer<I>,
+    io: BytesReader<I>,
     parse_slots: ParseSlots,
     eof: bool,
 }
 
 impl<I> EofBodyReader<I> {
-    pub fn new(io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
+    pub fn new(io: BytesReader<I>, parse_slots: ParseSlots) -> Self {
         Self {
             io,
             parse_slots,
@@ -544,16 +543,16 @@ impl<I: AsyncReadExt + Unpin> EofBodyReader<I> {
 
 #[derive(Debug)]
 pub struct BodylessBodyReader<I> {
-    io: IoBuffer<I>,
+    io: BytesReader<I>,
     parse_slots: ParseSlots,
 }
 
 impl<I> BodylessBodyReader<I> {
-    pub fn new(io: IoBuffer<I>, parse_slots: ParseSlots) -> Self {
+    pub fn new(io: BytesReader<I>, parse_slots: ParseSlots) -> Self {
         Self { io, parse_slots }
     }
 
-    pub fn drain(self) -> (IoBuffer<I>, ParseSlots) {
+    pub fn drain(self) -> (BytesReader<I>, ParseSlots) {
         let Self { io, parse_slots } = self;
         (io, parse_slots)
     }

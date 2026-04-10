@@ -45,7 +45,7 @@ use jrpxy_http_message::{
     header::Headers,
     message::{ParseSlots, Request},
 };
-use jrpxy_util::io_buffer::IoBuffer;
+use jrpxy_util::io_buffer::BytesReader;
 use tokio::io::AsyncReadExt;
 
 use crate::error::{FrontendError, FrontendResult};
@@ -54,12 +54,12 @@ use crate::error::{FrontendError, FrontendResult};
 /// is consumed, and a [`FrontendRequest`] is returned.
 #[derive(Debug)]
 pub struct FrontendReader<I> {
-    io_buffer: IoBuffer<I>,
+    io_buffer: BytesReader<I>,
     parse_slots: ParseSlots,
 }
 
 impl<I> FrontendReader<I> {
-    pub fn into_inner(self) -> IoBuffer<I> {
+    pub fn into_inner(self) -> BytesReader<I> {
         let Self {
             io_buffer,
             parse_slots: _,
@@ -71,24 +71,15 @@ impl<I> FrontendReader<I> {
     pub fn as_buf_slice(&self) -> &[u8] {
         self.io_buffer.as_bytes()
     }
-    /// An immutable reference to the underlying IO type.
-    pub fn as_inner(&self) -> &I {
-        self.io_buffer.as_io()
-    }
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
-    const HEAD_FILL_LEN: usize = 4096;
-
     /// Create a new [`FrontendReader`].
     pub fn new(io: I, max_headers: usize) -> Self {
-        Self::new_with_buffer(
-            IoBuffer::new_with_fill_len(io, Self::HEAD_FILL_LEN),
-            max_headers,
-        )
+        Self::new_with_buffer(BytesReader::new(io), max_headers)
     }
 
-    pub fn new_with_buffer(io: IoBuffer<I>, max_headers: usize) -> FrontendReader<I> {
+    pub fn new_with_buffer(io: BytesReader<I>, max_headers: usize) -> FrontendReader<I> {
         Self {
             io_buffer: io,
             parse_slots: ParseSlots::new(max_headers),
@@ -100,7 +91,7 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
         loop {
             if let Some(req) = self
                 .parse_slots
-                .parse_request(self.io_buffer.as_buffer_mut())
+                .parse_request(&mut self.io_buffer)
                 .map_err(FrontendError::HttpRequestParseError)?
             {
                 return Ok(req);
