@@ -51,7 +51,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
             let target_read_len = max_head_length.saturating_sub(self.io_buffer.len());
             let len = self
                 .io_buffer
-                .read_with_len(target_read_len)
+                .read(target_read_len)
                 .await
                 .map_err(BackendError::ReadError)?;
             if 0 == len {

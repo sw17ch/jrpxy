@@ -512,7 +512,7 @@ impl<I: AsyncReadExt + Unpin> EofBodyReader<I> {
         // Try to read more; a zero return means the connection was closed.
         let n = self
             .io
-            .read_with_len(max_len)
+            .read(max_len)
             .await
             .map_err(BodyError::BodyReadError)?;
         if n == 0 {

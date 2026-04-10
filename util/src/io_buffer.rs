@@ -132,9 +132,9 @@ where
     /// On success, returns the additional the number of bytes added to the
     /// buffer. A return value of 0 indicates that either the user passed a
     /// `len` of 0, or the reader has stopped returning bytes.
-    pub fn read_with_len(&mut self, len: usize) -> Fill<'_, I> {
+    pub fn read(&mut self, len: usize) -> Read<'_, I> {
         let Self { io, buffer } = self;
-        Fill {
+        Read {
             reader: Pin::new(io),
             buffer,
             len,
@@ -165,13 +165,13 @@ where
 }
 
 #[must_use = "futures do nothing unless you `.await` or poll them"]
-pub struct Fill<'s, I> {
+pub struct Read<'s, I> {
     reader: Pin<&'s mut I>,
     buffer: &'s mut ReaderBuffer,
     len: usize,
 }
 
-impl<'s, I> Future for Fill<'s, I>
+impl<'s, I> Future for Read<'s, I>
 where
     I: AsyncRead + Unpin,
 {
