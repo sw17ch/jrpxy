@@ -54,34 +54,34 @@ use crate::error::{FrontendError, FrontendResult};
 /// is consumed, and a [`FrontendRequest`] is returned.
 #[derive(Debug)]
 pub struct FrontendReader<I> {
-    io_buffer: BytesReader<I>,
+    reader: BytesReader<I>,
     parse_slots: ParseSlots,
 }
 
 impl<I> FrontendReader<I> {
     pub fn into_inner(self) -> BytesReader<I> {
         let Self {
-            io_buffer,
+            reader,
             parse_slots: _,
         } = self;
-        io_buffer
+        reader
     }
     /// An immutable slice of the internal buffer already read from the IO type,
     /// but not yet consumed.
     pub fn as_buf_slice(&self) -> &[u8] {
-        self.io_buffer.as_bytes()
+        self.reader.as_bytes()
     }
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
     /// Create a new [`FrontendReader`].
-    pub fn new(io: I, max_headers: usize) -> Self {
-        Self::new_with_buffer(BytesReader::new(io), max_headers)
+    pub fn new(reader: I, max_headers: usize) -> Self {
+        Self::new_with_buffer(BytesReader::new(reader), max_headers)
     }
 
-    pub fn new_with_buffer(io: BytesReader<I>, max_headers: usize) -> FrontendReader<I> {
+    pub fn new_with_buffer(reader: BytesReader<I>, max_headers: usize) -> FrontendReader<I> {
         Self {
-            io_buffer: io,
+            reader,
             parse_slots: ParseSlots::new(max_headers),
         }
     }
@@ -91,23 +91,23 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
         loop {
             if let Some(req) = self
                 .parse_slots
-                .parse_request(&mut self.io_buffer)
+                .parse_request(&mut self.reader)
                 .map_err(FrontendError::HttpRequestParseError)?
             {
                 return Ok(req);
-            } else if self.io_buffer.len() >= max_head_length {
+            } else if self.reader.len() >= max_head_length {
                 return Err(FrontendError::MaxHeadLenExceeded(
-                    self.io_buffer.len(),
+                    self.reader.len(),
                     max_head_length,
                 ));
             }
 
-            let first_read = self.io_buffer.is_empty();
+            let first_read = self.reader.is_empty();
 
             // read some data into the buffer
-            let target_read_len = max_head_length.saturating_sub(self.io_buffer.len());
+            let target_read_len = max_head_length.saturating_sub(self.reader.len());
             let len = self
-                .io_buffer
+                .reader
                 .read(target_read_len)
                 .await
                 .map_err(FrontendError::ReadError)?;
@@ -128,19 +128,19 @@ impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
     pub async fn read(mut self, max_head_length: usize) -> FrontendResult<FrontendRequest<I>> {
         let req = self.head(max_head_length).await?;
         let Self {
-            io_buffer,
+            reader,
             parse_slots,
         } = self;
 
         let reader = match req.framing()? {
             ParsedFraming::Length(cl) => FrontendBodyReader::CL(FrontendContentLengthBodyReader {
-                inner: ContentLengthBodyReader::new(cl, io_buffer, parse_slots),
+                inner: ContentLengthBodyReader::new(cl, reader, parse_slots),
             }),
             ParsedFraming::Chunked => FrontendBodyReader::TE(FrontendChunkedBodyReader {
-                inner: ChunkedBodyReader::new(io_buffer, parse_slots),
+                inner: ChunkedBodyReader::new(reader, parse_slots),
             }),
             ParsedFraming::NoFraming => FrontendBodyReader::Bodyless(FrontendBodylessBodyReader {
-                inner: BodylessBodyReader::new(io_buffer, parse_slots),
+                inner: BodylessBodyReader::new(reader, parse_slots),
             }),
         };
 
@@ -183,9 +183,9 @@ pub struct FrontendBodylessBodyReader<I> {
 
 impl<I: AsyncReadExt + Unpin> FrontendBodylessBodyReader<I> {
     pub fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        let (io, parse_slots) = self.inner.drain();
+        let (reader, parse_slots) = self.inner.drain();
         Ok(FrontendReader {
-            io_buffer: io,
+            reader,
             parse_slots,
         })
     }
@@ -211,13 +211,13 @@ impl<I: AsyncReadExt + Unpin> FrontendContentLengthBodyReader<I> {
     }
 
     pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        let (io, parse_slots) = self
+        let (reader, parse_slots) = self
             .inner
             .drain()
             .await
             .map_err(FrontendError::BodyReadError)?;
         Ok(FrontendReader {
-            io_buffer: io,
+            reader,
             parse_slots,
         })
     }
@@ -244,14 +244,14 @@ impl<I: AsyncReadExt + Unpin> FrontendChunkedBodyReader<I> {
     }
 
     pub async fn drain(self) -> FrontendResult<(FrontendReader<I>, Headers)> {
-        let (io, parse_slots, trailers) = self
+        let (reader, parse_slots, trailers) = self
             .inner
             .drain()
             .await
             .map_err(FrontendError::BodyReadError)?;
         Ok((
             FrontendReader {
-                io_buffer: io,
+                reader,
                 parse_slots,
             },
             trailers,

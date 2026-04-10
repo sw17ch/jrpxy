@@ -7,13 +7,13 @@ use crate::error::{BodyError, BodyResult};
 pub struct BodylessBodyWriter<I>(I);
 
 impl<I> BodylessBodyWriter<I> {
-    pub fn new(io: I) -> Self {
-        Self(io)
+    pub fn new(writer: I) -> Self {
+        Self(writer)
     }
 
     pub fn finish(self) -> I {
-        let Self(io) = self;
-        io
+        let Self(writer) = self;
+        writer
     }
 }
 
@@ -23,22 +23,26 @@ pub struct ContentLengthBodyWriter<I> {
     length: u64,
     /// the amount of the body already written
     offset: u64,
-    io: I,
+    writer: I,
 }
 
 impl<I> ContentLengthBodyWriter<I> {
-    pub fn new(length: u64, io: I) -> Self {
+    pub fn new(length: u64, writer: I) -> Self {
         Self {
             length,
             offset: 0,
-            io,
+            writer,
         }
     }
 }
 
 impl<I: AsyncWriteExt + Unpin> ContentLengthBodyWriter<I> {
     pub async fn write(&mut self, buffer: &[u8]) -> BodyResult<()> {
-        let Self { length, offset, io } = self;
+        let Self {
+            length,
+            offset,
+            writer,
+        } = self;
 
         let Some(next_offset) = offset.checked_add(buffer.len() as u64) else {
             return Err(BodyError::BodyOverflow(*length));
@@ -48,7 +52,8 @@ impl<I: AsyncWriteExt + Unpin> ContentLengthBodyWriter<I> {
             return Err(BodyError::BodyOverflow(*length));
         }
 
-        io.write_all(buffer)
+        writer
+            .write_all(buffer)
             .await
             .map_err(BodyError::BodyWriteError)?;
 
@@ -61,7 +66,7 @@ impl<I: AsyncWriteExt + Unpin> ContentLengthBodyWriter<I> {
         let Self {
             length,
             offset,
-            mut io,
+            mut writer,
         } = self;
         debug_assert!(offset <= length, "offset exceeds length");
         if offset < length {
@@ -70,8 +75,8 @@ impl<I: AsyncWriteExt + Unpin> ContentLengthBodyWriter<I> {
                 actual: offset,
             });
         }
-        io.flush().await.map_err(BodyError::BodyWriteError)?;
-        Ok(io)
+        writer.flush().await.map_err(BodyError::BodyWriteError)?;
+        Ok(writer)
     }
 }
 
@@ -118,12 +123,12 @@ mod test {
 }
 #[derive(Debug)]
 pub struct ChunkedBodyWriter<I> {
-    io: I,
+    writer: I,
 }
 
 impl<I> ChunkedBodyWriter<I> {
-    pub fn new(io: I) -> Self {
-        Self { io }
+    pub fn new(writer: I) -> Self {
+        Self { writer }
     }
 }
 
@@ -142,15 +147,15 @@ impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
         // TODO: we can avoid this heap allocation
         let chunk_header = format!("{:x}\r\n", buffer.len());
 
-        self.io
+        self.writer
             .write_all(chunk_header.as_bytes())
             .await
             .map_err(BodyError::BodyWriteError)?;
-        self.io
+        self.writer
             .write_all(buffer)
             .await
             .map_err(BodyError::BodyWriteError)?;
-        self.io
+        self.writer
             .write_all(b"\r\n")
             .await
             .map_err(BodyError::BodyWriteError)?;
@@ -159,30 +164,36 @@ impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
     }
 
     pub async fn finish_with_trailers(self, trailers: &Headers) -> BodyResult<I> {
-        let Self { mut io } = self;
+        let Self { mut writer } = self;
 
-        io.write_all(b"0\r\n")
+        writer
+            .write_all(b"0\r\n")
             .await
             .map_err(BodyError::BodyWriteError)?;
         for (name, value) in trailers.iter() {
-            io.write_all(name)
+            writer
+                .write_all(name)
                 .await
                 .map_err(BodyError::BodyWriteError)?;
-            io.write_all(b": ")
+            writer
+                .write_all(b": ")
                 .await
                 .map_err(BodyError::BodyWriteError)?;
-            io.write_all(value)
+            writer
+                .write_all(value)
                 .await
                 .map_err(BodyError::BodyWriteError)?;
-            io.write_all(b"\r\n")
+            writer
+                .write_all(b"\r\n")
                 .await
                 .map_err(BodyError::BodyWriteError)?;
         }
-        io.write_all(b"\r\n")
+        writer
+            .write_all(b"\r\n")
             .await
             .map_err(BodyError::BodyWriteError)?;
-        io.flush().await.map_err(BodyError::BodyWriteError)?;
-        Ok(io)
+        writer.flush().await.map_err(BodyError::BodyWriteError)?;
+        Ok(writer)
     }
 
     pub async fn finish(self) -> BodyResult<I> {
@@ -190,17 +201,18 @@ impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
     }
 
     pub async fn abort(self) -> BodyResult<I> {
-        let Self { mut io } = self;
+        let Self { mut writer } = self;
         // we allow users to explicitly abandon a transfer-encoding:chunked
         // write by emitting a bad chunk header. this should be a little more
         // durable when badly-configured body readers don't wait for the
         // terminating empty chunk to consider a body complete.
         //
         // we write an 'x' because it is not a valid hexadecimal character
-        io.write_all(b"x")
+        writer
+            .write_all(b"x")
             .await
             .map_err(BodyError::BodyWriteError)?;
-        io.flush().await.map_err(BodyError::BodyWriteError)?;
-        Ok(io)
+        writer.flush().await.map_err(BodyError::BodyWriteError)?;
+        Ok(writer)
     }
 }
