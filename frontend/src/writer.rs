@@ -82,25 +82,25 @@ use crate::error::FrontendResult;
 /// Writes a response to a frontend.
 #[derive(Debug)]
 pub struct FrontendWriter<I> {
-    io: I,
+    writer: I,
 }
 
 impl<I> FrontendWriter<I> {
     pub fn into_inner(self) -> I {
-        let Self { io } = self;
-        io
+        let Self { writer } = self;
+        writer
     }
 
     pub fn as_inner(&self) -> &I {
-        &self.io
+        &self.writer
     }
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
     /// Create a new frontend writer that will write responses into the
     /// specified `io`.
-    pub fn new(io: I) -> Self {
-        Self { io }
+    pub fn new(writer: I) -> Self {
+        Self { writer }
     }
 
     /// Send the response with a body terminated by connection close (RFC 9112
@@ -115,11 +115,11 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
     /// It is impossible for the client to determine if it received an entire
     /// response based only on the standard headers and body.
     pub async fn send_as_eof(self, response: &Response) -> FrontendResult<FrontendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_response_to(response, WriteFraming::StripFraming, &mut io)
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::StripFraming, &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter::Close(FrontendEofBodyWriter { io }))
+        Ok(FrontendBodyWriter::Close(FrontendEofBodyWriter { writer }))
     }
 
     /// Send the specified response with a chunked response body.
@@ -127,12 +127,12 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         self,
         response: &Response,
     ) -> FrontendResult<FrontendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_response_to(response, WriteFraming::Chunked, &mut io)
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::Chunked, &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter::TE(FrontendChunkedBodyWriter {
-            inner: ChunkedBodyWriter::new(io),
+            inner: ChunkedBodyWriter::new(writer),
         }))
     }
 
@@ -144,12 +144,12 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         response: &Response,
         body_len: u64,
     ) -> FrontendResult<FrontendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_response_to(response, WriteFraming::Length(body_len), &mut io)
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::Length(body_len), &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter::CL(FrontendContentLengthBodyWriter {
-            inner: ContentLengthBodyWriter::new(body_len, io),
+            inner: ContentLengthBodyWriter::new(body_len, writer),
         }))
     }
 
@@ -163,12 +163,12 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         self,
         response: &Response,
     ) -> Result<FrontendBodyWriter<I>, FrontendError> {
-        let Self { mut io } = self;
-        write_response_to(response, WriteFraming::PreserveFraming, &mut io)
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::PreserveFraming, &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodyWriter::Bodyless(FrontendBodylessBodyWriter {
-            inner: BodylessBodyWriter::new(io),
+            inner: BodylessBodyWriter::new(writer),
         }))
     }
 
@@ -194,12 +194,12 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
             "send_as_no_content called on a response that contains framing headers \
              (content-length or transfer-encoding); the origin is misbehaving"
         );
-        let Self { mut io } = self;
-        write_response_to(response, WriteFraming::StripFraming, &mut io)
+        let Self { mut writer } = self;
+        write_response_to(response, WriteFraming::StripFraming, &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
         Ok(FrontendBodylessBodyWriter {
-            inner: BodylessBodyWriter::new(io),
+            inner: BodylessBodyWriter::new(writer),
         })
     }
 }
@@ -269,20 +269,20 @@ async fn write_response_to<W: AsyncWriteExt + Unpin>(
 /// return a [`FrontendWriter`] — the connection is closed once the body is
 /// sent.
 pub struct FrontendEofBodyWriter<I> {
-    io: I,
+    writer: I,
 }
 
 impl<I: AsyncWriteExt + Unpin> FrontendEofBodyWriter<I> {
     pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
-        self.io
+        self.writer
             .write_all(buf)
             .await
             .map_err(FrontendError::WriteError)
     }
 
     pub async fn finish(self) -> FrontendResult<()> {
-        let Self { mut io } = self;
-        io.flush().await.map_err(FrontendError::WriteError)
+        let Self { mut writer } = self;
+        writer.flush().await.map_err(FrontendError::WriteError)
     }
 }
 
@@ -294,7 +294,9 @@ pub struct FrontendBodylessBodyWriter<I> {
 impl<I: AsyncWriteExt + Unpin> FrontendBodylessBodyWriter<I> {
     pub fn finish(self) -> FrontendResult<FrontendWriter<I>> {
         let Self { inner } = self;
-        Ok(FrontendWriter { io: inner.finish() })
+        Ok(FrontendWriter {
+            writer: inner.finish(),
+        })
     }
 }
 
@@ -314,11 +316,11 @@ impl<I: AsyncWriteExt + Unpin> FrontendContentLengthBodyWriter<I> {
 
     pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
         let Self { inner } = self;
-        let io = inner
+        let writer = inner
             .finish()
             .await
             .map_err(FrontendError::BodyWriteError)?;
-        Ok(FrontendWriter { io })
+        Ok(FrontendWriter { writer })
     }
 }
 
@@ -342,11 +344,11 @@ impl<I: AsyncWriteExt + Unpin> FrontendChunkedBodyWriter<I> {
         trailers: &Headers,
     ) -> FrontendResult<FrontendWriter<I>> {
         let Self { inner } = self;
-        let io = inner
+        let writer = inner
             .finish_with_trailers(trailers)
             .await
             .map_err(FrontendError::BodyWriteError)?;
-        Ok(FrontendWriter { io })
+        Ok(FrontendWriter { writer })
     }
 
     pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {

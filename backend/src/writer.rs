@@ -9,20 +9,20 @@ use tokio::io::{self, AsyncWriteExt};
 use crate::error::{BackendError, BackendResult};
 
 pub struct BackendWriter<I> {
-    io: I,
+    writer: I,
 }
 impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
-    pub fn new(io: I) -> Self {
-        Self { io }
+    pub fn new(writer: I) -> Self {
+        Self { writer }
     }
 
     pub async fn send_as_chunked(self, request: &Request) -> BackendResult<BackendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_request_to(request, WriteFraming::Chunked, &mut io)
+        let Self { mut writer } = self;
+        write_request_to(request, WriteFraming::Chunked, &mut writer)
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter::TE(BackendChunkedBodyWriter {
-            inner: ChunkedBodyWriter::new(io),
+            inner: ChunkedBodyWriter::new(writer),
         }))
     }
 
@@ -31,12 +31,12 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         request: &Request,
         body_len: u64,
     ) -> BackendResult<BackendBodyWriter<I>> {
-        let Self { mut io } = self;
-        write_request_to(request, WriteFraming::Length(body_len), &mut io)
+        let Self { mut writer } = self;
+        write_request_to(request, WriteFraming::Length(body_len), &mut writer)
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter::CL(BackendContentLengthBodyWriter {
-            inner: ContentLengthBodyWriter::new(body_len, io),
+            inner: ContentLengthBodyWriter::new(body_len, writer),
         }))
     }
 
@@ -47,18 +47,18 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         self,
         request: &Request,
     ) -> Result<BackendBodyWriter<I>, BackendError> {
-        let Self { mut io } = self;
-        write_request_to(request, WriteFraming::PreserveFraming, &mut io)
+        let Self { mut writer } = self;
+        write_request_to(request, WriteFraming::PreserveFraming, &mut writer)
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter::Bodyless(BackendBodylessBodyWriter {
-            inner: BodylessBodyWriter::new(io),
+            inner: BodylessBodyWriter::new(writer),
         }))
     }
 
     pub fn into_inner(self) -> I {
-        let Self { io } = self;
-        io
+        let Self { writer } = self;
+        writer
     }
 }
 

@@ -14,18 +14,18 @@ use crate::error::{BackendError, BackendResult};
 
 #[derive(Debug)]
 pub struct BackendReader<I> {
-    io_buffer: BytesReader<I>,
+    reader: BytesReader<I>,
     parse_slots: ParseSlots,
 }
 
 impl<I: AsyncReadExt + Unpin> BackendReader<I> {
-    pub fn new(io: I, max_headers: usize) -> Self {
-        Self::new_with_iobuffer(BytesReader::new(io), max_headers)
+    pub fn new(reader: I, max_headers: usize) -> Self {
+        Self::new_with_iobuffer(BytesReader::new(reader), max_headers)
     }
 
-    pub fn new_with_iobuffer(io_buffer: BytesReader<I>, max_headers: usize) -> Self {
+    pub fn new_with_iobuffer(reader: BytesReader<I>, max_headers: usize) -> Self {
         Self {
-            io_buffer,
+            reader,
             parse_slots: ParseSlots::new(max_headers),
         }
     }
@@ -34,23 +34,23 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         loop {
             if let Some(res) = self
                 .parse_slots
-                .parse_response(&mut self.io_buffer)
+                .parse_response(&mut self.reader)
                 .map_err(BackendError::HttpResponseParseError)?
             {
                 return Ok(res);
-            } else if self.io_buffer.len() >= max_head_length {
+            } else if self.reader.len() >= max_head_length {
                 return Err(BackendError::MaxHeadLenExceeded(
-                    self.io_buffer.len(),
+                    self.reader.len(),
                     max_head_length,
                 ));
             }
 
-            let first_read = self.io_buffer.is_empty();
+            let first_read = self.reader.is_empty();
 
             // read some data into the buffer
-            let target_read_len = max_head_length.saturating_sub(self.io_buffer.len());
+            let target_read_len = max_head_length.saturating_sub(self.reader.len());
             let len = self
-                .io_buffer
+                .reader
                 .read(target_read_len)
                 .await
                 .map_err(BackendError::ReadError)?;
@@ -77,7 +77,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     ) -> BackendResult<ResponseStream<I>> {
         let res = self.head(max_head_length).await?;
         let Self {
-            io_buffer,
+            reader,
             parse_slots,
         } = self;
 
@@ -113,7 +113,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
                         allow_body,
                         max_head_length,
                         reader: Self {
-                            io_buffer,
+                            reader,
                             parse_slots,
                         },
                     },
@@ -126,7 +126,7 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
                         allow_body,
                         max_head_length,
                         reader: Self {
-                            io_buffer,
+                            reader,
                             parse_slots,
                         },
                     },
@@ -142,27 +142,27 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
 
         let reader = if !expect_body {
             BackendBodyReader::Bodyless(BackendBodylessBodyReader {
-                inner: BodylessBodyReader::new(io_buffer, parse_slots),
+                inner: BodylessBodyReader::new(reader, parse_slots),
             })
         } else if is_no_framing && expect_body {
             // No framing headers: body is terminated by connection close.
             // RFC 9112 section 6.3 rule 8.
             BackendBodyReader::Eof(BackendEofBodyReader {
-                inner: EofBodyReader::new(io_buffer, parse_slots),
+                inner: EofBodyReader::new(reader, parse_slots),
             })
         } else {
             match framing {
                 ParsedFraming::Length(cl) => {
                     BackendBodyReader::CL(BackendContentLengthBodyReader {
-                        inner: ContentLengthBodyReader::new(cl, io_buffer, parse_slots),
+                        inner: ContentLengthBodyReader::new(cl, reader, parse_slots),
                     })
                 }
                 ParsedFraming::Chunked => BackendBodyReader::TE(BackendChunkedBodyReader {
-                    inner: ChunkedBodyReader::new(io_buffer, parse_slots),
+                    inner: ChunkedBodyReader::new(reader, parse_slots),
                 }),
                 ParsedFraming::NoFraming => {
                     BackendBodyReader::Bodyless(BackendBodylessBodyReader {
-                        inner: BodylessBodyReader::new(io_buffer, parse_slots),
+                        inner: BodylessBodyReader::new(reader, parse_slots),
                     })
                 }
             }
@@ -173,10 +173,10 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
 
     pub fn into_parts(self) -> BytesReader<I> {
         let Self {
-            io_buffer,
+            reader,
             parse_slots: _,
         } = self;
-        io_buffer
+        reader
     }
 }
 
@@ -261,9 +261,9 @@ pub struct BackendBodylessBodyReader<I> {
 impl<I: AsyncReadExt + Unpin> BackendBodylessBodyReader<I> {
     pub fn drain(self) -> BackendResult<BackendReader<I>> {
         let Self { inner } = self;
-        let (io, parse_slots) = inner.drain();
+        let (reader, parse_slots) = inner.drain();
         Ok(BackendReader {
-            io_buffer: io,
+            reader,
             parse_slots,
         })
     }
@@ -290,9 +290,9 @@ impl<I: AsyncReadExt + Unpin> BackendContentLengthBodyReader<I> {
 
     pub async fn drain(self) -> BackendResult<BackendReader<I>> {
         let Self { inner } = self;
-        let (io, parse_slots) = inner.drain().await.map_err(BackendError::BodyReadError)?;
+        let (reader, parse_slots) = inner.drain().await.map_err(BackendError::BodyReadError)?;
         Ok(BackendReader {
-            io_buffer: io,
+            reader,
             parse_slots,
         })
     }
@@ -320,11 +320,11 @@ impl<I: AsyncReadExt + Unpin> BackendChunkedBodyReader<I> {
 
     pub async fn drain(self) -> BackendResult<(BackendReader<I>, Headers)> {
         let Self { inner } = self;
-        let (io, parse_slots, trailers) =
+        let (reader, parse_slots, trailers) =
             inner.drain().await.map_err(BackendError::BodyReadError)?;
         Ok((
             BackendReader {
-                io_buffer: io,
+                reader,
                 parse_slots,
             },
             trailers,
