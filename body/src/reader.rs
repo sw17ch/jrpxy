@@ -1,5 +1,9 @@
+use std::future::poll_fn;
+use std::pin::Pin;
+use std::task::{Context, Poll, ready};
+
 use bytes::Bytes;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::{MessageError, ParseSlots};
@@ -59,16 +63,27 @@ impl<I> ContentLengthBodyReader<I> {
 
 impl<I> ContentLengthBodyReader<I>
 where
-    I: AsyncReadExt + Unpin,
+    I: AsyncRead + Unpin,
 {
-    /// Read bytes and return them as a [`Bytes`].
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
+        poll_fn(|cx| Self::poll_read(self, cx, max_len)).await
+    }
+
+    fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<BodyResult<Option<Bytes>>> {
         let remaining = self.remaining();
         if remaining == 0 {
-            return Ok(None);
+            return Poll::Ready(Ok(None));
         }
 
-        self.reader.ensure(IO_FILL_LEN).await?;
+        let mut ensure = self.reader.ensure(IO_FILL_LEN);
+        let ensured = ready!(Pin::new(&mut ensure).poll(cx));
+        if let Err(e) = ensured {
+            return Poll::Ready(Err(BodyError::from(e)));
+        }
 
         let at = remaining
             .try_into()
@@ -78,7 +93,7 @@ where
 
         self.offset += at as u64;
 
-        Ok(Some(self.reader.split_to(at)))
+        Poll::Ready(Ok(Some(self.reader.split_to(at))))
     }
 
     /// Drain the [`ContentLengthBodyReader`] and return the inner
