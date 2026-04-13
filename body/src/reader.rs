@@ -14,6 +14,14 @@ use crate::error::{BodyError, BodyResult, TrailerError};
 const DRAIN_SIZE: usize = 4096;
 const IO_FILL_LEN: usize = 4096;
 
+fn poll_ensure<I: AsyncRead + Unpin>(
+    cx: &mut Context<'_>,
+    reader: &mut BytesReader<I>,
+) -> Poll<BodyResult<()>> {
+    let mut ensure = reader.ensure(IO_FILL_LEN);
+    Poll::Ready(ready!(Pin::new(&mut ensure).poll(cx)).map_err(BodyError::from))
+}
+
 fn map_trailer_error(e: MessageError) -> BodyError {
     let trailer_error = match e {
         MessageError::Parse(httparse::Error::TooManyHeaders) => TrailerError::TooManyFields,
@@ -79,10 +87,8 @@ where
             return Poll::Ready(Ok(None));
         }
 
-        let mut ensure = self.reader.ensure(IO_FILL_LEN);
-        let ensured = ready!(Pin::new(&mut ensure).poll(cx));
-        if let Err(e) = ensured {
-            return Poll::Ready(Err(BodyError::from(e)));
+        if let Err(e) = ready!(poll_ensure(cx, &mut self.reader)) {
+            return Poll::Ready(Err(e));
         }
 
         let at = remaining
@@ -293,9 +299,8 @@ impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
                         self.state = ChunkBodyState::InFooterNeedCR;
                         continue;
                     }
-                    let mut ensure = self.reader.ensure(IO_FILL_LEN);
-                    if let Err(e) = ready!(Pin::new(&mut ensure).poll(cx)) {
-                        return Poll::Ready(Err(BodyError::from(e)));
+                    if let Err(e) = ready!(poll_ensure(cx, &mut self.reader)) {
+                        return Poll::Ready(Err(e));
                     }
                     let at = self
                         .remaining
@@ -305,9 +310,8 @@ impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
                     return Poll::Ready(Ok(Some(self.reader.split_to(at))));
                 }
                 ChunkBodyState::InFooterNeedCR => {
-                    let mut ensure = self.reader.ensure(IO_FILL_LEN);
-                    if let Err(e) = ready!(Pin::new(&mut ensure).poll(cx)) {
-                        return Poll::Ready(Err(BodyError::from(e)));
+                    if let Err(e) = ready!(poll_ensure(cx, &mut self.reader)) {
+                        return Poll::Ready(Err(e));
                     }
                     match self.reader.get_u8() {
                         b'\r' => {
@@ -321,9 +325,8 @@ impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
                     }
                 }
                 ChunkBodyState::InFooterNeedLF => {
-                    let mut ensure = self.reader.ensure(IO_FILL_LEN);
-                    if let Err(e) = ready!(Pin::new(&mut ensure).poll(cx)) {
-                        return Poll::Ready(Err(BodyError::from(e)));
+                    if let Err(e) = ready!(poll_ensure(cx, &mut self.reader)) {
+                        return Poll::Ready(Err(e));
                     }
                     match self.reader.get_u8() {
                         b'\n' => {
