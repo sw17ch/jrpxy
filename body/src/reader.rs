@@ -412,6 +412,7 @@ where
                             reader,
                             parse_slots,
                             trailers,
+                            extensions: ChunkExtensions(chunk_header_bytes),
                         }));
                     } else {
                         return Ok(NextChunk::Data(ChunkBodyReader {
@@ -432,6 +433,7 @@ where
 pub struct FinalChunkReader<I> {
     reader: BytesReader<I>,
     parse_slots: ParseSlots,
+    extensions: ChunkExtensions,
     trailers: Headers,
 }
 
@@ -440,11 +442,16 @@ impl<I> FinalChunkReader<I> {
         &self.trailers
     }
 
+    pub fn extensions(&self) -> &ChunkExtensions {
+        &self.extensions
+    }
+
     pub fn into_parts(self) -> (BytesReader<I>, ParseSlots, Headers) {
         let Self {
             reader,
             parse_slots,
             trailers,
+            extensions: _,
         } = self;
         (reader, parse_slots, trailers)
     }
