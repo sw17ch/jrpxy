@@ -278,6 +278,14 @@ impl<I: AsyncReadExt + Unpin> ChunkBodyReader<I> {
     /// the chunk is fully drained and the chunk footer (`\r\n`) has been
     /// consumed.
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
+        poll_fn(|cx| Self::poll_read(self, cx, max_len)).await
+    }
+
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<BodyResult<Option<Bytes>>> {
         loop {
             match self.state {
                 ChunkBodyState::InBody => {
@@ -285,37 +293,50 @@ impl<I: AsyncReadExt + Unpin> ChunkBodyReader<I> {
                         self.state = ChunkBodyState::InFooterNeedCR;
                         continue;
                     }
-                    self.reader.ensure(IO_FILL_LEN).await?;
+                    let mut ensure = self.reader.ensure(IO_FILL_LEN);
+                    if let Err(e) = ready!(Pin::new(&mut ensure).poll(cx)) {
+                        return Poll::Ready(Err(BodyError::from(e)));
+                    }
                     let at = self
                         .remaining
                         .min(self.reader.len() as u64)
                         .min(max_len as u64) as usize;
                     self.remaining -= at as u64;
-                    return Ok(Some(self.reader.split_to(at)));
+                    return Poll::Ready(Ok(Some(self.reader.split_to(at))));
                 }
                 ChunkBodyState::InFooterNeedCR => {
-                    self.reader.ensure(IO_FILL_LEN).await?;
+                    let mut ensure = self.reader.ensure(IO_FILL_LEN);
+                    if let Err(e) = ready!(Pin::new(&mut ensure).poll(cx)) {
+                        return Poll::Ready(Err(BodyError::from(e)));
+                    }
                     match self.reader.get_u8() {
                         b'\r' => {
                             self.state = ChunkBodyState::InFooterNeedLF;
                         }
                         unexpected => {
-                            return Err(BodyError::InvalidChunkFooter(b'\r', unexpected));
+                            return Poll::Ready(Err(BodyError::InvalidChunkFooter(
+                                b'\r', unexpected,
+                            )));
                         }
                     }
                 }
                 ChunkBodyState::InFooterNeedLF => {
-                    self.reader.ensure(IO_FILL_LEN).await?;
+                    let mut ensure = self.reader.ensure(IO_FILL_LEN);
+                    if let Err(e) = ready!(Pin::new(&mut ensure).poll(cx)) {
+                        return Poll::Ready(Err(BodyError::from(e)));
+                    }
                     match self.reader.get_u8() {
                         b'\n' => {
                             self.state = ChunkBodyState::Done;
                         }
                         unexpected => {
-                            return Err(BodyError::InvalidChunkFooter(b'\n', unexpected));
+                            return Poll::Ready(Err(BodyError::InvalidChunkFooter(
+                                b'\n', unexpected,
+                            )));
                         }
                     }
                 }
-                ChunkBodyState::Done => return Ok(None),
+                ChunkBodyState::Done => return Poll::Ready(Ok(None)),
             }
         }
     }
