@@ -69,7 +69,7 @@ where
         poll_fn(|cx| Self::poll_read(self, cx, max_len)).await
     }
 
-    fn poll_read(
+    pub fn poll_read(
         &mut self,
         cx: &mut Context<'_>,
         max_len: usize,
@@ -273,7 +273,7 @@ impl<I> ChunkBodyReader<I> {
     }
 }
 
-impl<I: AsyncReadExt + Unpin> ChunkBodyReader<I> {
+impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
     /// Read up to `max_len` bytes from this chunk's body. Returns `None` when
     /// the chunk is fully drained and the chunk footer (`\r\n`) has been
     /// consumed.
