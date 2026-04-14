@@ -44,10 +44,16 @@ impl<I> ContentLengthBodyWriter<I> {
 
 impl<I: AsyncWrite + Unpin> ContentLengthBodyWriter<I> {
     pub async fn write(&mut self, mut buffer: &[u8]) -> BodyResult<()> {
+        // TODO: should this return a usize instead of ()? Right now, we return
+        // a WriteZero error if we cannot fully write.
         while !buffer.is_empty() {
             let written = poll_fn(|cx| self.poll_write(cx, buffer)).await?;
-            let (_written, rest) = buffer.split_at(written);
-            buffer = rest;
+            if written == 0 {
+                return Err(BodyError::BodyWriteError(
+                    std::io::ErrorKind::WriteZero.into(),
+                ));
+            }
+            buffer = &buffer[written..];
         }
         Ok(())
     }
