@@ -80,47 +80,6 @@ impl<I: AsyncWriteExt + Unpin> ContentLengthBodyWriter<I> {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::ChunkedBodyWriter;
-
-    #[tokio::test]
-    async fn chunked_write_abort() {
-        let mut bw = ChunkedBodyWriter::new(Vec::new());
-        bw.write(b"hello").await.unwrap();
-        bw.write(b"there").await.unwrap();
-        let write_buf = bw.abort().await.unwrap();
-
-        assert_eq!(
-            "\
-            5\r\n\
-            hello\r\n\
-            5\r\n\
-            there\r\n\
-            x",
-            std::str::from_utf8(&write_buf).unwrap(),
-        );
-    }
-
-    #[tokio::test]
-    async fn chunked_write() {
-        let mut bw = ChunkedBodyWriter::new(Vec::new());
-        bw.write(b"hello").await.unwrap();
-        bw.write(b"there").await.unwrap();
-        let write_buf = bw.finish().await.unwrap();
-
-        assert_eq!(
-            "\
-            5\r\n\
-            hello\r\n\
-            5\r\n\
-            there\r\n\
-            0\r\n\
-            \r\n",
-            std::str::from_utf8(&write_buf).unwrap(),
-        );
-    }
-}
 #[derive(Debug)]
 pub struct ChunkedBodyWriter<I> {
     writer: I,
@@ -214,5 +173,47 @@ impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
             .map_err(BodyError::BodyWriteError)?;
         writer.flush().await.map_err(BodyError::BodyWriteError)?;
         Ok(writer)
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use super::ChunkedBodyWriter;
+
+    #[tokio::test]
+    async fn chunked_write_abort() {
+        let mut bw = ChunkedBodyWriter::new(Vec::new());
+        bw.write(b"hello").await.unwrap();
+        bw.write(b"there").await.unwrap();
+        let write_buf = bw.abort().await.unwrap();
+
+        assert_eq!(
+            "\
+            5\r\n\
+            hello\r\n\
+            5\r\n\
+            there\r\n\
+            x",
+            std::str::from_utf8(&write_buf).unwrap(),
+        );
+    }
+
+    #[tokio::test]
+    async fn chunked_write() {
+        let mut bw = ChunkedBodyWriter::new(Vec::new());
+        bw.write(b"hello").await.unwrap();
+        bw.write(b"there").await.unwrap();
+        let write_buf = bw.finish().await.unwrap();
+
+        assert_eq!(
+            "\
+            5\r\n\
+            hello\r\n\
+            5\r\n\
+            there\r\n\
+            0\r\n\
+            \r\n",
+            std::str::from_utf8(&write_buf).unwrap(),
+        );
     }
 }
