@@ -345,10 +345,9 @@ impl<I: AsyncReadExt + Unpin> BackendEofBodyReader<I> {
             .map_err(BackendError::BodyReadError)
     }
 
-    pub async fn drain(self) -> BackendResult<ParseSlots> {
+    pub fn drain(self) -> ParseSlots {
         let Self { inner } = self;
-        let parse_slots = inner.drain().await.map_err(BackendError::BodyReadError)?;
-        Ok(parse_slots)
+        inner.drain()
     }
 }
 
@@ -393,7 +392,7 @@ impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
             BackendBodyReader::Eof(r) => {
                 // TODO: we could probably figure out a way to reuse these
                 // instead of dropping them.
-                let _parse_slots = r.drain().await?;
+                let _parse_slots = r.drain();
                 Ok(None)
             }
         }
