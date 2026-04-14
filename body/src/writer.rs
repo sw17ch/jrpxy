@@ -204,6 +204,18 @@ mod test {
     }
 
     #[tokio::test]
+    async fn content_length_zero_write() {
+        let buf = &mut [0u8, 0, 0, 0][..];
+        let cursor = std::io::Cursor::new(buf);
+        let mut bw = ContentLengthBodyWriter::new(10, cursor);
+        let e = bw.write(b"01234").await.unwrap_err();
+        let BodyError::BodyWriteError(e) = e else {
+            panic!("unexpected error: {e:?}");
+        };
+        assert_eq!(std::io::ErrorKind::WriteZero, e.kind());
+    }
+
+    #[tokio::test]
     async fn chunked_write_abort() {
         let mut bw = ChunkedBodyWriter::new(Vec::new());
         bw.write(b"hello").await.unwrap();
