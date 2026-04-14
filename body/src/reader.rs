@@ -121,7 +121,7 @@ where
     }
 
     /// Drain the [`ContentLengthBodyReader`] and return the inner
-    /// [`IoBuffer`] and [`ParseSlots`].
+    /// [`BytesReader`] and [`ParseSlots`].
     pub async fn drain(mut self) -> BodyResult<(BytesReader<I>, ParseSlots)> {
         let () = poll_fn(|cx| self.poll_drain(cx)).await?;
         Ok(self.finish())
