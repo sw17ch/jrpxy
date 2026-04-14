@@ -110,20 +110,35 @@ where
         Poll::Ready(Ok(Some(self.reader.split_to(at))))
     }
 
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        loop {
+            match ready!(self.poll_read(cx, DRAIN_SIZE)) {
+                Err(e) => return Poll::Ready(Err(e)),
+                Ok(None) => return Poll::Ready(Ok(())),
+                Ok(Some(_)) => continue,
+            }
+        }
+    }
+
     /// Drain the [`ContentLengthBodyReader`] and return the inner
     /// [`IoBuffer`] and [`ParseSlots`].
     pub async fn drain(mut self) -> BodyResult<(BytesReader<I>, ParseSlots)> {
-        while let Some(_buf) = self.read(DRAIN_SIZE).await? {
-            // drop buffers until we get to the end of the body
-        }
+        let () = poll_fn(|cx| self.poll_drain(cx)).await?;
+        Ok(self.finish())
+    }
+
+    pub fn finish(self) -> (BytesReader<I>, ParseSlots) {
         let Self {
             length,
             offset,
             reader,
             parse_slots,
         } = self;
-        debug_assert_eq!(offset, length);
-        Ok((reader, parse_slots))
+        assert_eq!(
+            offset, length,
+            "attempted to finish content length body reader before fully drained"
+        );
+        (reader, parse_slots)
     }
 }
 
