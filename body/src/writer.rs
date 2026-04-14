@@ -1,5 +1,11 @@
+use std::{
+    future::poll_fn,
+    pin::Pin,
+    task::{Context, Poll, ready},
+};
+
 use jrpxy_http_message::header::Headers;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWrite, AsyncWriteExt};
 
 use crate::error::{BodyError, BodyResult};
 
@@ -36,30 +42,37 @@ impl<I> ContentLengthBodyWriter<I> {
     }
 }
 
-impl<I: AsyncWriteExt + Unpin> ContentLengthBodyWriter<I> {
-    pub async fn write(&mut self, buffer: &[u8]) -> BodyResult<()> {
-        let Self {
-            length,
-            offset,
-            writer,
-        } = self;
+impl<I: AsyncWrite + Unpin> ContentLengthBodyWriter<I> {
+    pub async fn write(&mut self, mut buffer: &[u8]) -> BodyResult<()> {
+        while !buffer.is_empty() {
+            let written = poll_fn(|cx| self.poll_write(cx, buffer)).await?;
+            let (_written, rest) = buffer.split_at(written);
+            buffer = rest;
+        }
+        Ok(())
+    }
 
-        let Some(next_offset) = offset.checked_add(buffer.len() as u64) else {
-            return Err(BodyError::BodyOverflow(*length));
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, buffer: &[u8]) -> Poll<BodyResult<usize>> {
+        let Some(target_next_offset) = self.offset.checked_add(buffer.len() as u64) else {
+            // a complete write of this buffer would overflow the size of a u64
+            return Poll::Ready(Err(BodyError::BodyOverflow(self.length)));
         };
 
-        if next_offset > *length {
-            return Err(BodyError::BodyOverflow(*length));
+        if target_next_offset > self.length {
+            // a complete write of this buffer would overflow the allowed length
+            return Poll::Ready(Err(BodyError::BodyOverflow(self.length)));
         }
 
-        writer
-            .write_all(buffer)
-            .await
-            .map_err(BodyError::BodyWriteError)?;
-
-        *offset = next_offset;
-
-        Ok(())
+        match ready!(Pin::new(&mut self.writer).poll_write(cx, buffer)) {
+            Ok(len) => {
+                // we already check that a full write of the buffer won't
+                // overflow, so we are safe to advance the length by the written
+                // length.
+                self.offset += len as u64;
+                Poll::Ready(Ok(len))
+            }
+            Err(e) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
+        }
     }
 
     pub async fn finish(self) -> BodyResult<I> {
@@ -178,7 +191,17 @@ impl<I: AsyncWriteExt + Unpin> ChunkedBodyWriter<I> {
 
 #[cfg(test)]
 mod test {
-    use super::ChunkedBodyWriter;
+    use crate::error::BodyError;
+
+    use super::{ChunkedBodyWriter, ContentLengthBodyWriter};
+
+    #[tokio::test]
+    async fn content_length_write_overflow() {
+        let mut bw = ContentLengthBodyWriter::new(10, Vec::new());
+        let () = bw.write(b"01234").await.unwrap();
+        let e = bw.write(b"567890").await.unwrap_err();
+        assert!(matches!(e, BodyError::BodyOverflow(10)));
+    }
 
     #[tokio::test]
     async fn chunked_write_abort() {
