@@ -249,9 +249,8 @@ impl<I: AsyncRead + Unpin> ChunkedBodyReader<I> {
                         }
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                         Poll::Ready(Ok(())) => match reader.finish() {
-                            Err(e) => return Poll::Ready(Err(e)),
-                            Ok(NextChunk::Data(r)) => self.inner = Some(r.into()),
-                            Ok(NextChunk::Final(r)) => self.inner = Some(r.into()),
+                            NextChunk::Data(r) => self.inner = Some(r.into()),
+                            NextChunk::Final(r) => self.inner = Some(r.into()),
                         },
                     }
                 }
@@ -487,7 +486,7 @@ where
     /// Read the next chunk.
     pub async fn read_chunk(mut self) -> BodyResult<NextChunk<I>> {
         let () = poll_fn(|cx| Self::poll_read_chunk(&mut self, cx)).await?;
-        self.finish()
+        Ok(self.finish())
     }
 
     /// Poll for the next chunk.
@@ -559,7 +558,7 @@ where
     ///
     /// Panics if the head reader has not successfully polled
     /// [`Self::poll_read_chunk`] to completion.
-    pub fn finish(self) -> BodyResult<NextChunk<I>> {
+    pub fn finish(self) -> NextChunk<I> {
         let Self {
             reader,
             parse_slots,
@@ -572,25 +571,23 @@ where
                 panic!("tried to finish while reading trailers")
             }
             ChunkHeadReaderState::Ready(next) => match next {
-                PollNextChunk::Data { size, chunk_header } => {
-                    Ok(NextChunk::Data(ChunkDataReader {
-                        reader,
-                        parse_slots,
-                        size,
-                        extensions: ChunkExtensions::new(chunk_header),
-                        remaining: size,
-                        state: ChunkBodyState::InBody,
-                    }))
-                }
+                PollNextChunk::Data { size, chunk_header } => NextChunk::Data(ChunkDataReader {
+                    reader,
+                    parse_slots,
+                    size,
+                    extensions: ChunkExtensions::new(chunk_header),
+                    remaining: size,
+                    state: ChunkBodyState::InBody,
+                }),
                 PollNextChunk::Final {
                     chunk_header,
                     trailers,
-                } => Ok(NextChunk::Final(FinalChunkReader {
+                } => NextChunk::Final(FinalChunkReader {
                     reader,
                     parse_slots,
                     extensions: ChunkExtensions::new(chunk_header),
                     trailers,
-                })),
+                }),
             },
         }
     }
