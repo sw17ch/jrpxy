@@ -364,10 +364,27 @@ impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
         }
     }
 
-    pub async fn drain(mut self) -> BodyResult<ChunkHeadReader<I>> {
-        while let Some(_drained) = self.read(DRAIN_SIZE).await? {
-            // drain bytes until we get to the end of the chunk
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        loop {
+            match ready!(self.poll_read(cx, DRAIN_SIZE)) {
+                Err(e) => return Poll::Ready(Err(e)),
+                Ok(None) => return Poll::Ready(Ok(())),
+                Ok(Some(_)) => continue,
+            }
         }
+    }
+
+    pub async fn drain(mut self) -> BodyResult<ChunkHeadReader<I>> {
+        poll_fn(|cx| Self::poll_drain(&mut self, cx)).await?;
+        Ok(self.finish())
+    }
+
+    /// Finish the body chunk body reader returning a head reader.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the body reader is not yet fully drained.
+    pub fn finish(self) -> ChunkHeadReader<I> {
         let Self {
             reader,
             parse_slots,
@@ -376,8 +393,11 @@ impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
             remaining: _,
             state,
         } = self;
-        debug_assert!(matches!(state, ChunkBodyState::Done));
-        Ok(ChunkHeadReader::new(reader, parse_slots))
+        assert!(
+            matches!(state, ChunkBodyState::Done),
+            "attempted to finish the chunk reader before it was fully drained"
+        );
+        ChunkHeadReader::new(reader, parse_slots)
     }
 }
 
