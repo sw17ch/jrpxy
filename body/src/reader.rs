@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll, ready};
 
 use bytes::Bytes;
-use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::io::AsyncRead;
 
 use jrpxy_http_message::header::Headers;
 use jrpxy_http_message::message::{MessageError, ParseSlots};
@@ -110,6 +110,13 @@ where
         Poll::Ready(Ok(Some(self.reader.split_to(at))))
     }
 
+    /// Drain the [`ContentLengthBodyReader`] and return the inner
+    /// [`BytesReader`] and [`ParseSlots`].
+    pub async fn drain(mut self) -> BodyResult<(BytesReader<I>, ParseSlots)> {
+        let () = poll_fn(|cx| self.poll_drain(cx)).await?;
+        Ok(self.finish())
+    }
+
     pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
         loop {
             match ready!(self.poll_read(cx, DRAIN_SIZE)) {
@@ -118,13 +125,6 @@ where
                 Ok(Some(_)) => continue,
             }
         }
-    }
-
-    /// Drain the [`ContentLengthBodyReader`] and return the inner
-    /// [`BytesReader`] and [`ParseSlots`].
-    pub async fn drain(mut self) -> BodyResult<(BytesReader<I>, ParseSlots)> {
-        let () = poll_fn(|cx| self.poll_drain(cx)).await?;
-        Ok(self.finish())
     }
 
     pub fn finish(self) -> (BytesReader<I>, ParseSlots) {
@@ -144,6 +144,7 @@ where
 
 /// The extensions attached to a chunk header. Currently opaque; full parsing
 /// is a TODO.
+#[derive(Debug)]
 pub struct ChunkExtensions {
     chunk_header_bytes: Bytes,
 }
@@ -160,10 +161,12 @@ impl ChunkExtensions {
 
 /// Positioned at the start of the next chunk (or the terminal chunk). Owns
 /// the underlying IO for the duration of inter-chunk parsing.
+#[derive(Debug)]
 pub struct ChunkedBodyReader<I> {
     inner: Option<ChunkedBodyChunkStream<I>>,
 }
 
+#[derive(Debug)]
 enum ChunkedBodyChunkStream<I> {
     InChunk(ChunkBodyReader<I>),
     BetweenChunk(ChunkHeadReader<I>),
@@ -186,12 +189,6 @@ impl<I> From<FinalChunkReader<I>> for ChunkedBodyChunkStream<I> {
     }
 }
 
-impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ChunkedBodyReader").finish_non_exhaustive()
-    }
-}
-
 impl<I> ChunkedBodyReader<I> {
     pub fn new(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
         Self {
@@ -207,7 +204,7 @@ impl<I> ChunkedBodyReader<I> {
     }
 }
 
-impl<I: AsyncReadExt + Unpin> ChunkedBodyReader<I> {
+impl<I: AsyncRead + Unpin> ChunkedBodyReader<I> {
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         loop {
             let Some(current) = self.inner.take() else {
@@ -421,12 +418,14 @@ pub enum NextChunk<I> {
     Final(FinalChunkReader<I>),
 }
 
+#[derive(Debug)]
 enum ChunkHeadReaderState {
     ReadingSize,
     ReadingTrailers { chunk_header_bytes: Bytes },
     Ready(PollNextChunk),
 }
 
+#[derive(Debug)]
 enum PollNextChunk {
     Data {
         size: u64,
@@ -438,6 +437,7 @@ enum PollNextChunk {
     },
 }
 
+#[derive(Debug)]
 pub struct ChunkHeadReader<I> {
     reader: BytesReader<I>,
     parse_slots: ParseSlots,
@@ -570,6 +570,7 @@ where
     }
 }
 
+#[derive(Debug)]
 pub struct FinalChunkReader<I> {
     reader: BytesReader<I>,
     parse_slots: ParseSlots,
@@ -691,7 +692,7 @@ impl<I> EofBodyReader<I> {
     }
 }
 
-impl<I: AsyncReadExt + Unpin> EofBodyReader<I> {
+impl<I: AsyncRead + Unpin> EofBodyReader<I> {
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         poll_fn(|cx| self.poll_read(cx, max_len)).await
     }
