@@ -22,6 +22,14 @@ fn poll_ensure<I: AsyncRead + Unpin>(
     Poll::Ready(ready!(Pin::new(&mut ensure).poll(cx)).map_err(BodyError::from))
 }
 
+fn poll_extend<I: AsyncRead + Unpin>(
+    cx: &mut Context<'_>,
+    reader: &mut BytesReader<I>,
+) -> Poll<BodyResult<()>> {
+    let mut extend = reader.extend(IO_FILL_LEN);
+    Poll::Ready(ready!(Pin::new(&mut extend).poll(cx)).map_err(BodyError::from))
+}
+
 fn map_trailer_error(e: MessageError) -> BodyError {
     let trailer_error = match e {
         MessageError::Parse(httparse::Error::TooManyHeaders) => TrailerError::TooManyFields,
@@ -121,7 +129,19 @@ where
 
 /// The extensions attached to a chunk header. Currently opaque; full parsing
 /// is a TODO.
-pub struct ChunkExtensions(pub Bytes);
+pub struct ChunkExtensions {
+    chunk_header_bytes: Bytes,
+}
+
+impl ChunkExtensions {
+    fn new(chunk_header_bytes: Bytes) -> Self {
+        Self { chunk_header_bytes }
+    }
+
+    pub fn header_bytes(&self) -> &Bytes {
+        &self.chunk_header_bytes
+    }
+}
 
 /// Positioned at the start of the next chunk (or the terminal chunk). Owns
 /// the underlying IO for the duration of inter-chunk parsing.
@@ -160,10 +180,10 @@ impl<I> std::fmt::Debug for ChunkedBodyReader<I> {
 impl<I> ChunkedBodyReader<I> {
     pub fn new(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
         Self {
-            inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader {
+            inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader::new(
                 reader,
                 parse_slots,
-            })),
+            ))),
         }
     }
 
@@ -357,10 +377,7 @@ impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
             state,
         } = self;
         debug_assert!(matches!(state, ChunkBodyState::Done));
-        Ok(ChunkHeadReader {
-            reader,
-            parse_slots,
-        })
+        Ok(ChunkHeadReader::new(reader, parse_slots))
     }
 }
 
@@ -369,63 +386,151 @@ pub enum NextChunk<I> {
     Final(FinalChunkReader<I>),
 }
 
+enum ChunkHeadReaderState {
+    ReadingSize,
+    ReadingTrailers { chunk_header_bytes: Bytes },
+    Ready(PollNextChunk),
+}
+
+enum PollNextChunk {
+    Data {
+        size: u64,
+        chunk_header: Bytes,
+    },
+    Final {
+        chunk_header: Bytes,
+        trailers: Headers,
+    },
+}
+
 pub struct ChunkHeadReader<I> {
     reader: BytesReader<I>,
     parse_slots: ParseSlots,
+    state: ChunkHeadReaderState,
+}
+
+impl<I> ChunkHeadReader<I> {
+    fn new(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
+        Self {
+            reader,
+            parse_slots,
+            state: ChunkHeadReaderState::ReadingSize,
+        }
+    }
 }
 
 impl<I> ChunkHeadReader<I>
 where
-    I: AsyncReadExt + Unpin,
+    I: AsyncRead + Unpin,
 {
-    pub async fn read_chunk(self) -> BodyResult<NextChunk<I>> {
-        let Self {
-            mut reader,
-            mut parse_slots,
-        } = self;
-        reader.ensure(IO_FILL_LEN).await?;
+    /// Read the next chunk.
+    pub async fn read_chunk(mut self) -> BodyResult<NextChunk<I>> {
+        let () = poll_fn(|cx| Self::poll_read_chunk(&mut self, cx)).await?;
+        self.finish()
+    }
+
+    /// Poll for the next chunk.
+    pub fn poll_read_chunk(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
         loop {
-            match httparse::parse_chunk_size(reader.as_bytes())
-                .map_err(BodyError::InvalidChunkHeader)?
-            {
-                httparse::Status::Partial => {
-                    reader.extend(IO_FILL_LEN).await?;
-                    continue;
-                }
-                httparse::Status::Complete((header_len, chunk_size)) => {
-                    let chunk_header_bytes = reader.split_to(header_len);
-                    if chunk_size == 0 {
-                        // terminal chunk: drain the trailer section
-                        let trailers = loop {
-                            reader.ensure(IO_FILL_LEN).await?;
-                            match parse_slots
-                                .parse_headers(&mut reader)
-                                .map_err(map_trailer_error)?
-                            {
-                                None => {
-                                    reader.extend(IO_FILL_LEN).await?;
-                                }
-                                Some(trailers) => break trailers,
+            match &mut self.state {
+                ChunkHeadReaderState::ReadingSize => {
+                    if let Err(e) = ready!(poll_ensure(cx, &mut self.reader)) {
+                        return Poll::Ready(Err(e));
+                    }
+
+                    match httparse::parse_chunk_size(self.reader.as_bytes())
+                        .map_err(BodyError::InvalidChunkHeader)?
+                    {
+                        httparse::Status::Partial => {
+                            if let Err(e) = ready!(poll_extend(cx, &mut self.reader)) {
+                                return Poll::Ready(Err(e));
                             }
-                        };
-                        return Ok(NextChunk::Final(FinalChunkReader {
-                            reader,
-                            parse_slots,
-                            trailers,
-                            extensions: ChunkExtensions(chunk_header_bytes),
-                        }));
-                    } else {
-                        return Ok(NextChunk::Data(ChunkBodyReader {
-                            reader,
-                            parse_slots,
-                            size: chunk_size,
-                            extensions: ChunkExtensions(chunk_header_bytes),
-                            remaining: chunk_size,
-                            state: ChunkBodyState::InBody,
-                        }));
+                            continue;
+                        }
+                        httparse::Status::Complete((header_len, chunk_size)) => {
+                            let chunk_header_bytes = self.reader.split_to(header_len);
+                            if chunk_size == 0 {
+                                self.state =
+                                    ChunkHeadReaderState::ReadingTrailers { chunk_header_bytes };
+                            } else {
+                                self.state = ChunkHeadReaderState::Ready(PollNextChunk::Data {
+                                    size: chunk_size,
+                                    chunk_header: chunk_header_bytes,
+                                });
+                            }
+                        }
                     }
                 }
+                ChunkHeadReaderState::ReadingTrailers { chunk_header_bytes } => {
+                    // terminal chunk: drain the trailer section
+                    'trailer: loop {
+                        if let Err(e) = ready!(poll_ensure(cx, &mut self.reader)) {
+                            return Poll::Ready(Err(e));
+                        }
+                        match self
+                            .parse_slots
+                            .parse_headers(&mut self.reader)
+                            .map_err(map_trailer_error)?
+                        {
+                            None => {
+                                if let Err(e) = ready!(poll_extend(cx, &mut self.reader)) {
+                                    return Poll::Ready(Err(e));
+                                }
+                            }
+                            Some(trailers) => {
+                                self.state = ChunkHeadReaderState::Ready(PollNextChunk::Final {
+                                    chunk_header: chunk_header_bytes.clone(),
+                                    trailers,
+                                });
+                                break 'trailer;
+                            }
+                        }
+                    }
+                }
+                ChunkHeadReaderState::Ready(_next) => return Poll::Ready(Ok(())),
             }
+        }
+    }
+
+    /// Finish the head reader.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the head reader has not successfully polled
+    /// [`Self::poll_read_chunk`] to completion.
+    pub fn finish(self) -> BodyResult<NextChunk<I>> {
+        let Self {
+            reader,
+            parse_slots,
+            state,
+        } = self;
+
+        match state {
+            ChunkHeadReaderState::ReadingSize => panic!("tried to finish ready while reading size"),
+            ChunkHeadReaderState::ReadingTrailers { .. } => {
+                panic!("tried to finish while reading trailers")
+            }
+            ChunkHeadReaderState::Ready(next) => match next {
+                PollNextChunk::Data { size, chunk_header } => {
+                    Ok(NextChunk::Data(ChunkBodyReader {
+                        reader,
+                        parse_slots,
+                        size,
+                        extensions: ChunkExtensions::new(chunk_header),
+                        remaining: size,
+                        state: ChunkBodyState::InBody,
+                    }))
+                }
+                PollNextChunk::Final {
+                    chunk_header,
+                    trailers,
+                } => Ok(NextChunk::Final(FinalChunkReader {
+                    reader,
+                    parse_slots,
+                    extensions: ChunkExtensions::new(chunk_header),
+                    trailers,
+                })),
+            },
         }
     }
 }
