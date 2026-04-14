@@ -506,7 +506,7 @@ where
         } = self;
 
         match state {
-            ChunkHeadReaderState::ReadingSize => panic!("tried to finish ready while reading size"),
+            ChunkHeadReaderState::ReadingSize => panic!("tried to finish while reading size"),
             ChunkHeadReaderState::ReadingTrailers { .. } => {
                 panic!("tried to finish while reading trailers")
             }
