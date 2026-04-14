@@ -206,66 +206,92 @@ impl<I> ChunkedBodyReader<I> {
 
 impl<I: AsyncRead + Unpin> ChunkedBodyReader<I> {
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
+        poll_fn(|cx| self.poll_read(cx, max_len)).await
+    }
+
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<BodyResult<Option<Bytes>>> {
         loop {
             let Some(current) = self.inner.take() else {
                 // We get left with a None after an error, which does not
                 // replace inner.
-                return Err(BodyError::ReadAfterError);
+                return Poll::Ready(Err(BodyError::ReadAfterError));
             };
 
             match current {
-                ChunkedBodyChunkStream::InChunk(mut in_chunk_reader) => {
-                    // We're in a chunk. Delegate to the current chunk reader.
-                    match in_chunk_reader.read(max_len).await? {
-                        Some(bytes) => {
-                            self.inner = Some(in_chunk_reader.into());
-                            return Ok(Some(bytes));
+                ChunkedBodyChunkStream::InChunk(mut reader) => {
+                    match reader.poll_read(cx, max_len) {
+                        Poll::Pending => {
+                            self.inner = Some(reader.into());
+                            return Poll::Pending;
                         }
-                        None => {
-                            let between_chunk_reader = in_chunk_reader.drain().await?;
-                            self.inner = Some(between_chunk_reader.into());
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Ready(Ok(Some(bytes))) => {
+                            self.inner = Some(reader.into());
+                            return Poll::Ready(Ok(Some(bytes)));
                         }
-                    }
-                }
-                ChunkedBodyChunkStream::BetweenChunk(between_chunk_reader) => {
-                    match between_chunk_reader.read_chunk().await? {
-                        NextChunk::Data(in_chunk_reader) => {
-                            self.inner = Some(in_chunk_reader.into())
-                        }
-                        NextChunk::Final(done_chunk_reader) => {
-                            self.inner = Some(done_chunk_reader.into())
+                        // poll_read returning None means the chunk body and
+                        // footer are fully consumed, so we finish directly
+                        // without going through poll_drain.
+                        Poll::Ready(Ok(None)) => {
+                            self.inner = Some(reader.finish().into());
                         }
                     }
                 }
-                ChunkedBodyChunkStream::Done(done_chunk_reader) => {
-                    self.inner = Some(done_chunk_reader.into());
-                    return Ok(None);
+                ChunkedBodyChunkStream::BetweenChunk(mut reader) => {
+                    match reader.poll_read_chunk(cx) {
+                        Poll::Pending => {
+                            self.inner = Some(reader.into());
+                            return Poll::Pending;
+                        }
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Ready(Ok(())) => match reader.finish() {
+                            Err(e) => return Poll::Ready(Err(e)),
+                            Ok(NextChunk::Data(r)) => self.inner = Some(r.into()),
+                            Ok(NextChunk::Final(r)) => self.inner = Some(r.into()),
+                        },
+                    }
+                }
+                ChunkedBodyChunkStream::Done(reader) => {
+                    self.inner = Some(reader.into());
+                    return Poll::Ready(Ok(None));
                 }
             }
         }
     }
 
-    pub async fn drain(self) -> BodyResult<(BytesReader<I>, ParseSlots, Headers)> {
-        let Self { inner } = self;
-        let Some(mut inner) = inner else {
-            return Err(BodyError::ReadAfterError);
-        };
+    pub async fn drain(mut self) -> BodyResult<(BytesReader<I>, ParseSlots, Headers)> {
+        poll_fn(|cx| self.poll_drain(cx)).await?;
+        Ok(self.finish())
+    }
 
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
         loop {
-            inner = match inner {
-                ChunkedBodyChunkStream::InChunk(in_chunk_reader) => {
-                    in_chunk_reader.drain().await?.into()
-                }
-                ChunkedBodyChunkStream::BetweenChunk(between_chunk_reader) => {
-                    match between_chunk_reader.read_chunk().await? {
-                        NextChunk::Data(in_chunk_reader) => in_chunk_reader.into(),
-                        NextChunk::Final(done_chunk_reader) => done_chunk_reader.into(),
-                    }
-                }
-                ChunkedBodyChunkStream::Done(done_chunk_reader) => {
-                    return Ok(done_chunk_reader.into_parts());
-                }
+            match ready!(self.poll_read(cx, DRAIN_SIZE)) {
+                Err(e) => return Poll::Ready(Err(e)),
+                Ok(None) => return Poll::Ready(Ok(())),
+                Ok(Some(_)) => continue,
             }
+        }
+    }
+
+    /// Finish the chunked body reader and return the inner parts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained or if an error occurred
+    /// while reading or draining.
+    pub fn finish(self) -> (BytesReader<I>, ParseSlots, Headers) {
+        let Self { inner } = self;
+        match inner {
+            Some(ChunkedBodyChunkStream::Done(done_chunk_reader)) => done_chunk_reader.into_parts(),
+            Some(_) => {
+                panic!("attempted to finish the chunked body reader before it was fully drained")
+            }
+            None => panic!("attempted to finish the chunked body reader after an error"),
         }
     }
 }
@@ -376,6 +402,11 @@ impl<I: AsyncRead + Unpin> ChunkDataReader<I> {
         }
     }
 
+    pub async fn drain(mut self) -> BodyResult<ChunkHeadReader<I>> {
+        poll_fn(|cx| Self::poll_drain(&mut self, cx)).await?;
+        Ok(self.finish())
+    }
+
     pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
         loop {
             match ready!(self.poll_read(cx, DRAIN_SIZE)) {
@@ -384,11 +415,6 @@ impl<I: AsyncRead + Unpin> ChunkDataReader<I> {
                 Ok(Some(_)) => continue,
             }
         }
-    }
-
-    pub async fn drain(mut self) -> BodyResult<ChunkHeadReader<I>> {
-        poll_fn(|cx| Self::poll_drain(&mut self, cx)).await?;
-        Ok(self.finish())
     }
 
     /// Finish the body chunk body reader returning a head reader.
