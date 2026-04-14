@@ -463,7 +463,7 @@ where
                 }
                 ChunkHeadReaderState::ReadingTrailers { chunk_header_bytes } => {
                     // terminal chunk: drain the trailer section
-                    'trailer: loop {
+                    loop {
                         if let Err(e) = ready!(poll_ensure(cx, &mut self.reader)) {
                             return Poll::Ready(Err(e));
                         }
@@ -479,10 +479,10 @@ where
                             }
                             Some(trailers) => {
                                 self.state = ChunkHeadReaderState::Ready(PollNextChunk::Final {
-                                    chunk_header: chunk_header_bytes.clone(),
+                                    chunk_header: std::mem::take(chunk_header_bytes),
                                     trailers,
                                 });
-                                break 'trailer;
+                                return Poll::Ready(Ok(()));
                             }
                         }
                     }
