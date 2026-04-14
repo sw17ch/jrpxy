@@ -168,13 +168,13 @@ pub struct ChunkedBodyReader<I> {
 
 #[derive(Debug)]
 enum ChunkedBodyChunkStream<I> {
-    InChunk(ChunkBodyReader<I>),
+    InChunk(ChunkDataReader<I>),
     BetweenChunk(ChunkHeadReader<I>),
     Done(FinalChunkReader<I>),
 }
 
-impl<I> From<ChunkBodyReader<I>> for ChunkedBodyChunkStream<I> {
-    fn from(value: ChunkBodyReader<I>) -> Self {
+impl<I> From<ChunkDataReader<I>> for ChunkedBodyChunkStream<I> {
+    fn from(value: ChunkDataReader<I>) -> Self {
         Self::InChunk(value)
     }
 }
@@ -280,7 +280,7 @@ enum ChunkBodyState {
 
 /// Positioned within a single chunk. Holds the chunk's declared size and any
 /// extensions. Owns the IO for the duration of reading this chunk.
-pub struct ChunkBodyReader<I> {
+pub struct ChunkDataReader<I> {
     reader: BytesReader<I>,
     parse_slots: ParseSlots,
     size: u64,
@@ -289,7 +289,7 @@ pub struct ChunkBodyReader<I> {
     state: ChunkBodyState,
 }
 
-impl<I> std::fmt::Debug for ChunkBodyReader<I> {
+impl<I> std::fmt::Debug for ChunkDataReader<I> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ChunkReader")
             .field("size", &self.size)
@@ -299,7 +299,7 @@ impl<I> std::fmt::Debug for ChunkBodyReader<I> {
     }
 }
 
-impl<I> ChunkBodyReader<I> {
+impl<I> ChunkDataReader<I> {
     /// The declared byte length of this chunk.
     pub fn size(&self) -> u64 {
         self.size
@@ -311,7 +311,7 @@ impl<I> ChunkBodyReader<I> {
     }
 }
 
-impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
+impl<I: AsyncRead + Unpin> ChunkDataReader<I> {
     /// Read up to `max_len` bytes from this chunk's body. Returns `None` when
     /// the chunk is fully drained and the chunk footer (`\r\n`) has been
     /// consumed.
@@ -414,7 +414,7 @@ impl<I: AsyncRead + Unpin> ChunkBodyReader<I> {
 }
 
 pub enum NextChunk<I> {
-    Data(ChunkBodyReader<I>),
+    Data(ChunkDataReader<I>),
     Final(FinalChunkReader<I>),
 }
 
@@ -547,7 +547,7 @@ where
             }
             ChunkHeadReaderState::Ready(next) => match next {
                 PollNextChunk::Data { size, chunk_header } => {
-                    Ok(NextChunk::Data(ChunkBodyReader {
+                    Ok(NextChunk::Data(ChunkDataReader {
                         reader,
                         parse_slots,
                         size,
