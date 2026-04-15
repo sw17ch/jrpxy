@@ -214,21 +214,51 @@ pub struct ChunkDataWriter<I> {
     length: u64,
     /// the amount of the chunk already written
     offset: u64,
+    /// the number of footer characters written; a footer is \r\n, so once this
+    /// is 2, the footer is fully written
+    footer_written: u8,
+    /// the writer into which data will be placed
     writer: I,
 }
+
+const CHUNK_FOOTER: &[u8] = b"\r\n";
 
 impl<I> ChunkDataWriter<I> {
     fn new(length: u64, writer: I) -> Self {
         Self {
             length,
             offset: 0,
+            footer_written: 0,
             writer,
+        }
+    }
+
+    /// Finish the chunk writer and return a [`ChunkedBodyWriter`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chunk data has not been fully written or if the chunk
+    /// footer has not been written via [`Self::poll_complete`].
+    pub fn finish(self) -> ChunkedBodyWriter<I> {
+        assert_eq!(
+            self.offset, self.length,
+            "attempted to finish chunk writer before chunk data was fully written"
+        );
+        assert_eq!(
+            CHUNK_FOOTER.len(),
+            self.footer_written as usize,
+            "attempted to finish chunk writer before chunk footer was written"
+        );
+        ChunkedBodyWriter {
+            writer: self.writer,
         }
     }
 }
 
 impl<I: AsyncWrite + Unpin> ChunkDataWriter<I> {
-    pub async fn write(&mut self, mut buffer: &[u8]) -> BodyResult<()> {
+    /// Write the entire buffer and the chunk footer, returning a
+    /// [`ChunkedBodyWriter`] on success.
+    pub async fn write(mut self, mut buffer: &[u8]) -> BodyResult<ChunkedBodyWriter<I>> {
         while !buffer.is_empty() {
             let written = poll_fn(|cx| self.poll_write(cx, buffer)).await?;
             if written == 0 {
@@ -238,11 +268,35 @@ impl<I: AsyncWrite + Unpin> ChunkDataWriter<I> {
             }
             buffer = &buffer[written..];
         }
-        Ok(())
+        poll_fn(|cx| self.poll_complete(cx)).await?;
+        Ok(self.finish())
     }
 
     pub fn poll_write(&mut self, cx: &mut Context<'_>, buffer: &[u8]) -> Poll<BodyResult<usize>> {
         poll_write_bounded(cx, &mut self.writer, self.length, &mut self.offset, buffer)
+    }
+
+    pub fn poll_complete(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        while self.footer_written < CHUNK_FOOTER.len() as u8 {
+            let buf = &CHUNK_FOOTER[self.footer_written as usize..];
+            match ready!(Pin::new(&mut self.writer).poll_write(cx, buf)) {
+                Ok(0) => {
+                    return Poll::Ready(Err(BodyError::BodyWriteError(
+                        std::io::ErrorKind::WriteZero.into(),
+                    )));
+                }
+                Ok(w) => {
+                    self.footer_written += w as u8;
+                    debug_assert!(
+                        self.footer_written <= CHUNK_FOOTER.len() as u8,
+                        "BUG: wrote more than 2 bytes of footer"
+                    );
+                }
+                Err(e) => return Poll::Ready(Err(BodyError::BodyWriteError(e))),
+            }
+        }
+
+        Poll::Ready(Ok(()))
     }
 }
 
