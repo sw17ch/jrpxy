@@ -28,6 +28,8 @@ pub enum BodyError {
     InvalidChunkFooter(u8, u8),
     #[error("Attempted to read after previous failure")]
     ReadAfterError,
+    #[error("Attempted to write after previous failure")]
+    WriteAfterError,
 }
 
 impl From<ReaderBufferError> for BodyError {

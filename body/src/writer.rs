@@ -118,22 +118,6 @@ impl<I> ChunkedBodyWriter<I> {
     }
 }
 
-impl<I> ChunkedBodyWriter<I> {
-    /// Begin writing a chunk of `chunk_length` bytes, returning a
-    /// [`ChunkHeadWriter`] that will emit the chunk header before handing off
-    /// to a [`ChunkDataWriter`].
-    pub fn start_chunk(self, chunk_length: u64) -> ChunkHeadWriter<I> {
-        ChunkHeadWriter::new(chunk_length, self.writer)
-    }
-
-    /// Begin writing the terminal chunk and trailers, returning a
-    /// [`FinalChunkWriter`] that will emit the closing chunk when polled to
-    /// completion.
-    pub fn final_chunk(self, trailers: &Headers) -> FinalChunkWriter<I> {
-        FinalChunkWriter::new(trailers, self.writer)
-    }
-}
-
 impl<I: AsyncWrite + Unpin> ChunkedBodyWriter<I> {
     // TODO: add a flush method so that we can force out writes
 
@@ -148,13 +132,17 @@ impl<I: AsyncWrite + Unpin> ChunkedBodyWriter<I> {
         // own the writer. The borrow ends when the returned ChunkedBodyWriter
         // is dropped at the end of the chain.
         ChunkHeadWriter::new(buffer.len() as u64, &mut self.writer)
-            .write().await?
-            .write(buffer).await?;
+            .write()
+            .await?
+            .write(buffer)
+            .await?;
         Ok(())
     }
 
     pub async fn finish_with_trailers(self, trailers: &Headers) -> BodyResult<I> {
-        self.final_chunk(trailers).write().await
+        let Self { writer } = self;
+        let writer = FinalChunkWriter::new(trailers, writer).write().await?;
+        Ok(writer)
     }
 
     pub async fn finish(self) -> BodyResult<I> {
@@ -175,6 +163,163 @@ impl<I: AsyncWrite + Unpin> ChunkedBodyWriter<I> {
             .map_err(BodyError::BodyWriteError)?;
         writer.flush().await.map_err(BodyError::BodyWriteError)?;
         Ok(writer)
+    }
+}
+
+pub struct ManuallyChunkedBodyWriter<'b, I> {
+    buffer: &'b [u8],
+    mode: Option<BodyWriterMode<I>>,
+}
+
+impl<'b, I> ManuallyChunkedBodyWriter<'b, I> {
+    pub fn finish(mut self, trailers: &Headers) -> ManuallyChunkedBodyFinalizer<I> {
+        let Some(mode) = self.mode.take() else {
+            panic!("attempted to finish after error");
+        };
+        let BodyWriterMode::Idle(writer) = mode else {
+            panic!("attempted to finish without polling poll_write to completion");
+        };
+        let IdleChunkWriter { writer } = writer;
+
+        ManuallyChunkedBodyFinalizer {
+            mode: Some(BodyFinalizerMode::Final(FinalChunkWriter::new(
+                trailers, writer,
+            ))),
+        }
+    }
+}
+
+impl<'b, I> ManuallyChunkedBodyWriter<'b, I>
+where
+    I: AsyncWrite + Unpin,
+{
+    pub fn new(writer: I, buffer: &'b [u8]) -> Self {
+        Self {
+            buffer,
+            mode: Some(BodyWriterMode::Idle(IdleChunkWriter { writer })),
+        }
+    }
+
+    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        loop {
+            let Some(mode) = self.mode.take() else {
+                return Poll::Ready(Err(BodyError::WriteAfterError));
+            };
+            match mode {
+                BodyWriterMode::Idle(w) => {
+                    self.mode = Some(BodyWriterMode::Head(w.start(self.buffer.len())));
+                }
+                BodyWriterMode::Head(mut w) => match w.poll_write(cx) {
+                    Poll::Pending => {
+                        self.mode = Some(BodyWriterMode::Head(w));
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        self.mode = Some(BodyWriterMode::Data(w.finish()));
+                    }
+                },
+                BodyWriterMode::Data(mut w) => {
+                    if !self.buffer.is_empty() {
+                        match w.poll_write(cx, self.buffer) {
+                            Poll::Pending => {
+                                self.mode = Some(BodyWriterMode::Data(w));
+                                return Poll::Pending;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Ready(Ok(len)) => {
+                                let rest = &self.buffer[len..];
+                                self.buffer = rest;
+                                self.mode = Some(BodyWriterMode::Data(w));
+                            }
+                        }
+                    } else {
+                        match w.poll_complete(cx) {
+                            Poll::Pending => {
+                                self.mode = Some(BodyWriterMode::Data(w));
+                                return Poll::Pending;
+                            }
+                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                            Poll::Ready(Ok(())) => {
+                                self.mode = Some(BodyWriterMode::Idle(w.finish()));
+                                return Poll::Ready(Ok(()));
+                            }
+                        }
+                    }
+                }
+            }
+            debug_assert!(self.mode.is_some(), "failed to repalce mode");
+        }
+    }
+}
+
+pub struct ManuallyChunkedBodyFinalizer<I> {
+    mode: Option<BodyFinalizerMode<I>>,
+}
+
+impl<I> ManuallyChunkedBodyFinalizer<I> {
+    pub fn finish(mut self) -> I {
+        let Some(mode) = self.mode.take() else {
+            panic!("attempted to finish after an error");
+        };
+        let BodyFinalizerMode::Done(w) = mode else {
+            panic!("attempted to finish without polling poll_final to completion");
+        };
+        w
+    }
+}
+
+impl<I> ManuallyChunkedBodyFinalizer<I>
+where
+    I: AsyncWrite + Unpin,
+{
+    pub fn poll_final(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        loop {
+            let Some(mode) = self.mode.take() else {
+                return Poll::Ready(Err(BodyError::WriteAfterError));
+            };
+            match mode {
+                BodyFinalizerMode::Final(mut w) => match w.poll_write(cx) {
+                    Poll::Pending => {
+                        self.mode = Some(BodyFinalizerMode::Final(w));
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        self.mode = Some(BodyFinalizerMode::Done(w.finish()));
+                    }
+                },
+                BodyFinalizerMode::Done(w) => {
+                    self.mode = Some(BodyFinalizerMode::Done(w));
+                    return Poll::Ready(Ok(()));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+enum BodyWriterMode<I> {
+    Idle(IdleChunkWriter<I>),
+    Head(ChunkHeadWriter<I>),
+    Data(ChunkDataWriter<I>),
+}
+
+#[derive(Debug)]
+enum BodyFinalizerMode<I> {
+    Final(FinalChunkWriter<I>),
+    Done(I),
+}
+
+#[derive(Debug)]
+pub struct IdleChunkWriter<I> {
+    writer: I,
+}
+
+impl<I> IdleChunkWriter<I> {
+    pub fn start(self, chunk_length: usize) -> ChunkHeadWriter<I> {
+        let Self { writer } = self;
+        ChunkHeadWriter::new(chunk_length as u64, writer)
     }
 }
 
@@ -291,7 +436,7 @@ impl<I> ChunkDataWriter<I> {
     ///
     /// Panics if the chunk data has not been fully written or if the chunk
     /// footer has not been written via [`Self::poll_complete`].
-    pub fn finish(self) -> ChunkedBodyWriter<I> {
+    pub fn finish(self) -> IdleChunkWriter<I> {
         assert_eq!(
             self.offset, self.length,
             "attempted to finish chunk writer before chunk data was fully written"
@@ -301,7 +446,7 @@ impl<I> ChunkDataWriter<I> {
             self.footer_written as usize,
             "attempted to finish chunk writer before chunk footer was written"
         );
-        ChunkedBodyWriter {
+        IdleChunkWriter {
             writer: self.writer,
         }
     }
@@ -321,7 +466,8 @@ impl<I: AsyncWrite + Unpin> ChunkDataWriter<I> {
             buffer = &buffer[written..];
         }
         poll_fn(|cx| self.poll_complete(cx)).await?;
-        Ok(self.finish())
+        let IdleChunkWriter { writer } = self.finish();
+        Ok(ChunkedBodyWriter { writer })
     }
 
     pub fn poll_write(&mut self, cx: &mut Context<'_>, buffer: &[u8]) -> Poll<BodyResult<usize>> {
