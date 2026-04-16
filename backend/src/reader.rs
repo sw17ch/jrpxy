@@ -281,6 +281,18 @@ impl<I> BackendContentLengthBodyReader<I> {
     pub fn content_length(&self) -> u64 {
         self.inner.content_length()
     }
+
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
+    pub fn finish(self) -> BackendReader<I> {
+        let Self { inner } = self;
+        let (reader, parse_slots) = inner.finish();
+        BackendReader {
+            reader,
+            parse_slots,
+        }
+    }
 }
 
 impl<I: AsyncRead + Unpin> BackendContentLengthBodyReader<I> {
@@ -304,18 +316,6 @@ impl<I: AsyncRead + Unpin> BackendContentLengthBodyReader<I> {
     pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
         Poll::Ready(ready!(self.inner.poll_drain(cx)).map_err(BackendError::BodyReadError))
     }
-
-    /// # Panics
-    ///
-    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
-    pub fn finish(self) -> BackendReader<I> {
-        let Self { inner } = self;
-        let (reader, parse_slots) = inner.finish();
-        BackendReader {
-            reader,
-            parse_slots,
-        }
-    }
 }
 
 /// Backend wrapper for [`ChunkedBodyReader`]. Draining it returns both a
@@ -327,6 +327,21 @@ pub struct BackendChunkedBodyReader<I> {
 impl<I> BackendChunkedBodyReader<I> {
     pub fn drained(&self) -> bool {
         self.inner.drained()
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
+    pub fn finish(self) -> (BackendReader<I>, Headers) {
+        let Self { inner } = self;
+        let (reader, parse_slots, trailers) = inner.finish();
+        (
+            BackendReader {
+                reader,
+                parse_slots,
+            },
+            trailers,
+        )
     }
 }
 
@@ -351,21 +366,6 @@ impl<I: AsyncRead + Unpin> BackendChunkedBodyReader<I> {
     pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
         Poll::Ready(ready!(self.inner.poll_drain(cx)).map_err(BackendError::BodyReadError))
     }
-
-    /// # Panics
-    ///
-    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
-    pub fn finish(self) -> (BackendReader<I>, Headers) {
-        let Self { inner } = self;
-        let (reader, parse_slots, trailers) = inner.finish();
-        (
-            BackendReader {
-                reader,
-                parse_slots,
-            },
-            trailers,
-        )
-    }
 }
 
 /// Body reader for close-delimited response bodies.
@@ -374,16 +374,16 @@ pub struct BackendEofBodyReader<I> {
 }
 
 impl<I: AsyncRead + Unpin> BackendEofBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
+        poll_fn(|cx| self.poll_read(cx, max_len)).await
+    }
+
     pub fn poll_read(
         &mut self,
         cx: &mut Context<'_>,
         max_len: usize,
     ) -> Poll<BackendResult<Option<Bytes>>> {
         Poll::Ready(ready!(self.inner.poll_read(cx, max_len)).map_err(BackendError::BodyReadError))
-    }
-
-    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
-        poll_fn(|cx| self.poll_read(cx, max_len)).await
     }
 
     pub fn drain(self) -> ParseSlots {
@@ -401,16 +401,7 @@ pub enum BackendBodyReader<I> {
     Eof(BackendEofBodyReader<I>),
 }
 
-impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
-    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
-        match self {
-            BackendBodyReader::Bodyless(_) => Ok(None),
-            BackendBodyReader::CL(r) => r.read(max_len).await,
-            BackendBodyReader::TE(r) => r.read(max_len).await,
-            BackendBodyReader::Eof(r) => r.read(max_len).await,
-        }
-    }
-
+impl<I> BackendBodyReader<I> {
     pub fn drained(&self) -> bool {
         match self {
             BackendBodyReader::Bodyless(_) => true,
@@ -420,22 +411,63 @@ impl<I: AsyncReadExt + Unpin> BackendBodyReader<I> {
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained via [`Self::poll_drain`]
+    /// and the body framing is content-length or chunked transfer-encoding.
+    pub fn finish(self) -> Option<BackendReader<I>> {
+        match self {
+            BackendBodyReader::Bodyless(r) => {
+                let (reader, parse_slots) = r.inner.drain();
+                Some(BackendReader {
+                    reader,
+                    parse_slots,
+                })
+            }
+
+            BackendBodyReader::CL(r) => Some(r.finish()),
+            BackendBodyReader::TE(r) => {
+                let (reader, _trailers) = r.finish();
+                Some(reader)
+            }
+            BackendBodyReader::Eof(_) => None,
+        }
+    }
+}
+
+impl<I: AsyncRead + Unpin> BackendBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
+        poll_fn(|cx| self.poll_read(cx, max_len)).await
+    }
+
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<BackendResult<Option<Bytes>>> {
+        match self {
+            BackendBodyReader::Bodyless(_) => Poll::Ready(Ok(None)),
+            BackendBodyReader::CL(r) => r.poll_read(cx, max_len),
+            BackendBodyReader::TE(r) => r.poll_read(cx, max_len),
+            BackendBodyReader::Eof(r) => r.poll_read(cx, max_len),
+        }
+    }
+
     /// Drain the body and return the next [`BackendReader`], discarding
     /// any trailers.
-    pub async fn drain(self) -> BackendResult<Option<BackendReader<I>>> {
+    pub async fn drain(mut self) -> BackendResult<Option<BackendReader<I>>> {
+        poll_fn(|cx| self.poll_drain(cx)).await?;
+        Ok(self.finish())
+    }
+
+    /// Drain the body, discarding any trailers. For EOF-framed bodies the
+    /// connection cannot be reused, so [`Self::finish`] returns `None`.
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
         match self {
-            BackendBodyReader::Bodyless(r) => r.drain().map(Some),
-            BackendBodyReader::CL(r) => r.drain().await.map(Some),
-            BackendBodyReader::TE(r) => {
-                let (reader, _trailers) = r.drain().await?;
-                Ok(Some(reader))
-            }
-            BackendBodyReader::Eof(r) => {
-                // TODO: we could probably figure out a way to reuse these
-                // instead of dropping them.
-                let _parse_slots = r.drain();
-                Ok(None)
-            }
+            BackendBodyReader::Bodyless(_) => Poll::Ready(Ok(())),
+            BackendBodyReader::CL(r) => r.poll_drain(cx),
+            BackendBodyReader::TE(r) => r.poll_drain(cx),
+            BackendBodyReader::Eof(_) => Poll::Ready(Ok(())),
         }
     }
 }
