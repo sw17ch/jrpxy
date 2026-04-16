@@ -245,8 +245,6 @@ const MAX_CHUNK_HEAD_LEN: usize = 18;
 /// [`DataWriter`] for the chunk body.
 #[derive(Debug)]
 pub struct HeadWriter<I> {
-    // TODO: avoid the heap allocation from format! by implementing a
-    // no-alloc hex formatter.
     /// Pre-formatted header bytes, e.g. `"1a\r\n"`.
     header: [u8; MAX_CHUNK_HEAD_LEN],
     /// Number of valid bytes in `header`.
