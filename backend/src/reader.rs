@@ -330,25 +330,41 @@ impl<I> BackendChunkedBodyReader<I> {
     }
 }
 
-impl<I: AsyncReadExt + Unpin> BackendChunkedBodyReader<I> {
+impl<I: AsyncRead + Unpin> BackendChunkedBodyReader<I> {
     pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
-        self.inner
-            .read(max_len)
-            .await
-            .map_err(BackendError::BodyReadError)
+        poll_fn(|cx| self.poll_read(cx, max_len)).await
     }
 
-    pub async fn drain(self) -> BackendResult<(BackendReader<I>, Headers)> {
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<BackendResult<Option<Bytes>>> {
+        Poll::Ready(ready!(self.inner.poll_read(cx, max_len)).map_err(BackendError::BodyReadError))
+    }
+
+    pub async fn drain(mut self) -> BackendResult<(BackendReader<I>, Headers)> {
+        poll_fn(|cx| self.poll_drain(cx)).await?;
+        Ok(self.finish())
+    }
+
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
+        Poll::Ready(ready!(self.inner.poll_drain(cx)).map_err(BackendError::BodyReadError))
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
+    pub fn finish(self) -> (BackendReader<I>, Headers) {
         let Self { inner } = self;
-        let (reader, parse_slots, trailers) =
-            inner.drain().await.map_err(BackendError::BodyReadError)?;
-        Ok((
+        let (reader, parse_slots, trailers) = inner.finish();
+        (
             BackendReader {
                 reader,
                 parse_slots,
             },
             trailers,
-        ))
+        )
     }
 }
 
@@ -357,12 +373,17 @@ pub struct BackendEofBodyReader<I> {
     inner: EofBodyReader<I>,
 }
 
-impl<I: AsyncReadExt + Unpin> BackendEofBodyReader<I> {
+impl<I: AsyncRead + Unpin> BackendEofBodyReader<I> {
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<BackendResult<Option<Bytes>>> {
+        Poll::Ready(ready!(self.inner.poll_read(cx, max_len)).map_err(BackendError::BodyReadError))
+    }
+
     pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
-        self.inner
-            .read(max_len)
-            .await
-            .map_err(BackendError::BodyReadError)
+        poll_fn(|cx| self.poll_read(cx, max_len)).await
     }
 
     pub fn drain(self) -> ParseSlots {
