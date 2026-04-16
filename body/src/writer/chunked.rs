@@ -226,7 +226,7 @@ pub struct IdleWriter<I> {
 }
 
 impl<I> IdleWriter<I> {
-    fn start(self, chunk_length: u64) -> HeadWriter<I> {
+    pub fn start(self, chunk_length: u64) -> HeadWriter<I> {
         let Self { writer } = self;
         HeadWriter::new(chunk_length, writer)
     }
