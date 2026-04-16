@@ -127,22 +127,14 @@ impl<I: AsyncWrite + Unpin> ChunkedBodyWriter<I> {
             // attempting to write a zero-length chunk will break framing.
             return Ok(());
         }
-        // Pass &mut self.writer as the I parameter — &mut I: AsyncWrite + Unpin
-        // for any I: AsyncWrite + Unpin, so the sub-writers borrow rather than
-        // own the writer. The borrow ends when the returned ChunkedBodyWriter
-        // is dropped at the end of the chain.
-        ChunkHeadWriter::new(buffer.len() as u64, &mut self.writer)
-            .write()
-            .await?
-            .write(buffer)
-            .await?;
-        Ok(())
+        let mut w = ManuallyChunkedBodyWriter::new(&mut self.writer, buffer);
+        poll_fn(|cx| w.poll_write(cx)).await
     }
 
     pub async fn finish_with_trailers(self, trailers: &Headers) -> BodyResult<I> {
-        let Self { writer } = self;
-        let writer = FinalChunkWriter::new(trailers, writer).write().await?;
-        Ok(writer)
+        let mut f = ManuallyChunkedBodyFinalizer::new(trailers, self.writer);
+        poll_fn(|cx| f.poll_final(cx)).await?;
+        Ok(f.finish())
     }
 
     pub async fn finish(self) -> BodyResult<I> {
@@ -207,7 +199,15 @@ where
             };
             match mode {
                 BodyWriterMode::Idle(w) => {
-                    self.mode = Some(BodyWriterMode::Head(w.start(self.buffer.len())));
+                    if self.buffer.is_empty() {
+                        // if the buffer we were given is empty, don't try to
+                        // write it out. the user will have to call finish to
+                        // close out the body.
+                        self.mode = Some(BodyWriterMode::Idle(w));
+                        return Poll::Ready(Ok(()));
+                    } else {
+                        self.mode = Some(BodyWriterMode::Head(w.start(self.buffer.len() as u64)));
+                    }
                 }
                 BodyWriterMode::Head(mut w) => match w.poll_write(cx) {
                     Poll::Pending => {
@@ -248,7 +248,7 @@ where
                     }
                 }
             }
-            debug_assert!(self.mode.is_some(), "failed to repalce mode");
+            debug_assert!(self.mode.is_some(), "failed to replace mode");
         }
     }
 }
@@ -258,6 +258,14 @@ pub struct ManuallyChunkedBodyFinalizer<I> {
 }
 
 impl<I> ManuallyChunkedBodyFinalizer<I> {
+    fn new(trailers: &Headers, writer: I) -> Self {
+        Self {
+            mode: Some(BodyFinalizerMode::Final(FinalChunkWriter::new(
+                trailers, writer,
+            ))),
+        }
+    }
+
     pub fn finish(mut self) -> I {
         let Some(mode) = self.mode.take() else {
             panic!("attempted to finish after an error");
@@ -317,9 +325,9 @@ pub struct IdleChunkWriter<I> {
 }
 
 impl<I> IdleChunkWriter<I> {
-    pub fn start(self, chunk_length: usize) -> ChunkHeadWriter<I> {
+    pub fn start(self, chunk_length: u64) -> ChunkHeadWriter<I> {
         let Self { writer } = self;
-        ChunkHeadWriter::new(chunk_length as u64, writer)
+        ChunkHeadWriter::new(chunk_length, writer)
     }
 }
 
