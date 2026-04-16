@@ -1,3 +1,6 @@
+use std::future::poll_fn;
+use std::task::{Context, Poll, ready};
+
 use bytes::Bytes;
 use jrpxy_body::reader::{
     BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader, EofBodyReader,
@@ -8,7 +11,7 @@ use jrpxy_http_message::{
     message::{ParseSlots, Response},
 };
 use jrpxy_util::io_buffer::BytesReader;
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::{BackendError, BackendResult};
 
@@ -280,21 +283,38 @@ impl<I> BackendContentLengthBodyReader<I> {
     }
 }
 
-impl<I: AsyncReadExt + Unpin> BackendContentLengthBodyReader<I> {
+impl<I: AsyncRead + Unpin> BackendContentLengthBodyReader<I> {
     pub async fn read(&mut self, max_len: usize) -> BackendResult<Option<Bytes>> {
-        self.inner
-            .read(max_len)
-            .await
-            .map_err(BackendError::BodyReadError)
+        poll_fn(|cx| self.poll_read(cx, max_len)).await
     }
 
-    pub async fn drain(self) -> BackendResult<BackendReader<I>> {
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<BackendResult<Option<Bytes>>> {
+        Poll::Ready(ready!(self.inner.poll_read(cx, max_len)).map_err(BackendError::BodyReadError))
+    }
+
+    pub async fn drain(mut self) -> BackendResult<BackendReader<I>> {
+        poll_fn(|cx| self.poll_drain(cx)).await?;
+        Ok(self.finish())
+    }
+
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
+        Poll::Ready(ready!(self.inner.poll_drain(cx)).map_err(BackendError::BodyReadError))
+    }
+
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
+    pub fn finish(self) -> BackendReader<I> {
         let Self { inner } = self;
-        let (reader, parse_slots) = inner.drain().await.map_err(BackendError::BodyReadError)?;
-        Ok(BackendReader {
+        let (reader, parse_slots) = inner.finish();
+        BackendReader {
             reader,
             parse_slots,
-        })
+        }
     }
 }
 

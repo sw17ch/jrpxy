@@ -97,6 +97,9 @@ where
         }
     }
 
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
     pub fn finish(self) -> (BytesReader<I>, ParseSlots) {
         let Self {
             length,
