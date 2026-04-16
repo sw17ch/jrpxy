@@ -80,12 +80,9 @@ impl<'b, I> ChunkWriter<'b, I> {
         let ChunkWriterMode::Idle(writer) = mode else {
             panic!("attempted to finish without polling poll_write to completion");
         };
-        let IdleWriter { writer } = writer;
-
+        let final_writer = writer.into_final(trailers);
         TrailerWriter {
-            mode: Some(FinalChunkWriterMode::Final(FinalWriter::new(
-                trailers, writer,
-            ))),
+            mode: Some(FinalChunkWriterMode::Final(final_writer)),
         }
     }
 }
@@ -232,6 +229,11 @@ impl<I> IdleWriter<I> {
     fn start(self, chunk_length: u64) -> HeadWriter<I> {
         let Self { writer } = self;
         HeadWriter::new(chunk_length, writer)
+    }
+
+    pub fn into_final(self, trailers: &Headers) -> FinalWriter<I> {
+        let Self { writer } = self;
+        FinalWriter::new(trailers, writer)
     }
 }
 
