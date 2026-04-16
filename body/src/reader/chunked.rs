@@ -79,6 +79,23 @@ impl<I> ChunkedBodyReader<I> {
     pub fn drained(&self) -> bool {
         matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
     }
+
+    /// Finish the chunked body reader and return the inner parts.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained or if an error occurred
+    /// while reading or draining.
+    pub fn finish(self) -> (BytesReader<I>, ParseSlots, Headers) {
+        let Self { inner } = self;
+        match inner {
+            Some(ChunkedBodyChunkStream::Done(done_chunk_reader)) => done_chunk_reader.into_parts(),
+            Some(_) => {
+                panic!("attempted to finish the chunked body reader before it was fully drained")
+            }
+            None => panic!("attempted to finish the chunked body reader after an error"),
+        }
+    }
 }
 
 impl<I: AsyncRead + Unpin> ChunkedBodyReader<I> {
@@ -151,23 +168,6 @@ impl<I: AsyncRead + Unpin> ChunkedBodyReader<I> {
                 Ok(None) => return Poll::Ready(Ok(())),
                 Ok(Some(_)) => continue,
             }
-        }
-    }
-
-    /// Finish the chunked body reader and return the inner parts.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the reader has not been fully drained or if an error occurred
-    /// while reading or draining.
-    pub fn finish(self) -> (BytesReader<I>, ParseSlots, Headers) {
-        let Self { inner } = self;
-        match inner {
-            Some(ChunkedBodyChunkStream::Done(done_chunk_reader)) => done_chunk_reader.into_parts(),
-            Some(_) => {
-                panic!("attempted to finish the chunked body reader before it was fully drained")
-            }
-            None => panic!("attempted to finish the chunked body reader after an error"),
         }
     }
 }

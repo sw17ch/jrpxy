@@ -45,6 +45,23 @@ impl<I> ContentLengthBodyReader<I> {
         debug_assert!(self.offset <= self.length);
         self.length - self.offset
     }
+
+    /// # Panics
+    ///
+    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
+    pub fn finish(self) -> (BytesReader<I>, ParseSlots) {
+        let Self {
+            length,
+            offset,
+            reader,
+            parse_slots,
+        } = self;
+        assert_eq!(
+            offset, length,
+            "attempted to finish content length body reader before fully drained"
+        );
+        (reader, parse_slots)
+    }
 }
 
 impl<I> ContentLengthBodyReader<I>
@@ -95,22 +112,5 @@ where
                 Ok(Some(_)) => continue,
             }
         }
-    }
-
-    /// # Panics
-    ///
-    /// Panics if the reader has not been fully drained via [`Self::poll_drain`].
-    pub fn finish(self) -> (BytesReader<I>, ParseSlots) {
-        let Self {
-            length,
-            offset,
-            reader,
-            parse_slots,
-        } = self;
-        assert_eq!(
-            offset, length,
-            "attempted to finish content length body reader before fully drained"
-        );
-        (reader, parse_slots)
     }
 }

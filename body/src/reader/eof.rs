@@ -29,6 +29,26 @@ impl<I> EofBodyReader<I> {
     }
 }
 
+impl<I> EofBodyReader<I> {
+    pub fn drained(&self) -> bool {
+        self.eof
+    }
+
+    /// There isn't any reason to drain an EOF reader because draining discards
+    /// the body, and we only find the end of the body when the remote end
+    /// closes the connection. For this reason, draining discards the
+    /// connection, and returns the internal [`ParseSlots`] so they can be
+    /// reused.
+    pub fn drain(self) -> ParseSlots {
+        let Self {
+            reader: _,
+            parse_slots,
+            eof: _,
+        } = self;
+        parse_slots
+    }
+}
+
 impl<I: AsyncRead + Unpin> EofBodyReader<I> {
     pub async fn read(&mut self, max_len: usize) -> BodyResult<Option<Bytes>> {
         poll_fn(|cx| self.poll_read(cx, max_len)).await
@@ -59,23 +79,5 @@ impl<I: AsyncRead + Unpin> EofBodyReader<I> {
         }
         let at = self.reader.len().min(max_len);
         Poll::Ready(Ok(Some(self.reader.split_to(at))))
-    }
-
-    pub fn drained(&self) -> bool {
-        self.eof
-    }
-
-    /// There isn't any reason to drain an EOF reader because draining discards
-    /// the body, and we only find the end of the body when the remote end
-    /// closes the connection. For this reason, draining discards the
-    /// connection, and returns the internal [`ParseSlots`] so they can be
-    /// reused.
-    pub fn drain(self) -> ParseSlots {
-        let Self {
-            reader: _,
-            parse_slots,
-            eof: _,
-        } = self;
-        parse_slots
     }
 }
