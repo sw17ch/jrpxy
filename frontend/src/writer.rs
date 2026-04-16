@@ -68,16 +68,17 @@
 //! }
 //! ```
 
-use jrpxy_body::writer::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter};
-use jrpxy_http_message::framing::WriteFraming;
-use jrpxy_http_message::framing::is_framing_header;
-use jrpxy_http_message::header::Headers;
-use jrpxy_http_message::message::Response;
-use tokio::io;
-use tokio::io::AsyncWriteExt;
-
-use crate::error::FrontendError;
-use crate::error::FrontendResult;
+use crate::error::{FrontendError, FrontendResult};
+use jrpxy_body::writer::{
+    bodyless::BodylessBodyWriter, chunked::ChunkedBodyWriter,
+    content_length::ContentLengthBodyWriter,
+};
+use jrpxy_http_message::{
+    framing::{WriteFraming, is_framing_header},
+    header::Headers,
+    message::Response,
+};
+use tokio::io::{self, AsyncWriteExt};
 
 /// Writes a response to a frontend.
 #[derive(Debug)]

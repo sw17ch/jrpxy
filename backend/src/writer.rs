@@ -1,4 +1,7 @@
-use jrpxy_body::writer::{BodylessBodyWriter, ChunkedBodyWriter, ContentLengthBodyWriter};
+use jrpxy_body::writer::{
+    bodyless::BodylessBodyWriter, chunked::ChunkedBodyWriter,
+    content_length::ContentLengthBodyWriter,
+};
 use jrpxy_http_message::{
     framing::{WriteFraming, is_framing_header},
     header::Headers,
