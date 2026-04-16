@@ -131,6 +131,13 @@ pub enum ChunkWriterMode<I> {
     Idle(IdleWriter<I>),
     Head(HeadWriter<I>),
     Data(DataWriter<I>),
+    Completing(DataCompleter<I>),
+}
+
+impl<I> ChunkWriterMode<I> {
+    pub fn new(writer: I) -> Self {
+        ChunkWriterMode::Idle(IdleWriter { writer })
+    }
 }
 
 impl<I: AsyncWrite + Unpin> ChunkWriterMode<I> {
@@ -158,33 +165,32 @@ impl<I: AsyncWrite + Unpin> ChunkWriterMode<I> {
                         *self = ChunkWriterMode::Data(w.finish());
                     }
                 },
-                ChunkWriterMode::Data(mut w) => {
-                    if !buf.is_empty() {
-                        match w.poll_write(cx, buf) {
-                            Poll::Pending => {
-                                *self = ChunkWriterMode::Data(w);
-                                return Poll::Pending;
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Ready(Ok(len)) => {
-                                *buf = &buf[len..];
-                                *self = ChunkWriterMode::Data(w);
-                            }
-                        }
-                    } else {
-                        match w.poll_complete(cx) {
-                            Poll::Pending => {
-                                *self = ChunkWriterMode::Data(w);
-                                return Poll::Pending;
-                            }
-                            Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                            Poll::Ready(Ok(())) => {
-                                *self = ChunkWriterMode::Idle(w.finish());
-                                return Poll::Ready(Ok(()));
-                            }
+                ChunkWriterMode::Data(mut w) => match w.poll_write(cx, buf) {
+                    Poll::Pending => {
+                        *self = ChunkWriterMode::Data(w);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(len)) => {
+                        *buf = &buf[len..];
+                        if buf.is_empty() {
+                            *self = ChunkWriterMode::Completing(w.finish());
+                        } else {
+                            *self = ChunkWriterMode::Data(w);
                         }
                     }
-                }
+                },
+                ChunkWriterMode::Completing(mut w) => match w.poll_complete(cx) {
+                    Poll::Pending => {
+                        *self = ChunkWriterMode::Completing(w);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Ready(Ok(())) => {
+                        *self = ChunkWriterMode::Idle(w.finish());
+                        return Poll::Ready(Ok(()));
+                    }
+                },
             }
             debug_assert!(
                 !matches!(self, ChunkWriterMode::Failed),
@@ -237,6 +243,10 @@ pub struct IdleWriter<I> {
 }
 
 impl<I> IdleWriter<I> {
+    pub fn into_inner(self) -> I {
+        self.writer
+    }
+
     pub fn start(self, chunk_length: u64) -> HeadWriter<I> {
         let Self { writer } = self;
         HeadWriter::new(chunk_length, writer)
@@ -302,8 +312,7 @@ impl<I> HeadWriter<I> {
 }
 
 impl<I: AsyncWrite + Unpin> HeadWriter<I> {
-    /// Write the entire chunk header, returning a [`DataWriter`] on
-    /// success.
+    /// Write the entire chunk header, returning a [`DataWriter`] on success.
     pub async fn write(mut self) -> BodyResult<DataWriter<I>> {
         poll_fn(|cx| self.poll_write(cx)).await?;
         Ok(self.finish())
@@ -326,59 +335,58 @@ impl<I: AsyncWrite + Unpin> HeadWriter<I> {
     }
 }
 
-/// A writer for a single chunk-encoded data chunk. It accepts a fixed number of
-/// bytes before returning [`BodyError::BodyOverflow`].
+/// Writes the data bytes of a single chunk. The declared length is fixed at
+/// construction; attempting to write more bytes returns
+/// [`BodyError::BodyOverflow`]. Call [`finish`](DataWriter::finish) once
+/// [`is_complete`](DataWriter::is_complete) returns `true` to obtain a
+/// [`DataCompleter`] for the chunk footer.
 #[derive(Debug)]
 pub struct DataWriter<I> {
     /// the declared size of this chunk
     length: u64,
     /// the amount of the chunk already written
     offset: u64,
-    /// the number of footer characters written; a footer is \r\n, so once this
-    /// is 2, the footer is fully written
-    footer_written: u8,
     /// the writer into which data will be placed
     writer: I,
 }
-
-const CHUNK_FOOTER: &[u8] = b"\r\n";
 
 impl<I> DataWriter<I> {
     fn new(length: u64, writer: I) -> Self {
         Self {
             length,
             offset: 0,
-            footer_written: 0,
             writer,
         }
     }
 
-    /// Finish the chunk writer and return a [`ChunkedBodyWriter`].
+    /// Returns `true` when all declared bytes have been written and the chunk
+    /// is ready to be completed via [`finish`](Self::finish).
+    pub fn is_complete(&self) -> bool {
+        self.offset == self.length
+    }
+
+    /// Finish the data writer and return a [`DataCompleter`] for the chunk
+    /// footer.
     ///
     /// # Panics
     ///
-    /// Panics if the chunk data has not been fully written or if the chunk
-    /// footer has not been written via [`Self::poll_complete`].
-    pub fn finish(self) -> IdleWriter<I> {
+    /// Panics if the chunk data has not been fully written via
+    /// [`Self::poll_write`].
+    pub fn finish(self) -> DataCompleter<I> {
         assert_eq!(
             self.offset, self.length,
-            "attempted to finish chunk writer before chunk data was fully written"
+            "attempted to finish data writer before all chunk data was written"
         );
-        assert_eq!(
-            CHUNK_FOOTER.len(),
-            self.footer_written as usize,
-            "attempted to finish chunk writer before chunk footer was written"
-        );
-        IdleWriter {
+        DataCompleter {
+            footer_written: 0,
             writer: self.writer,
         }
     }
 }
 
 impl<I: AsyncWrite + Unpin> DataWriter<I> {
-    /// Write the entire buffer and the chunk footer, returning a
-    /// [`ChunkedBodyWriter`] on success.
-    pub async fn write(mut self, mut buffer: &[u8]) -> BodyResult<ChunkedBodyWriter<I>> {
+    /// Write the entire buffer, returning a [`DataCompleter`] on success.
+    pub async fn write(mut self, mut buffer: &[u8]) -> BodyResult<DataCompleter<I>> {
         while !buffer.is_empty() {
             let written = poll_fn(|cx| self.poll_write(cx, buffer)).await?;
             if written == 0 {
@@ -388,13 +396,50 @@ impl<I: AsyncWrite + Unpin> DataWriter<I> {
             }
             buffer = &buffer[written..];
         }
-        poll_fn(|cx| self.poll_complete(cx)).await?;
-        let IdleWriter { writer } = self.finish();
-        Ok(ChunkedBodyWriter { writer })
+        Ok(self.finish())
     }
 
     pub fn poll_write(&mut self, cx: &mut Context<'_>, buffer: &[u8]) -> Poll<BodyResult<usize>> {
         super::poll_write_bounded(cx, &mut self.writer, self.length, &mut self.offset, buffer)
+    }
+}
+
+/// The footer (`\r\n`) terminating a single chunk. Obtained from
+/// [`DataWriter::finish`] once all chunk data has been written.
+#[derive(Debug)]
+pub struct DataCompleter<I> {
+    /// the number of footer bytes already written; the footer is `\r\n`
+    footer_written: u8,
+    writer: I,
+}
+
+const CHUNK_FOOTER: &[u8] = b"\r\n";
+
+impl<I> DataCompleter<I> {
+    /// Finish the completer and return an [`IdleWriter`] ready for the next
+    /// chunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chunk footer has not been fully written via
+    /// [`Self::poll_complete`].
+    pub fn finish(self) -> IdleWriter<I> {
+        assert_eq!(
+            self.footer_written as usize,
+            CHUNK_FOOTER.len(),
+            "attempted to finish data completer before chunk footer was written"
+        );
+        IdleWriter {
+            writer: self.writer,
+        }
+    }
+}
+
+impl<I: AsyncWrite + Unpin> DataCompleter<I> {
+    /// Write the chunk footer, returning an [`IdleWriter`] on success.
+    pub async fn write(mut self) -> BodyResult<IdleWriter<I>> {
+        poll_fn(|cx| self.poll_complete(cx)).await?;
+        Ok(self.finish())
     }
 
     pub fn poll_complete(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
@@ -416,7 +461,6 @@ impl<I: AsyncWrite + Unpin> DataWriter<I> {
                 Err(e) => return Poll::Ready(Err(BodyError::BodyWriteError(e))),
             }
         }
-
         Poll::Ready(Ok(()))
     }
 }
