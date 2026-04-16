@@ -34,8 +34,8 @@ impl<I: AsyncWrite + Unpin> ChunkedBodyWriter<I> {
     }
 
     pub async fn finish_with_trailers(self, trailers: &Headers) -> BodyResult<I> {
-        let mut f = FinalChunkWriter::new(trailers, self.writer);
-        poll_fn(|cx| f.poll_final(cx)).await?;
+        let mut f = TrailerWriter::new(trailers, self.writer);
+        poll_fn(|cx| f.poll_write(cx)).await?;
         Ok(f.finish())
     }
 
@@ -73,7 +73,7 @@ impl<'b, I> ChunkWriter<'b, I> {
         }
     }
 
-    pub fn finish(mut self, trailers: &Headers) -> FinalChunkWriter<I> {
+    pub fn finish(mut self, trailers: &Headers) -> TrailerWriter<I> {
         let Some(mode) = self.mode.take() else {
             panic!("attempted to finish after error");
         };
@@ -82,7 +82,7 @@ impl<'b, I> ChunkWriter<'b, I> {
         };
         let IdleWriter { writer } = writer;
 
-        FinalChunkWriter {
+        TrailerWriter {
             mode: Some(FinalChunkWriterMode::Final(FinalWriter::new(
                 trailers, writer,
             ))),
@@ -155,11 +155,13 @@ where
     }
 }
 
-pub struct FinalChunkWriter<I> {
+/// Writes the final chunk of a chunk-encoded body with trailers. If no trailers
+/// are specified, the final chunk appears as `0\r\n\r\n`.
+pub struct TrailerWriter<I> {
     mode: Option<FinalChunkWriterMode<I>>,
 }
 
-impl<I> FinalChunkWriter<I> {
+impl<I> TrailerWriter<I> {
     pub(super) fn new(trailers: &Headers, writer: I) -> Self {
         Self {
             mode: Some(FinalChunkWriterMode::Final(FinalWriter::new(
@@ -179,11 +181,11 @@ impl<I> FinalChunkWriter<I> {
     }
 }
 
-impl<I> FinalChunkWriter<I>
+impl<I> TrailerWriter<I>
 where
     I: AsyncWrite + Unpin,
 {
-    pub fn poll_final(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
         loop {
             let Some(mode) = self.mode.take() else {
                 return Poll::Ready(Err(BodyError::WriteAfterError));
