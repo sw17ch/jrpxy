@@ -239,8 +239,8 @@ impl<I> IdleWriter<I> {
 const MAX_CHUNK_HEAD_LEN: usize = 18;
 
 /// Writes the header line for a single chunk (`{size:x}\r\n`). Once fully
-/// written, call [`finish`](ChunkHeadWriter::finish) to obtain a
-/// [`ChunkDataWriter`] for the chunk body.
+/// written, call [`finish`](HeadWriter::finish) to obtain a
+/// [`DataWriter`] for the chunk body.
 #[derive(Debug)]
 pub struct HeadWriter<I> {
     // TODO: avoid the heap allocation from format! by implementing a
@@ -251,7 +251,7 @@ pub struct HeadWriter<I> {
     header_len: u8,
     /// Number of header bytes already written.
     written: u8,
-    /// The chunk body length, forwarded to [`ChunkDataWriter`] on finish.
+    /// The chunk body length, forwarded to [`DataWriter`] on finish.
     chunk_length: u64,
     writer: I,
 }
@@ -275,7 +275,7 @@ impl<I> HeadWriter<I> {
         }
     }
 
-    /// Finish the head writer and return a [`ChunkDataWriter`] for the body.
+    /// Finish the head writer and return a [`DataWriter`] for the body.
     ///
     /// # Panics
     ///
@@ -291,7 +291,7 @@ impl<I> HeadWriter<I> {
 }
 
 impl<I: AsyncWrite + Unpin> HeadWriter<I> {
-    /// Write the entire chunk header, returning a [`ChunkDataWriter`] on
+    /// Write the entire chunk header, returning a [`DataWriter`] on
     /// success.
     pub async fn write(mut self) -> BodyResult<DataWriter<I>> {
         poll_fn(|cx| self.poll_write(cx)).await?;
@@ -411,8 +411,8 @@ impl<I: AsyncWrite + Unpin> DataWriter<I> {
 }
 
 /// Writes the terminal chunk (`0\r\n`), any trailers, and the final `\r\n`,
-/// then flushes. Call [`finish`](FinalChunkWriter::finish) to retrieve the
-/// inner writer once [`poll_write`](FinalChunkWriter::poll_write) completes.
+/// then flushes. Call [`finish`](FinalWriter::finish) to retrieve the
+/// inner writer once [`poll_write`](FinalWriter::poll_write) completes.
 #[derive(Debug)]
 pub struct FinalWriter<I> {
     /// Pre-serialized bytes: `"0\r\n{trailers}\r\n"`.
