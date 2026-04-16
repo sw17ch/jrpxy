@@ -118,7 +118,7 @@ where
     I: AsyncWrite + Unpin,
 {
     pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
-        FinalChunkWriterMode::poll_final(&mut self.mode, cx)
+        FinalChunkWriterMode::poll_write(&mut self.mode, cx)
     }
 }
 
@@ -197,7 +197,7 @@ impl<I: AsyncWrite + Unpin> ChunkWriterMode<I> {
 #[derive(Debug, Default)]
 pub enum FinalChunkWriterMode<I> {
     /// Sentinel left behind by [`std::mem::take`] and set on write errors.
-    /// Any call to [`Self::poll_final`] while in this state returns
+    /// Any call to [`Self::poll_write`] while in this state returns
     /// [`BodyError::WriteAfterError`].
     #[default]
     Failed,
@@ -206,7 +206,7 @@ pub enum FinalChunkWriterMode<I> {
 }
 
 impl<I: AsyncWrite + Unpin> FinalChunkWriterMode<I> {
-    pub fn poll_final(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
         loop {
             match std::mem::take(self) {
                 FinalChunkWriterMode::Failed => {
