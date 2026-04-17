@@ -164,15 +164,15 @@ impl<I: AsyncWriteExt + Unpin> BackendContentLengthBodyWriter<I> {
             .map_err(BackendError::BodyWriteError)
     }
 
+    pub async fn finish(mut self) -> BackendResult<BackendWriter<I>> {
+        self.flush().await?;
+        self.into_writer()
+    }
+
     pub fn into_writer(self) -> BackendResult<BackendWriter<I>> {
         let Self { inner } = self;
         let writer = inner.into_writer().map_err(BackendError::BodyWriteError)?;
         Ok(BackendWriter::new(writer))
-    }
-
-    pub async fn finish(mut self) -> BackendResult<BackendWriter<I>> {
-        self.flush().await?;
-        self.into_writer()
     }
 }
 
