@@ -9,6 +9,8 @@ use jrpxy_http_message::{
     header::Headers,
     message::Request,
 };
+use std::{future::poll_fn, task::{Context, Poll}};
+
 use tokio::io::{self, AsyncWriteExt};
 
 use crate::error::{BackendError, BackendResult};
@@ -143,10 +145,26 @@ impl<I: AsyncWriteExt + Unpin> BackendContentLengthBodyWriter<I> {
         inner.write(buf).await.map_err(BackendError::BodyWriteError)
     }
 
-    pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<BackendResult<usize>> {
+        self.inner
+            .poll_write(cx, buf)
+            .map_err(BackendError::BodyWriteError)
+    }
+
+    pub async fn flush(&mut self) -> BackendResult<()> {
+        poll_fn(|cx| self.poll_flush(cx)).await
+    }
+
+    pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
+        self.inner
+            .poll_flush(cx)
+            .map_err(BackendError::BodyWriteError)
+    }
+
+    pub fn finish(self) -> BackendResult<BackendWriter<I>> {
         let Self { inner } = self;
-        let io = inner.finish().await.map_err(BackendError::BodyWriteError)?;
-        Ok(BackendWriter::new(io))
+        let writer = inner.finish().map_err(BackendError::BodyWriteError)?;
+        Ok(BackendWriter::new(writer))
     }
 }
 
@@ -234,7 +252,7 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
         match self {
             BackendBodyWriter::Bodyless(w) => w.finish(),
-            BackendBodyWriter::CL(w) => w.finish().await,
+            BackendBodyWriter::CL(w) => w.finish(),
             BackendBodyWriter::TE(w) => w.finish().await,
         }
     }

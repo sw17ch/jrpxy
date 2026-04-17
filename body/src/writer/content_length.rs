@@ -3,7 +3,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWrite;
 
 use crate::error::{BodyError, BodyResult};
 
@@ -46,21 +46,26 @@ impl<I: AsyncWrite + Unpin> ContentLengthBodyWriter<I> {
         super::poll_write_bounded(cx, &mut self.writer, self.length, &mut self.offset, buffer)
     }
 
-    pub async fn finish(self) -> BodyResult<I> {
-        let Self {
-            length,
-            offset,
-            mut writer,
-        } = self;
-        debug_assert!(offset <= length, "offset exceeds length");
-        if offset < length {
+    pub async fn flush(&mut self) -> BodyResult<()> {
+        poll_fn(|cx| self.poll_flush(cx)).await
+    }
+
+    pub fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        match std::pin::Pin::new(&mut self.writer).poll_flush(cx) {
+            Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+            Poll::Ready(Err(e)) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    pub fn finish(self) -> BodyResult<I> {
+        if self.offset < self.length {
             return Err(BodyError::IncompleteBody {
-                expected: length,
-                actual: offset,
+                expected: self.length,
+                actual: self.offset,
             });
         }
-        writer.flush().await.map_err(BodyError::BodyWriteError)?;
-        Ok(writer)
+        Ok(self.writer)
     }
 }
 
