@@ -76,10 +76,6 @@ impl<I> IdleWriter<I> {
         Self { writer }
     }
 
-    pub fn into_writer(self) -> I {
-        self.writer
-    }
-
     pub fn start(self, chunk_length: u64) -> HeadWriter<I> {
         let Self { writer } = self;
         HeadWriter::new(chunk_length, writer)
