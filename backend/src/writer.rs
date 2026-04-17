@@ -1,6 +1,8 @@
-use jrpxy_body::writer::{
-    bodyless::BodylessBodyWriter, chunked::ChunkedBodyWriter,
-    content_length::ContentLengthBodyWriter,
+use jrpxy_body::{
+    error::BodyError,
+    writer::{
+        bodyless::BodylessBodyWriter, chunked::IdleWriter, content_length::ContentLengthBodyWriter,
+    },
 };
 use jrpxy_http_message::{
     framing::{WriteFraming, is_framing_header},
@@ -25,7 +27,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter::TE(BackendChunkedBodyWriter {
-            inner: ChunkedBodyWriter::new(writer),
+            inner: Some(IdleWriter::new(writer)),
         }))
     }
 
@@ -151,19 +153,44 @@ impl<I: AsyncWriteExt + Unpin> BackendContentLengthBodyWriter<I> {
 /// Backend wrapper for [`ChunkedBodyWriter`]. Finishing it with trailers
 /// forwards them to the backend as chunked trailer fields.
 pub struct BackendChunkedBodyWriter<I> {
-    inner: ChunkedBodyWriter<I>,
+    /// `None` after an error or once the writer has been finished/aborted.
+    inner: Option<IdleWriter<I>>,
 }
 
 impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyWriter<I> {
     pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
-        let Self { inner } = self;
-        inner.write(buf).await.map_err(BackendError::BodyWriteError)
+        if buf.is_empty() {
+            // we do not create empty chunks
+            return Ok(());
+        }
+        let Some(idle) = self.inner.take() else {
+            return Err(BackendError::BodyWriteError(BodyError::WriteAfterError));
+        };
+        let idle = idle
+            .start(buf.len() as u64)
+            .write()
+            .await
+            .map_err(BackendError::BodyWriteError)?
+            .write(buf)
+            .await
+            .map_err(BackendError::BodyWriteError)?
+            .write()
+            .await
+            .map_err(BackendError::BodyWriteError)?;
+        self.inner = Some(idle);
+        Ok(())
     }
 
-    pub async fn finish_with_trailers(self, trailers: &Headers) -> BackendResult<BackendWriter<I>> {
-        let Self { inner } = self;
-        let io = inner
-            .finish_with_trailers(trailers)
+    pub async fn finish_with_trailers(
+        mut self,
+        trailers: &Headers,
+    ) -> BackendResult<BackendWriter<I>> {
+        let Some(idle) = self.inner.take() else {
+            return Err(BackendError::BodyWriteError(BodyError::WriteAfterError));
+        };
+        let io = idle
+            .into_final(trailers)
+            .write()
             .await
             .map_err(BackendError::BodyWriteError)?;
         Ok(BackendWriter::new(io))
@@ -173,15 +200,20 @@ impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyWriter<I> {
         self.finish_with_trailers(&Default::default()).await
     }
 
-    pub async fn abort(self) -> BackendResult<()> {
-        let Self { inner } = self;
-        inner.abort().await.map_err(BackendError::BodyWriteError)?;
+    pub async fn abort(mut self) -> BackendResult<()> {
+        let Some(idle) = self.inner.take() else {
+            return Err(BackendError::BodyWriteError(BodyError::WriteAfterError));
+        };
+        idle.abort()
+            .write()
+            .await
+            .map_err(BackendError::BodyWriteError)?;
         Ok(())
     }
 }
 
-/// The body writer for a backend connection; it is typed so that finishing
-/// always produces a [`BackendWriter`] without exposing raw IO.
+/// The body writer for a backend connection. Finishing always produces a
+/// [`BackendWriter`] without exposing raw IO.
 pub enum BackendBodyWriter<I> {
     Bodyless(BackendBodylessBodyWriter<I>),
     CL(BackendContentLengthBodyWriter<I>),

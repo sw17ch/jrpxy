@@ -5,7 +5,7 @@ use std::{
 };
 
 use jrpxy_http_message::header::Headers;
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use tokio::io::AsyncWrite;
 
 use crate::error::{BodyError, BodyResult};
 
@@ -44,19 +44,7 @@ impl<I: AsyncWrite + Unpin> ChunkedBodyWriter<I> {
     }
 
     pub async fn abort(self) -> BodyResult<I> {
-        let Self { mut writer } = self;
-        // we allow users to explicitly abandon a transfer-encoding:chunked
-        // write by emitting a bad chunk header. this should be a little more
-        // durable when badly-configured body readers don't wait for the
-        // terminating empty chunk to consider a body complete.
-        //
-        // we write an 'x' because it is not a valid hexadecimal character
-        writer
-            .write_all(b"x")
-            .await
-            .map_err(BodyError::BodyWriteError)?;
-        writer.flush().await.map_err(BodyError::BodyWriteError)?;
-        Ok(writer)
+        IdleWriter::new(self.writer).abort().write().await
     }
 }
 
@@ -243,6 +231,10 @@ pub struct IdleWriter<I> {
 }
 
 impl<I> IdleWriter<I> {
+    pub fn new(writer: I) -> Self {
+        Self { writer }
+    }
+
     pub fn into_inner(self) -> I {
         self.writer
     }
@@ -255,6 +247,54 @@ impl<I> IdleWriter<I> {
     pub fn into_final(self, trailers: &Headers) -> FinalWriter<I> {
         let Self { writer } = self;
         FinalWriter::new(trailers, writer)
+    }
+
+    pub fn abort(self) -> AbortWriter<I> {
+        AbortWriter {
+            written: false,
+            flushed: false,
+            writer: self.writer,
+        }
+    }
+}
+
+/// Aborts a chunked transfer by writing an invalid chunk header byte (`x`),
+/// then flushing. The invalid hex character signals to the reader that the
+/// body is malformed, which is more robust than relying on connection close
+/// when readers don't wait for the terminating empty chunk.
+#[derive(Debug)]
+pub struct AbortWriter<I> {
+    written: bool,
+    flushed: bool,
+    writer: I,
+}
+
+impl<I: AsyncWrite + Unpin> AbortWriter<I> {
+    /// Write the abort byte and flush, returning the inner writer on success.
+    pub async fn write(mut self) -> BodyResult<I> {
+        poll_fn(|cx| self.poll_abort(cx)).await?;
+        Ok(self.writer)
+    }
+
+    pub fn poll_abort(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        if !self.written {
+            match ready!(Pin::new(&mut self.writer).poll_write(cx, b"x")) {
+                Ok(0) => {
+                    return Poll::Ready(Err(BodyError::BodyWriteError(
+                        std::io::ErrorKind::WriteZero.into(),
+                    )));
+                }
+                Ok(_) => self.written = true,
+                Err(e) => return Poll::Ready(Err(BodyError::BodyWriteError(e))),
+            }
+        }
+        match ready!(Pin::new(&mut self.writer).poll_flush(cx)) {
+            Ok(()) => {
+                self.flushed = true;
+                Poll::Ready(Ok(()))
+            }
+            Err(e) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
+        }
     }
 }
 
