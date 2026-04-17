@@ -235,7 +235,7 @@ impl<I> IdleWriter<I> {
         Self { writer }
     }
 
-    pub fn into_inner(self) -> I {
+    pub fn into_writer(self) -> I {
         self.writer
     }
 

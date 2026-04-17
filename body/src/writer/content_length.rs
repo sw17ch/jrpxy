@@ -58,7 +58,7 @@ impl<I: AsyncWrite + Unpin> ContentLengthBodyWriter<I> {
         }
     }
 
-    pub fn finish(self) -> BodyResult<I> {
+    pub fn into_writer(self) -> BodyResult<I> {
         if self.offset < self.length {
             return Err(BodyError::IncompleteBody {
                 expected: self.length,

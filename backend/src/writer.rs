@@ -9,7 +9,10 @@ use jrpxy_http_message::{
     header::Headers,
     message::Request,
 };
-use std::{future::poll_fn, task::{Context, Poll}};
+use std::{
+    future::poll_fn,
+    task::{Context, Poll},
+};
 
 use tokio::io::{self, AsyncWriteExt};
 
@@ -161,10 +164,15 @@ impl<I: AsyncWriteExt + Unpin> BackendContentLengthBodyWriter<I> {
             .map_err(BackendError::BodyWriteError)
     }
 
-    pub fn finish(self) -> BackendResult<BackendWriter<I>> {
+    pub fn into_writer(self) -> BackendResult<BackendWriter<I>> {
         let Self { inner } = self;
-        let writer = inner.finish().map_err(BackendError::BodyWriteError)?;
+        let writer = inner.into_writer().map_err(BackendError::BodyWriteError)?;
         Ok(BackendWriter::new(writer))
+    }
+
+    pub async fn finish(mut self) -> BackendResult<BackendWriter<I>> {
+        self.flush().await?;
+        self.into_writer()
     }
 }
 
@@ -252,7 +260,7 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
         match self {
             BackendBodyWriter::Bodyless(w) => w.finish(),
-            BackendBodyWriter::CL(w) => w.finish(),
+            BackendBodyWriter::CL(w) => w.finish().await,
             BackendBodyWriter::TE(w) => w.finish().await,
         }
     }

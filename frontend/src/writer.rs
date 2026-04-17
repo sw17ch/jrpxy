@@ -318,7 +318,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendContentLengthBodyWriter<I> {
     pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
         let Self { mut inner } = self;
         inner.flush().await.map_err(FrontendError::BodyWriteError)?;
-        let writer = inner.finish().map_err(FrontendError::BodyWriteError)?;
+        let writer = inner.into_writer().map_err(FrontendError::BodyWriteError)?;
         Ok(FrontendWriter { writer })
     }
 }
