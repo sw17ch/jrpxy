@@ -11,12 +11,15 @@ use crate::error::{BodyError, BodyResult};
 
 #[derive(Debug)]
 pub struct ChunkedBodyWriter<I> {
-    writer: I,
+    /// `None` after an error or once the writer has been finished/aborted.
+    inner: Option<IdleWriter<I>>,
 }
 
 impl<I> ChunkedBodyWriter<I> {
     pub fn new(writer: I) -> Self {
-        Self { writer }
+        Self {
+            inner: Some(IdleWriter::new(writer)),
+        }
     }
 }
 
@@ -29,199 +32,37 @@ impl<I: AsyncWrite + Unpin> ChunkedBodyWriter<I> {
             // attempting to write a zero-length chunk will break framing.
             return Ok(());
         }
-        let mut w = ChunkWriter::new(&mut self.writer, buffer);
-        poll_fn(|cx| w.poll_write(cx)).await
+        let Some(idle) = self.inner.take() else {
+            return Err(BodyError::WriteAfterError);
+        };
+        let idle = idle
+            .start(buffer.len() as u64)
+            .write()
+            .await?
+            .write(buffer)
+            .await?
+            .write()
+            .await?;
+        self.inner = Some(idle);
+        Ok(())
     }
 
-    pub async fn finish_with_trailers(self, trailers: &Headers) -> BodyResult<I> {
-        let mut f = TrailerWriter::new(trailers, self.writer);
-        poll_fn(|cx| f.poll_write(cx)).await?;
-        Ok(f.finish())
+    pub async fn finish_with_trailers(mut self, trailers: &Headers) -> BodyResult<I> {
+        let Some(idle) = self.inner.take() else {
+            return Err(BodyError::WriteAfterError);
+        };
+        idle.into_final(trailers).write().await
     }
 
     pub async fn finish(self) -> BodyResult<I> {
         self.finish_with_trailers(&Default::default()).await
     }
 
-    pub async fn abort(self) -> BodyResult<I> {
-        IdleWriter::new(self.writer).abort().write().await
-    }
-}
-
-pub struct ChunkWriter<'b, I> {
-    buffer: &'b [u8],
-    mode: ChunkWriterMode<I>,
-}
-
-impl<'b, I> ChunkWriter<'b, I> {
-    pub fn new(writer: I, buffer: &'b [u8]) -> Self {
-        Self {
-            buffer,
-            mode: ChunkWriterMode::Idle(IdleWriter { writer }),
-        }
-    }
-
-    pub fn finish(self, trailers: &Headers) -> TrailerWriter<I> {
-        let ChunkWriterMode::Idle(writer) = self.mode else {
-            panic!("attempted to finish without polling poll_write to completion");
+    pub async fn abort(mut self) -> BodyResult<I> {
+        let Some(idle) = self.inner.take() else {
+            return Err(BodyError::WriteAfterError);
         };
-        TrailerWriter {
-            mode: FinalChunkWriterMode::Final(writer.into_final(trailers)),
-        }
-    }
-}
-
-impl<'b, I> ChunkWriter<'b, I>
-where
-    I: AsyncWrite + Unpin,
-{
-    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
-        ChunkWriterMode::poll_write(&mut self.mode, cx, &mut self.buffer)
-    }
-}
-
-/// Writes the final chunk of a chunk-encoded body with trailers. If no trailers
-/// are specified, the final chunk appears as `0\r\n\r\n`.
-pub struct TrailerWriter<I> {
-    mode: FinalChunkWriterMode<I>,
-}
-
-impl<I> TrailerWriter<I> {
-    pub(super) fn new(trailers: &Headers, writer: I) -> Self {
-        Self {
-            mode: FinalChunkWriterMode::Final(FinalWriter::new(trailers, writer)),
-        }
-    }
-
-    pub fn finish(self) -> I {
-        let FinalChunkWriterMode::Done(w) = self.mode else {
-            panic!("attempted to finish without polling poll_final to completion");
-        };
-        w
-    }
-}
-
-impl<I> TrailerWriter<I>
-where
-    I: AsyncWrite + Unpin,
-{
-    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
-        FinalChunkWriterMode::poll_write(&mut self.mode, cx)
-    }
-}
-
-#[derive(Debug, Default)]
-pub enum ChunkWriterMode<I> {
-    /// Sentinel set on write errors. Any call to [`Self::poll_write`] while in
-    /// this state returns [`BodyError::WriteAfterError`].
-    #[default]
-    Failed,
-    Idle(IdleWriter<I>),
-    Head(HeadWriter<I>),
-    Data(DataWriter<I>),
-    Completing(DataCompleter<I>),
-}
-
-impl<I> ChunkWriterMode<I> {
-    pub fn new(writer: I) -> Self {
-        ChunkWriterMode::Idle(IdleWriter { writer })
-    }
-}
-
-impl<I: AsyncWrite + Unpin> ChunkWriterMode<I> {
-    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &mut &[u8]) -> Poll<BodyResult<()>> {
-        loop {
-            match std::mem::take(self) {
-                ChunkWriterMode::Failed => {
-                    return Poll::Ready(Err(BodyError::WriteAfterError));
-                }
-                ChunkWriterMode::Idle(w) => {
-                    if buf.is_empty() {
-                        *self = ChunkWriterMode::Idle(w);
-                        return Poll::Ready(Ok(()));
-                    } else {
-                        *self = ChunkWriterMode::Head(w.start(buf.len() as u64));
-                    }
-                }
-                ChunkWriterMode::Head(mut w) => match w.poll_write(cx) {
-                    Poll::Pending => {
-                        *self = ChunkWriterMode::Head(w);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(())) => {
-                        *self = ChunkWriterMode::Data(w.finish());
-                    }
-                },
-                ChunkWriterMode::Data(mut w) => match w.poll_write(cx, buf) {
-                    Poll::Pending => {
-                        *self = ChunkWriterMode::Data(w);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(len)) => {
-                        *buf = &buf[len..];
-                        if buf.is_empty() {
-                            *self = ChunkWriterMode::Completing(w.finish());
-                        } else {
-                            *self = ChunkWriterMode::Data(w);
-                        }
-                    }
-                },
-                ChunkWriterMode::Completing(mut w) => match w.poll_complete(cx) {
-                    Poll::Pending => {
-                        *self = ChunkWriterMode::Completing(w);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(())) => {
-                        *self = ChunkWriterMode::Idle(w.finish());
-                        return Poll::Ready(Ok(()));
-                    }
-                },
-            }
-            debug_assert!(
-                !matches!(self, ChunkWriterMode::Failed),
-                "failed to replace mode"
-            );
-        }
-    }
-}
-
-#[derive(Debug, Default)]
-pub enum FinalChunkWriterMode<I> {
-    /// Sentinel left behind by [`std::mem::take`] and set on write errors.
-    /// Any call to [`Self::poll_write`] while in this state returns
-    /// [`BodyError::WriteAfterError`].
-    #[default]
-    Failed,
-    Final(FinalWriter<I>),
-    Done(I),
-}
-
-impl<I: AsyncWrite + Unpin> FinalChunkWriterMode<I> {
-    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
-        loop {
-            match std::mem::take(self) {
-                FinalChunkWriterMode::Failed => {
-                    return Poll::Ready(Err(BodyError::WriteAfterError));
-                }
-                FinalChunkWriterMode::Final(mut w) => match w.poll_write(cx) {
-                    Poll::Pending => {
-                        *self = FinalChunkWriterMode::Final(w);
-                        return Poll::Pending;
-                    }
-                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Ready(Ok(())) => {
-                        *self = FinalChunkWriterMode::Done(w.finish());
-                    }
-                },
-                FinalChunkWriterMode::Done(w) => {
-                    *self = FinalChunkWriterMode::Done(w);
-                    return Poll::Ready(Ok(()));
-                }
-            }
-        }
+        idle.abort().write().await
     }
 }
 
