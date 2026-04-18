@@ -475,13 +475,8 @@ impl<I> FrontendDataWriter<I> {
 }
 
 impl<I: AsyncWrite + Unpin> FrontendDataWriter<I> {
-    pub async fn write_all(&mut self, mut buf: &[u8]) -> FrontendResult<()> {
-        while !buf.is_empty() {
-            let written = poll_fn(|cx| self.poll_write(cx, buf)).await?;
-            let (_written, rest) = buf.split_at(written);
-            buf = rest;
-        }
-        Ok(())
+    pub async fn write_all(&mut self, buf: &[u8]) -> FrontendResult<usize> {
+        poll_fn(|cx| self.poll_write(cx, buf)).await
     }
 
     pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<FrontendResult<usize>> {

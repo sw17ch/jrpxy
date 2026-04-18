@@ -2,7 +2,7 @@ use jrpxy_body::{
     error::BodyError,
     writer::{
         bodyless::BodylessBodyWriter,
-        chunked::{DataCompleter, DataWriter, FinalWriter, HeadWriter, IdleWriter},
+        chunked::{AbortWriter, DataCompleter, DataWriter, FinalWriter, HeadWriter, IdleWriter},
         content_length::ContentLengthBodyWriter,
     },
 };
@@ -33,9 +33,9 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
         write_request_to(request, WriteFraming::Chunked, &mut writer)
             .await
             .map_err(BackendError::WriteError)?;
-        Ok(BackendBodyWriter::TE(BackendChunkedBodyWriter {
-            state: Some(BackendChunkState::Idle(IdleWriter::new(writer))),
-        }))
+        Ok(BackendBodyWriter::TE(Some(BackendIdleWriter {
+            inner: IdleWriter::new(writer),
+        })))
     }
 
     pub async fn send_as_content_length(
@@ -178,124 +178,195 @@ impl<I: AsyncWriteExt + Unpin> BackendContentLengthBodyWriter<I> {
     }
 }
 
-macro_rules! park {
-    ($self:expr, $state:expr) => {{
-        $self.state = Some($state);
-        return Poll::Pending;
-    }};
+/// Backend typestate wrapper for [`IdleWriter`]. Represents a chunked body
+/// writer at a chunk boundary, ready to begin a new chunk or finish the body.
+pub struct BackendIdleWriter<I> {
+    inner: IdleWriter<I>,
 }
 
-enum BackendChunkState<I> {
-    Idle(IdleWriter<I>),
-    WritingHead(HeadWriter<I>),
-    WritingData {
-        writer: DataWriter<I>,
-        written: usize,
-    },
-    WritingFooter(DataCompleter<I>),
-}
+impl<I> BackendIdleWriter<I> {
+    /// Begin a new chunk of the given length, returning a [`BackendHeadWriter`]
+    /// that will write the chunk header.
+    pub fn start(self, chunk_length: u64) -> BackendHeadWriter<I> {
+        BackendHeadWriter {
+            inner: self.inner.start(chunk_length),
+        }
+    }
 
-/// Backend wrapper for a chunked body writer. Finishing it with trailers
-/// forwards them to the backend as chunked trailer fields.
-pub struct BackendChunkedBodyWriter<I> {
-    /// `None` after an error or once the writer has been finished/aborted.
-    state: Option<BackendChunkState<I>>,
-}
-
-impl<I> BackendChunkedBodyWriter<I> {
     /// Consume the writer and return a [`BackendChunkedBodyFinisher`] that
-    /// writes the terminal chunk and trailers. Returns an error if the writer
-    /// is not at a chunk boundary (i.e. not in the idle state).
-    pub fn into_finisher(self, trailers: &Headers) -> BackendResult<BackendChunkedBodyFinisher<I>> {
-        match self.state {
-            Some(BackendChunkState::Idle(idle)) => Ok(BackendChunkedBodyFinisher {
-                inner: Some(idle.into_final(trailers)),
-            }),
-            _ => Err(BackendError::BodyWriteError(BodyError::WriteAfterError)),
+    /// writes the terminal zero-length chunk and any trailers.
+    pub fn into_finisher(self, trailers: &Headers) -> BackendChunkedBodyFinisher<I> {
+        BackendChunkedBodyFinisher {
+            inner: Some(self.inner.into_final(trailers)),
+        }
+    }
+
+    /// Consume the writer and return a [`BackendChunkedBodyAborter`] that
+    /// writes the abort byte (`x`) and flushes.
+    pub fn into_aborter(self) -> BackendChunkedBodyAborter<I> {
+        BackendChunkedBodyAborter {
+            inner: Some(self.inner.abort()),
         }
     }
 }
 
-impl<I: AsyncWrite + Unpin> BackendChunkedBodyWriter<I> {
-    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
+impl<I: AsyncWrite + Unpin> BackendIdleWriter<I> {
+    /// Write a single complete chunk (head + data + footer). Returns the updated
+    /// [`BackendIdleWriter`] ready for the next chunk on success.
+    ///
+    /// No-ops when `buf` is empty to avoid writing a zero-length chunk.
+    pub async fn write(self, buf: &[u8]) -> BackendResult<Self> {
+        if buf.is_empty() {
+            return Ok(self);
+        }
+        let idle = self
+            .inner
+            .start(buf.len() as u64)
+            .write()
+            .await
+            .map_err(BackendError::BodyWriteError)?
+            .write(buf)
+            .await
+            .map_err(BackendError::BodyWriteError)?
+            .write()
+            .await
+            .map_err(BackendError::BodyWriteError)?;
+        Ok(BackendIdleWriter { inner: idle })
+    }
+}
+
+/// Backend typestate wrapper for [`HeadWriter`]. Writes the chunk header.
+pub struct BackendHeadWriter<I> {
+    inner: HeadWriter<I>,
+}
+
+impl<I: AsyncWrite + Unpin> BackendHeadWriter<I> {
+    /// Write the entire chunk header, returning a [`BackendDataWriter`] on
+    /// success.
+    pub async fn write(mut self) -> BackendResult<BackendDataWriter<I>> {
+        poll_fn(|cx| self.poll_write(cx)).await?;
+        Ok(self.finish())
+    }
+
+    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
+        self.inner
+            .poll_write(cx)
+            .map_err(BackendError::BodyWriteError)
+    }
+
+    /// Finish the head writer and return a [`BackendDataWriter`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chunk header has not been fully written via
+    /// [`Self::poll_write`].
+    pub fn finish(self) -> BackendDataWriter<I> {
+        BackendDataWriter {
+            inner: self.inner.finish(),
+        }
+    }
+}
+
+/// Backend typestate wrapper for [`DataWriter`]. Writes the data bytes of a
+/// single chunk.
+pub struct BackendDataWriter<I> {
+    inner: DataWriter<I>,
+}
+
+impl<I> BackendDataWriter<I> {
+    /// Returns `true` when all declared bytes have been written.
+    pub fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+
+    /// Finish the data writer and return a [`BackendDataCompleter`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if all declared bytes have not been written via
+    /// [`Self::poll_write`].
+    pub fn finish(self) -> BackendDataCompleter<I> {
+        BackendDataCompleter {
+            inner: self.inner.finish(),
+        }
+    }
+}
+
+impl<I: AsyncWrite + Unpin> BackendDataWriter<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<usize> {
         poll_fn(|cx| self.poll_write(cx, buf)).await
     }
 
-    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<BackendResult<()>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(()));
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<BackendResult<usize>> {
+        self.inner
+            .poll_write(cx, buf)
+            .map_err(BackendError::BodyWriteError)
+    }
+}
+
+/// Backend typestate wrapper for [`DataCompleter`]. Writes the chunk footer
+/// (`\r\n`).
+pub struct BackendDataCompleter<I> {
+    inner: DataCompleter<I>,
+}
+
+impl<I> BackendDataCompleter<I> {
+    /// Finish the completer and return a [`BackendIdleWriter`] ready for the
+    /// next chunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chunk footer has not been fully written via
+    /// [`Self::poll_write`].
+    pub fn into_idle_writer(self) -> BackendIdleWriter<I> {
+        BackendIdleWriter {
+            inner: self.inner.finish(),
         }
-        loop {
-            let state = match self.state.take() {
-                None => return ready_error(BodyError::WriteAfterError),
-                Some(s) => s,
-            };
-            match state {
-                BackendChunkState::Idle(idle) => {
-                    self.state = Some(BackendChunkState::WritingHead(idle.start(buf.len() as u64)));
-                }
-                BackendChunkState::WritingHead(mut head) => match head.poll_write(cx) {
-                    Poll::Pending => park!(self, BackendChunkState::WritingHead(head)),
-                    Poll::Ready(Err(e)) => return ready_error(e),
-                    Poll::Ready(Ok(())) => {
-                        self.state = Some(BackendChunkState::WritingData {
-                            writer: head.finish(),
-                            written: 0,
-                        });
-                    }
-                },
-                BackendChunkState::WritingData {
-                    mut writer,
-                    written,
-                } => match writer.poll_write(cx, &buf[written..]) {
-                    Poll::Pending => {
-                        park!(self, BackendChunkState::WritingData { writer, written })
-                    }
-                    Poll::Ready(Err(e)) => return ready_error(e),
-                    Poll::Ready(Ok(n)) => {
-                        let written = written + n;
-                        if writer.is_complete() {
-                            self.state = Some(BackendChunkState::WritingFooter(writer.finish()));
-                        } else {
-                            park!(self, BackendChunkState::WritingData { writer, written });
-                        }
-                    }
-                },
-                BackendChunkState::WritingFooter(mut footer) => match footer.poll_complete(cx) {
-                    Poll::Pending => park!(self, BackendChunkState::WritingFooter(footer)),
-                    Poll::Ready(Err(e)) => return ready_error(e),
-                    Poll::Ready(Ok(())) => {
-                        self.state = Some(BackendChunkState::Idle(footer.finish()));
-                        return Poll::Ready(Ok(()));
-                    }
-                },
+    }
+}
+
+impl<I: AsyncWrite + Unpin> BackendDataCompleter<I> {
+    /// Write the chunk footer, returning a [`BackendIdleWriter`] on success.
+    pub async fn write(mut self) -> BackendResult<BackendIdleWriter<I>> {
+        poll_fn(|cx| self.poll_write(cx)).await?;
+        Ok(self.into_idle_writer())
+    }
+
+    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
+        self.inner
+            .poll_complete(cx)
+            .map_err(BackendError::BodyWriteError)
+    }
+}
+
+/// Aborts a chunked backend request by writing an invalid chunk header byte
+/// (`x`) and flushing.
+pub struct BackendChunkedBodyAborter<I> {
+    /// `None` once the abort has been written and flushed.
+    inner: Option<AbortWriter<I>>,
+}
+
+impl<I: AsyncWrite + Unpin> BackendChunkedBodyAborter<I> {
+    pub async fn abort(mut self) -> BackendResult<()> {
+        poll_fn(|cx| self.poll_abort(cx)).await
+    }
+
+    pub fn poll_abort(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<()>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return ready_error(BodyError::WriteAfterError);
+        };
+        match inner.poll_abort(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => ready_error(e),
+            Poll::Ready(Ok(())) => {
+                self.inner = None;
+                Poll::Ready(Ok(()))
             }
         }
-    }
-
-    pub async fn finish_with_trailers(self, trailers: &Headers) -> BackendResult<BackendWriter<I>> {
-        self.into_finisher(trailers)?.finish().await
-    }
-
-    pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
-        self.finish_with_trailers(&Default::default()).await
-    }
-
-    pub async fn abort(self) -> BackendResult<()> {
-        // Only write the abort byte when idle (between chunks). Mid-chunk,
-        // the partial write already leaves framing broken — which is the goal.
-        if let Some(BackendChunkState::Idle(idle)) = self.state {
-            idle.abort()
-                .write()
-                .await
-                .map_err(BackendError::BodyWriteError)?;
-        }
-        Ok(())
     }
 }
 
 /// Writes the terminal chunk and trailers for a chunked backend request.
-/// Obtained from [`BackendChunkedBodyWriter::into_finisher`].
 pub struct BackendChunkedBodyFinisher<I> {
     inner: Option<FinalWriter<I>>,
 }
@@ -327,7 +398,7 @@ impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyFinisher<I> {
 pub enum BackendBodyWriter<I> {
     Bodyless(BackendBodylessBodyWriter<I>),
     CL(BackendContentLengthBodyWriter<I>),
-    TE(BackendChunkedBodyWriter<I>),
+    TE(Option<BackendIdleWriter<I>>),
 }
 
 impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
@@ -337,7 +408,13 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
                 jrpxy_body::error::BodyError::BodyOverflow(buf.len() as u64),
             )),
             BackendBodyWriter::CL(w) => w.write(buf).await,
-            BackendBodyWriter::TE(w) => w.write(buf).await,
+            BackendBodyWriter::TE(opt) => {
+                let idle = opt
+                    .take()
+                    .ok_or(BackendError::BodyWriteError(BodyError::WriteAfterError))?;
+                *opt = Some(idle.write(buf).await?);
+                Ok(())
+            }
         }
     }
 
@@ -345,14 +422,24 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
         match self {
             BackendBodyWriter::Bodyless(w) => w.finish(),
             BackendBodyWriter::CL(w) => w.finish().await,
-            BackendBodyWriter::TE(w) => w.finish().await,
+            BackendBodyWriter::TE(opt) => {
+                let idle = opt.ok_or(BackendError::BodyWriteError(BodyError::WriteAfterError))?;
+                idle.into_finisher(&Default::default()).finish().await
+            }
         }
     }
 
     pub async fn abort(self) -> BackendResult<()> {
         match self {
             BackendBodyWriter::Bodyless(_) | BackendBodyWriter::CL(_) => Ok(()),
-            BackendBodyWriter::TE(w) => w.abort().await,
+            BackendBodyWriter::TE(opt) => {
+                // Only write the abort byte when idle (between chunks). Mid-chunk,
+                // the partial write already leaves framing broken — which is the goal.
+                if let Some(idle) = opt {
+                    idle.into_aborter().abort().await?;
+                }
+                Ok(())
+            }
         }
     }
 }

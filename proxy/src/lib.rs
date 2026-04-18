@@ -928,7 +928,13 @@ where
                             match (frontend_body_reader, backend_body_writer) {
                                 (FrontendBodyReader::TE(fr), BackendBodyWriter::TE(bw)) => {
                                     let (next_reader, trailers) = fr.drain().await?;
-                                    let next_backend = bw.finish_with_trailers(&trailers).await?;
+                                    let next_backend = bw
+                                        // TODO: same as FrontendWriterGone — goes away
+                                        // when we have a FrontendToBackendBodyCopier.
+                                        .ok_or(ProxyCopyError::BackendWriterGone)?
+                                        .into_finisher(&trailers)
+                                        .finish()
+                                        .await?;
                                     Ok((next_reader, next_backend))
                                 }
                                 (fr, bw) => {
