@@ -475,7 +475,7 @@ impl<I> FrontendDataWriter<I> {
 }
 
 impl<I: AsyncWrite + Unpin> FrontendDataWriter<I> {
-    pub async fn write_all(mut self, mut buf: &[u8]) -> FrontendResult<()> {
+    pub async fn write_all(&mut self, mut buf: &[u8]) -> FrontendResult<()> {
         while !buf.is_empty() {
             let written = poll_fn(|cx| self.poll_write(cx, buf)).await?;
             let (_written, rest) = buf.split_at(written);
@@ -514,12 +514,12 @@ impl<I> FrontendDataCompleter<I> {
 
 impl<I: AsyncWrite + Unpin> FrontendDataCompleter<I> {
     /// Write the chunk footer, returning a [`FrontendIdleWriter`] on success.
-    pub async fn complete(mut self) -> FrontendResult<FrontendIdleWriter<I>> {
-        poll_fn(|cx| self.poll_complete(cx)).await?;
+    pub async fn write(mut self) -> FrontendResult<FrontendIdleWriter<I>> {
+        poll_fn(|cx| self.poll_write(cx)).await?;
         Ok(self.into_idle_writer())
     }
 
-    pub fn poll_complete(&mut self, cx: &mut Context<'_>) -> Poll<FrontendResult<()>> {
+    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<FrontendResult<()>> {
         self.inner
             .poll_complete(cx)
             .map_err(FrontendError::BodyWriteError)
