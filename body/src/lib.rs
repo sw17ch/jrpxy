@@ -65,6 +65,15 @@ pub enum C2CState<R, W> {
 
 const READ_SIZE: usize = 8192;
 
+/// Store `$state` and return `Poll::Pending` atomically, preventing the
+/// common mistake of storing state without returning.
+macro_rules! park {
+    ($self:expr, $state:expr) => {{
+        $self.state = Some($state);
+        return Poll::Pending;
+    }};
+}
+
 pub struct ChunkToChunkBodyForwarder<R, W> {
     state: Option<C2CState<R, W>>,
 }
@@ -82,10 +91,7 @@ where
             match state {
                 C2CState::ReadChunk { mut reader, writer } => match reader.poll_read_chunk(cx) {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        self.state = Some(C2CState::ReadChunk { reader, writer });
-                        return Poll::Pending;
-                    }
+                    Poll::Pending => park!(self, C2CState::ReadChunk { reader, writer }),
                     Poll::Ready(Ok(())) => match reader.finish() {
                         NextChunk::Data(reader) => {
                             let writer = writer.start(reader.size());
@@ -99,10 +105,7 @@ where
                 },
                 C2CState::WriteChunk { reader, mut writer } => match writer.poll_write(cx) {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        self.state = Some(C2CState::WriteChunk { reader, writer });
-                        return Poll::Pending;
-                    }
+                    Poll::Pending => park!(self, C2CState::WriteChunk { reader, writer }),
                     Poll::Ready(Ok(())) => {
                         let writer = writer.finish();
                         self.state = Some(C2CState::ReadData { reader, writer });
@@ -110,10 +113,7 @@ where
                 },
                 C2CState::WriteFinal { reader, mut writer } => match writer.poll_write(cx) {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        self.state = Some(C2CState::WriteFinal { reader, writer });
-                        return Poll::Pending;
-                    }
+                    Poll::Pending => park!(self, C2CState::WriteFinal { reader, writer }),
                     Poll::Ready(Ok(())) => {
                         let reader = reader.into_parts();
                         let writer = writer.finish();
@@ -123,10 +123,7 @@ where
                 C2CState::ReadData { mut reader, writer } => {
                     match reader.poll_read(cx, READ_SIZE) {
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                        Poll::Pending => {
-                            self.state = Some(C2CState::ReadData { reader, writer });
-                            return Poll::Pending;
-                        }
+                        Poll::Pending => park!(self, C2CState::ReadData { reader, writer }),
                         Poll::Ready(Ok(None)) => {
                             let writer = writer.finish();
                             self.state = Some(C2CState::CloseChunk { reader, writer });
@@ -146,14 +143,7 @@ where
                     mut data,
                 } => match writer.poll_write(cx, &data) {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        self.state = Some(C2CState::WriteData {
-                            reader,
-                            writer,
-                            data,
-                        });
-                        return Poll::Pending;
-                    }
+                    Poll::Pending => park!(self, C2CState::WriteData { reader, writer, data }),
                     Poll::Ready(Ok(len)) => {
                         let _written = data.split_to(len);
                         self.state = if !data.is_empty() {
@@ -169,10 +159,7 @@ where
                 },
                 C2CState::CloseChunk { reader, mut writer } => match writer.poll_complete(cx) {
                     Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                    Poll::Pending => {
-                        self.state = Some(C2CState::CloseChunk { reader, writer });
-                        return Poll::Pending;
-                    }
+                    Poll::Pending => park!(self, C2CState::CloseChunk { reader, writer }),
                     Poll::Ready(Ok(())) => {
                         let reader = reader.finish();
                         let writer = writer.finish();
