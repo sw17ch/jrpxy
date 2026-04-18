@@ -87,6 +87,14 @@ pub struct ChunkToChunkBodyForwarder<R, W> {
     state: Option<C2CState<R, W>>,
 }
 
+impl<R, W> ChunkToChunkBodyForwarder<R, W> {
+    pub fn new(reader: ChunkHeadReader<R>, writer: IdleWriter<W>) -> Self {
+        Self {
+            state: Some(C2CState::ReadChunk { reader, writer }),
+        }
+    }
+}
+
 impl<R, W> ChunkToChunkBodyForwarder<R, W>
 where
     R: AsyncRead + Unpin,
@@ -270,6 +278,14 @@ pub struct ChunkToOtherBodyForwarder<R, W> {
     state: Option<C2OState<R, W>>,
 }
 
+impl<R, W> ChunkToOtherBodyForwarder<R, W> {
+    pub fn new(reader: ChunkHeadReader<R>, writer: OtherBodyWriter<W>) -> Self {
+        Self {
+            state: Some(C2OState::ReadChunk { reader, writer }),
+        }
+    }
+}
+
 impl<R, W> ChunkToOtherBodyForwarder<R, W>
 where
     R: AsyncRead + Unpin,
@@ -433,6 +449,14 @@ pub struct OtherToChunkedBodyForwarder<R, W> {
     state: Option<O2CState<R, W>>,
 }
 
+impl<R, W> OtherToChunkedBodyForwarder<R, W> {
+    pub fn new(reader: OtherBodyReader<R>, writer: IdleWriter<W>) -> Self {
+        Self {
+            state: Some(O2CState::ReadData { reader, writer }),
+        }
+    }
+}
+
 impl<R, W> OtherToChunkedBodyForwarder<R, W>
 where
     R: AsyncRead + Unpin,
@@ -566,6 +590,14 @@ pub struct OtherToOtherBodyForwarder<R, W> {
     state: Option<O2OState<R, W>>,
 }
 
+impl<R, W> OtherToOtherBodyForwarder<R, W> {
+    pub fn new(reader: OtherBodyReader<R>, writer: OtherBodyWriter<W>) -> Self {
+        Self {
+            state: Some(O2OState::ReadData { reader, writer }),
+        }
+    }
+}
+
 impl<R, W> OtherToOtherBodyForwarder<R, W>
 where
     R: AsyncRead + Unpin,
@@ -634,6 +666,52 @@ where
                 },
                 O2OState::Done { .. } => return Poll::Ready(Ok(())),
             }
+        }
+    }
+}
+
+pub enum BodyForwarder<R, W> {
+    C2C(ChunkToChunkBodyForwarder<R, W>),
+    C2O(ChunkToOtherBodyForwarder<R, W>),
+    O2C(OtherToChunkedBodyForwarder<R, W>),
+    O2O(OtherToOtherBodyForwarder<R, W>),
+}
+
+impl<R, W> From<ChunkToChunkBodyForwarder<R, W>> for BodyForwarder<R, W> {
+    fn from(f: ChunkToChunkBodyForwarder<R, W>) -> Self {
+        BodyForwarder::C2C(f)
+    }
+}
+
+impl<R, W> From<ChunkToOtherBodyForwarder<R, W>> for BodyForwarder<R, W> {
+    fn from(f: ChunkToOtherBodyForwarder<R, W>) -> Self {
+        BodyForwarder::C2O(f)
+    }
+}
+
+impl<R, W> From<OtherToChunkedBodyForwarder<R, W>> for BodyForwarder<R, W> {
+    fn from(f: OtherToChunkedBodyForwarder<R, W>) -> Self {
+        BodyForwarder::O2C(f)
+    }
+}
+
+impl<R, W> From<OtherToOtherBodyForwarder<R, W>> for BodyForwarder<R, W> {
+    fn from(f: OtherToOtherBodyForwarder<R, W>) -> Self {
+        BodyForwarder::O2O(f)
+    }
+}
+
+impl<R, W> BodyForwarder<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pub fn poll_forward(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        match self {
+            BodyForwarder::C2C(f) => f.poll_forward(cx),
+            BodyForwarder::C2O(f) => f.poll_forward(cx),
+            BodyForwarder::O2C(f) => f.poll_forward(cx),
+            BodyForwarder::O2O(f) => f.poll_forward(cx),
         }
     }
 }
