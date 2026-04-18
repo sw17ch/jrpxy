@@ -38,6 +38,11 @@
 //! }
 //! ```
 
+use std::{
+    future::poll_fn,
+    task::{Context, Poll, ready},
+};
+
 use bytes::Bytes;
 use jrpxy_body::reader::{BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader};
 use jrpxy_http_message::{
@@ -200,26 +205,37 @@ impl<I> FrontendContentLengthBodyReader<I> {
     pub fn content_length(&self) -> u64 {
         self.inner.content_length()
     }
+
+    pub fn finish(self) -> FrontendReader<I> {
+        let Self { inner } = self;
+        let (reader, parse_slots) = inner.finish();
+        FrontendReader {
+            reader,
+            parse_slots,
+        }
+    }
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendContentLengthBodyReader<I> {
     pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
-        self.inner
-            .read(max_len)
-            .await
-            .map_err(FrontendError::BodyReadError)
+        poll_fn(|cx| self.poll_read(cx, max_len)).await
     }
 
-    pub async fn drain(self) -> FrontendResult<FrontendReader<I>> {
-        let (reader, parse_slots) = self
-            .inner
-            .drain()
-            .await
-            .map_err(FrontendError::BodyReadError)?;
-        Ok(FrontendReader {
-            reader,
-            parse_slots,
-        })
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<FrontendResult<Option<Bytes>>> {
+        Poll::Ready(ready!(self.inner.poll_read(cx, max_len)).map_err(FrontendError::BodyReadError))
+    }
+
+    pub async fn drain(mut self) -> FrontendResult<FrontendReader<I>> {
+        poll_fn(|cx| self.poll_drain(cx)).await?;
+        Ok(self.finish())
+    }
+
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<FrontendResult<()>> {
+        Poll::Ready(ready!(self.inner.poll_drain(cx)).map_err(FrontendError::BodyReadError))
     }
 }
 
@@ -233,29 +249,39 @@ impl<I> FrontendChunkedBodyReader<I> {
     pub fn drained(&self) -> bool {
         self.inner.drained()
     }
-}
 
-impl<I: AsyncReadExt + Unpin> FrontendChunkedBodyReader<I> {
-    pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
-        self.inner
-            .read(max_len)
-            .await
-            .map_err(FrontendError::BodyReadError)
-    }
-
-    pub async fn drain(self) -> FrontendResult<(FrontendReader<I>, Headers)> {
-        let (reader, parse_slots, trailers) = self
-            .inner
-            .drain()
-            .await
-            .map_err(FrontendError::BodyReadError)?;
-        Ok((
+    pub fn finish(self) -> (FrontendReader<I>, Headers) {
+        let (reader, parse_slots, trailers) = self.inner.finish();
+        (
             FrontendReader {
                 reader,
                 parse_slots,
             },
             trailers,
-        ))
+        )
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> FrontendChunkedBodyReader<I> {
+    pub async fn read(&mut self, max_len: usize) -> FrontendResult<Option<Bytes>> {
+        poll_fn(|cx| self.poll_read(cx, max_len)).await
+    }
+
+    pub fn poll_read(
+        &mut self,
+        cx: &mut Context<'_>,
+        max_len: usize,
+    ) -> Poll<FrontendResult<Option<Bytes>>> {
+        Poll::Ready(ready!(self.inner.poll_read(cx, max_len)).map_err(FrontendError::BodyReadError))
+    }
+
+    pub async fn drain(mut self) -> FrontendResult<(FrontendReader<I>, Headers)> {
+        poll_fn(|cx| self.poll_drain(cx)).await?;
+        Ok(self.finish())
+    }
+
+    pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<FrontendResult<()>> {
+        Poll::Ready(ready!(self.inner.poll_drain(cx)).map_err(FrontendError::BodyReadError))
     }
 }
 

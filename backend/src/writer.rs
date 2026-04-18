@@ -1,6 +1,10 @@
-use jrpxy_body::writer::{
-    bodyless::BodylessBodyWriter, chunked::ChunkedBodyWriter,
-    content_length::ContentLengthBodyWriter,
+use jrpxy_body::{
+    error::BodyError,
+    writer::{
+        bodyless::BodylessBodyWriter,
+        chunked::{DataCompleter, DataWriter, FinalWriter, HeadWriter, IdleWriter},
+        content_length::ContentLengthBodyWriter,
+    },
 };
 use jrpxy_http_message::{
     framing::{WriteFraming, is_framing_header},
@@ -12,7 +16,7 @@ use std::{
     task::{Context, Poll},
 };
 
-use tokio::io::{self, AsyncWriteExt};
+use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 
 use crate::error::{BackendError, BackendResult};
 
@@ -30,7 +34,7 @@ impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
             .await
             .map_err(BackendError::WriteError)?;
         Ok(BackendBodyWriter::TE(BackendChunkedBodyWriter {
-            inner: ChunkedBodyWriter::new(writer),
+            state: Some(BackendChunkState::Idle(IdleWriter::new(writer))),
         }))
     }
 
@@ -174,27 +178,132 @@ impl<I: AsyncWriteExt + Unpin> BackendContentLengthBodyWriter<I> {
     }
 }
 
-/// Backend wrapper for [`ChunkedBodyWriter`]. Finishing it with trailers
+macro_rules! park {
+    ($self:expr, $state:expr) => {{
+        $self.state = Some($state);
+        return Poll::Pending;
+    }};
+}
+
+enum BackendChunkState<I> {
+    Idle(IdleWriter<I>),
+    WritingHead(HeadWriter<I>),
+    WritingData {
+        writer: DataWriter<I>,
+        written: usize,
+    },
+    WritingFooter(DataCompleter<I>),
+    WritingFinal(FinalWriter<I>),
+}
+
+/// Backend wrapper for a chunked body writer. Finishing it with trailers
 /// forwards them to the backend as chunked trailer fields.
 pub struct BackendChunkedBodyWriter<I> {
-    inner: ChunkedBodyWriter<I>,
+    /// `None` after an error or once the writer has been finished/aborted.
+    state: Option<BackendChunkState<I>>,
+}
+
+impl<I: AsyncWrite + Unpin> BackendChunkedBodyWriter<I> {
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<BackendResult<()>> {
+        if buf.is_empty() {
+            return Poll::Ready(Ok(()));
+        }
+        loop {
+            let state = match self.state.take() {
+                None => return ready_error(BodyError::WriteAfterError),
+                Some(s) => s,
+            };
+            match state {
+                BackendChunkState::Idle(idle) => {
+                    self.state = Some(BackendChunkState::WritingHead(idle.start(buf.len() as u64)));
+                }
+                BackendChunkState::WritingHead(mut head) => match head.poll_write(cx) {
+                    Poll::Pending => park!(self, BackendChunkState::WritingHead(head)),
+                    Poll::Ready(Err(e)) => return ready_error(e),
+                    Poll::Ready(Ok(())) => {
+                        self.state = Some(BackendChunkState::WritingData {
+                            writer: head.finish(),
+                            written: 0,
+                        });
+                    }
+                },
+                BackendChunkState::WritingData {
+                    mut writer,
+                    written,
+                } => match writer.poll_write(cx, &buf[written..]) {
+                    Poll::Pending => {
+                        park!(self, BackendChunkState::WritingData { writer, written })
+                    }
+                    Poll::Ready(Err(e)) => return ready_error(e),
+                    Poll::Ready(Ok(n)) => {
+                        let written = written + n;
+                        if writer.is_complete() {
+                            self.state = Some(BackendChunkState::WritingFooter(writer.finish()));
+                        } else {
+                            park!(self, BackendChunkState::WritingData { writer, written });
+                        }
+                    }
+                },
+                BackendChunkState::WritingFooter(mut footer) => match footer.poll_complete(cx) {
+                    Poll::Pending => park!(self, BackendChunkState::WritingFooter(footer)),
+                    Poll::Ready(Err(e)) => return ready_error(e),
+                    Poll::Ready(Ok(())) => {
+                        self.state = Some(BackendChunkState::Idle(footer.finish()));
+                        return Poll::Ready(Ok(()));
+                    }
+                },
+                BackendChunkState::WritingFinal(_) => {
+                    return ready_error(BodyError::WriteAfterError);
+                }
+            }
+        }
+    }
+
+    pub fn poll_finish_with_trailers(
+        &mut self,
+        cx: &mut Context<'_>,
+        trailers: &Headers,
+    ) -> Poll<BackendResult<BackendWriter<I>>> {
+        loop {
+            let state = match self.state.take() {
+                None => return ready_error(BodyError::WriteAfterError),
+                Some(s) => s,
+            };
+            match state {
+                BackendChunkState::Idle(idle) => {
+                    self.state = Some(BackendChunkState::WritingFinal(idle.into_final(trailers)));
+                }
+                BackendChunkState::WritingFinal(mut final_writer) => {
+                    match final_writer.poll_write(cx) {
+                        Poll::Pending => {
+                            park!(self, BackendChunkState::WritingFinal(final_writer))
+                        }
+                        Poll::Ready(Err(e)) => return ready_error(e),
+                        Poll::Ready(Ok(())) => {
+                            let writer = final_writer.finish();
+                            return Poll::Ready(Ok(BackendWriter::new(writer)));
+                        }
+                    }
+                }
+                other => {
+                    self.state = Some(other);
+                    return ready_error(BodyError::WriteAfterError);
+                }
+            }
+        }
+    }
 }
 
 impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyWriter<I> {
     pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
-        self.inner
-            .write(buf)
-            .await
-            .map_err(BackendError::BodyWriteError)
+        poll_fn(|cx| self.poll_write(cx, buf)).await
     }
 
-    pub async fn finish_with_trailers(self, trailers: &Headers) -> BackendResult<BackendWriter<I>> {
-        let io = self
-            .inner
-            .finish_with_trailers(trailers)
-            .await
-            .map_err(BackendError::BodyWriteError)?;
-        Ok(BackendWriter::new(io))
+    pub async fn finish_with_trailers(
+        mut self,
+        trailers: &Headers,
+    ) -> BackendResult<BackendWriter<I>> {
+        poll_fn(|cx| self.poll_finish_with_trailers(cx, trailers)).await
     }
 
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
@@ -202,10 +311,14 @@ impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyWriter<I> {
     }
 
     pub async fn abort(self) -> BackendResult<()> {
-        self.inner
-            .abort()
-            .await
-            .map_err(BackendError::BodyWriteError)?;
+        // Only write the abort byte when idle (between chunks). Mid-chunk,
+        // the partial write already leaves framing broken — which is the goal.
+        if let Some(BackendChunkState::Idle(idle)) = self.state {
+            idle.abort()
+                .write()
+                .await
+                .map_err(BackendError::BodyWriteError)?;
+        }
         Ok(())
     }
 }
@@ -243,6 +356,10 @@ impl<I: AsyncWriteExt + Unpin> BackendBodyWriter<I> {
             BackendBodyWriter::TE(w) => w.abort().await,
         }
     }
+}
+
+fn ready_error<T>(e: BodyError) -> Poll<BackendResult<T>> {
+    Poll::Ready(Err(BackendError::BodyWriteError(e)))
 }
 
 #[cfg(test)]
