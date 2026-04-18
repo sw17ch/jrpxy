@@ -222,10 +222,14 @@ impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
         }
     }
 
-    fn into_writer(self) -> BodyResult<W> {
+    fn into_writer(self) -> BodyResult<Option<W>> {
         match self {
-            OtherBodyWriter::ContentLength(w) => w.into_writer(),
-            OtherBodyWriter::Eof(w) => Ok(w),
+            OtherBodyWriter::ContentLength(w) => w.into_writer().map(Some),
+            // Do not allow extracting out the EOF writer. We drop it to
+            // indicate that things are finished. There's no way to indicate
+            // that something has gone wrong. Use non-EOF writers and readers if
+            // you want to avoid this ambiguous error condition.
+            OtherBodyWriter::Eof(_w) => Ok(None),
         }
     }
 }
@@ -258,7 +262,7 @@ pub enum C2OState<R, W> {
     },
     Done {
         reader: (BytesReader<R>, ParseSlots, Headers),
-        writer: W,
+        writer: Option<W>,
     },
 }
 
@@ -527,6 +531,108 @@ where
                     }
                 },
                 O2CState::Done { .. } => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+pub enum O2OState<R, W> {
+    /// Reading body bytes from the source. On data, transitions to
+    /// `WriteData`. On EOF/end, transitions to `FlushWriter`.
+    ReadData {
+        reader: OtherBodyReader<R>,
+        writer: OtherBodyWriter<W>,
+    },
+    /// Writing body bytes to the destination. When the buffer is empty,
+    /// transitions back to `ReadData`.
+    WriteData {
+        reader: OtherBodyReader<R>,
+        writer: OtherBodyWriter<W>,
+        data: Bytes,
+    },
+    /// All body bytes have been forwarded. Flush and validate the writer
+    /// (relevant for content-length), then transition to `Done`.
+    FlushWriter {
+        reader: OtherBodyReader<R>,
+        writer: OtherBodyWriter<W>,
+    },
+    Done {
+        reader: (ParseSlots, Option<BytesReader<R>>),
+        writer: Option<W>,
+    },
+}
+
+pub struct OtherToOtherBodyForwarder<R, W> {
+    state: Option<O2OState<R, W>>,
+}
+
+impl<R, W> OtherToOtherBodyForwarder<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pub fn poll_forward(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        loop {
+            let Some(state) = self.state.take() else {
+                return Poll::Ready(Err(BodyError::ForwardAfterError));
+            };
+            match state {
+                O2OState::ReadData { mut reader, writer } => {
+                    match reader.poll_read(cx, READ_SIZE) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => park!(self, O2OState::ReadData { reader, writer }),
+                        Poll::Ready(Ok(None)) => {
+                            self.state = Some(O2OState::FlushWriter { reader, writer });
+                        }
+                        Poll::Ready(Ok(Some(data))) => {
+                            self.state = Some(O2OState::WriteData {
+                                reader,
+                                writer,
+                                data,
+                            });
+                        }
+                    }
+                }
+                O2OState::WriteData {
+                    reader,
+                    mut writer,
+                    mut data,
+                } => match writer.poll_write(cx, &data) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(
+                        self,
+                        O2OState::WriteData {
+                            reader,
+                            writer,
+                            data
+                        }
+                    ),
+                    Poll::Ready(Ok(len)) => {
+                        let _written = data.split_to(len);
+                        self.state = if !data.is_empty() {
+                            Some(O2OState::WriteData {
+                                reader,
+                                writer,
+                                data,
+                            })
+                        } else {
+                            Some(O2OState::ReadData { reader, writer })
+                        };
+                    }
+                },
+                O2OState::FlushWriter { reader, mut writer } => match writer.poll_flush(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, O2OState::FlushWriter { reader, writer }),
+                    Poll::Ready(Ok(())) => {
+                        let writer = match writer.into_writer() {
+                            Ok(w) => w,
+                            Err(e) => return Poll::Ready(Err(e)),
+                        };
+                        let reader = reader.into_done();
+                        self.state = Some(O2OState::Done { reader, writer });
+                    }
+                },
+                O2OState::Done { .. } => return Poll::Ready(Ok(())),
             }
         }
     }
