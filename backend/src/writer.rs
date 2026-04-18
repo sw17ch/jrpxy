@@ -193,7 +193,6 @@ enum BackendChunkState<I> {
         written: usize,
     },
     WritingFooter(DataCompleter<I>),
-    WritingFinal(FinalWriter<I>),
 }
 
 /// Backend wrapper for a chunked body writer. Finishing it with trailers
@@ -203,7 +202,25 @@ pub struct BackendChunkedBodyWriter<I> {
     state: Option<BackendChunkState<I>>,
 }
 
+impl<I> BackendChunkedBodyWriter<I> {
+    /// Consume the writer and return a [`BackendChunkedBodyFinisher`] that
+    /// writes the terminal chunk and trailers. Returns an error if the writer
+    /// is not at a chunk boundary (i.e. not in the idle state).
+    pub fn into_finisher(self, trailers: &Headers) -> BackendResult<BackendChunkedBodyFinisher<I>> {
+        match self.state {
+            Some(BackendChunkState::Idle(idle)) => Ok(BackendChunkedBodyFinisher {
+                inner: Some(idle.into_final(trailers)),
+            }),
+            _ => Err(BackendError::BodyWriteError(BodyError::WriteAfterError)),
+        }
+    }
+}
+
 impl<I: AsyncWrite + Unpin> BackendChunkedBodyWriter<I> {
+    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
+        poll_fn(|cx| self.poll_write(cx, buf)).await
+    }
+
     pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<BackendResult<()>> {
         if buf.is_empty() {
             return Poll::Ready(Ok(()));
@@ -252,58 +269,12 @@ impl<I: AsyncWrite + Unpin> BackendChunkedBodyWriter<I> {
                         return Poll::Ready(Ok(()));
                     }
                 },
-                BackendChunkState::WritingFinal(_) => {
-                    return ready_error(BodyError::WriteAfterError);
-                }
             }
         }
     }
 
-    pub fn poll_finish_with_trailers(
-        &mut self,
-        cx: &mut Context<'_>,
-        trailers: &Headers,
-    ) -> Poll<BackendResult<BackendWriter<I>>> {
-        loop {
-            let state = match self.state.take() {
-                None => return ready_error(BodyError::WriteAfterError),
-                Some(s) => s,
-            };
-            match state {
-                BackendChunkState::Idle(idle) => {
-                    self.state = Some(BackendChunkState::WritingFinal(idle.into_final(trailers)));
-                }
-                BackendChunkState::WritingFinal(mut final_writer) => {
-                    match final_writer.poll_write(cx) {
-                        Poll::Pending => {
-                            park!(self, BackendChunkState::WritingFinal(final_writer))
-                        }
-                        Poll::Ready(Err(e)) => return ready_error(e),
-                        Poll::Ready(Ok(())) => {
-                            let writer = final_writer.finish();
-                            return Poll::Ready(Ok(BackendWriter::new(writer)));
-                        }
-                    }
-                }
-                other => {
-                    self.state = Some(other);
-                    return ready_error(BodyError::WriteAfterError);
-                }
-            }
-        }
-    }
-}
-
-impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyWriter<I> {
-    pub async fn write(&mut self, buf: &[u8]) -> BackendResult<()> {
-        poll_fn(|cx| self.poll_write(cx, buf)).await
-    }
-
-    pub async fn finish_with_trailers(
-        mut self,
-        trailers: &Headers,
-    ) -> BackendResult<BackendWriter<I>> {
-        poll_fn(|cx| self.poll_finish_with_trailers(cx, trailers)).await
+    pub async fn finish_with_trailers(self, trailers: &Headers) -> BackendResult<BackendWriter<I>> {
+        self.into_finisher(trailers)?.finish().await
     }
 
     pub async fn finish(self) -> BackendResult<BackendWriter<I>> {
@@ -320,6 +291,34 @@ impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyWriter<I> {
                 .map_err(BackendError::BodyWriteError)?;
         }
         Ok(())
+    }
+}
+
+/// Writes the terminal chunk and trailers for a chunked backend request.
+/// Obtained from [`BackendChunkedBodyWriter::into_finisher`].
+pub struct BackendChunkedBodyFinisher<I> {
+    inner: Option<FinalWriter<I>>,
+}
+
+impl<I: AsyncWrite + Unpin> BackendChunkedBodyFinisher<I> {
+    pub fn poll_finish(&mut self, cx: &mut Context<'_>) -> Poll<BackendResult<BackendWriter<I>>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return ready_error(BodyError::WriteAfterError);
+        };
+        match inner.poll_write(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => ready_error(e),
+            Poll::Ready(Ok(())) => {
+                let writer = self.inner.take().unwrap().finish();
+                Poll::Ready(Ok(BackendWriter::new(writer)))
+            }
+        }
+    }
+}
+
+impl<I: AsyncWriteExt + Unpin> BackendChunkedBodyFinisher<I> {
+    pub async fn finish(mut self) -> BackendResult<BackendWriter<I>> {
+        poll_fn(|cx| self.poll_finish(cx)).await
     }
 }
 
