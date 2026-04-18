@@ -30,6 +30,8 @@ pub enum BodyError {
     ReadAfterError,
     #[error("Attempted to write after previous failure")]
     WriteAfterError,
+    #[error("Attempted to forward after previous failure")]
+    ForwardAfterError,
 }
 
 impl From<ReaderBufferError> for BodyError {
