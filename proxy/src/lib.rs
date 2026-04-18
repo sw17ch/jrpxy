@@ -969,7 +969,15 @@ where
                             match (backend_body_reader, frontend_body_writer) {
                                 (BackendBodyReader::TE(br), FrontendBodyWriter::TE(fw)) => {
                                     let (next_backend, trailers) = br.drain().await?;
-                                    let next_frontend = fw.finish_with_trailers(&trailers).await?;
+                                    let next_frontend = fw
+                                        // TODO: it's a bit odd to be exposed to
+                                        // this failure mode. I suspect it goes
+                                        // away when we implement a
+                                        // BackendToFrontendBodyCopier.
+                                        .ok_or(ProxyCopyError::FrontendWriterGone)?
+                                        .into_finisher(&trailers)
+                                        .finish()
+                                        .await?;
                                     Ok((Some(next_backend), Some(next_frontend)))
                                 }
                                 (br, fw) => {

@@ -180,6 +180,8 @@ impl<I> HeadWriter<I> {
     /// Panics if the chunk header has not been fully written via
     /// [`Self::poll_write`].
     pub fn finish(self) -> DataWriter<I> {
+        // TODO: we should have this return an error rather than a panic when
+        // not fully written.
         assert_eq!(
             self.written, self.header_len,
             "attempted to finish chunk head writer before header was fully written"

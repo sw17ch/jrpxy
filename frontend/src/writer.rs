@@ -73,7 +73,7 @@ use jrpxy_body::{
     error::BodyError,
     writer::{
         bodyless::BodylessBodyWriter,
-        chunked::{DataCompleter, DataWriter, FinalWriter, HeadWriter, IdleWriter},
+        chunked::{AbortWriter, DataCompleter, DataWriter, FinalWriter, HeadWriter, IdleWriter},
         content_length::ContentLengthBodyWriter,
     },
 };
@@ -141,9 +141,9 @@ impl<I: AsyncWriteExt + Unpin> FrontendWriter<I> {
         write_response_to(response, WriteFraming::Chunked, &mut writer)
             .await
             .map_err(FrontendError::WriteError)?;
-        Ok(FrontendBodyWriter::TE(FrontendChunkedBodyWriter {
-            state: Some(FrontendChunkState::Idle(IdleWriter::new(writer))),
-        }))
+        Ok(FrontendBodyWriter::TE(Some(FrontendIdleWriter {
+            inner: IdleWriter::new(writer),
+        })))
     }
 
     /// Send the specified response with a content-length delimited response
@@ -358,136 +358,202 @@ impl<I: AsyncWriteExt + Unpin> FrontendContentLengthBodyWriter<I> {
     }
 }
 
-macro_rules! park {
-    ($self:expr, $state:expr) => {{
-        $self.state = Some($state);
-        return Poll::Pending;
-    }};
+/// Frontend typestate wrapper for [`IdleWriter`]. Represents a chunked body
+/// writer at a chunk boundary, ready to begin a new chunk or finish the body.
+pub struct FrontendIdleWriter<I> {
+    inner: IdleWriter<I>,
 }
 
-enum FrontendChunkState<I> {
-    Idle(IdleWriter<I>),
-    WritingHead(HeadWriter<I>),
-    WritingData {
-        writer: DataWriter<I>,
-        written: usize,
-    },
-    WritingFooter(DataCompleter<I>),
-}
+impl<I> FrontendIdleWriter<I> {
+    /// Begin a new chunk of the given length, returning a [`FrontendHeadWriter`]
+    /// that will write the chunk header.
+    pub fn start(self, chunk_length: u64) -> FrontendHeadWriter<I> {
+        FrontendHeadWriter {
+            inner: self.inner.start(chunk_length),
+        }
+    }
 
-/// Frontend wrapper for a chunked body writer. Finishing it with trailers
-/// forwards them to the frontend as chunked trailer fields.
-pub struct FrontendChunkedBodyWriter<I> {
-    /// `None` after an error or once the writer has been finished/aborted.
-    state: Option<FrontendChunkState<I>>,
-}
-
-impl<I> FrontendChunkedBodyWriter<I> {
     /// Consume the writer and return a [`FrontendChunkedBodyFinisher`] that
-    /// writes the terminal chunk and trailers. Returns an error if the writer
-    /// is not at a chunk boundary (i.e. not in the idle state).
-    pub fn into_finisher(
-        self,
-        trailers: &Headers,
-    ) -> FrontendResult<FrontendChunkedBodyFinisher<I>> {
-        match self.state {
-            Some(FrontendChunkState::Idle(idle)) => Ok(FrontendChunkedBodyFinisher {
-                inner: Some(idle.into_final(trailers)),
-            }),
-            _ => Err(FrontendError::BodyWriteError(BodyError::WriteAfterError)),
+    /// writes the terminal zero-lengthed chunk and any trailers.
+    pub fn into_finisher(self, trailers: &Headers) -> FrontendChunkedBodyFinisher<I> {
+        FrontendChunkedBodyFinisher {
+            inner: Some(self.inner.into_final(trailers)),
+        }
+    }
+
+    /// Consume the writer and return a [`FrontendChunkedBodyAborter`] that
+    /// writes the abort byte (`x`) and flushes.
+    pub fn into_aborter(self) -> FrontendChunkedBodyAborter<I> {
+        FrontendChunkedBodyAborter {
+            inner: Some(self.inner.abort()),
         }
     }
 }
 
-impl<I: AsyncWrite + Unpin> FrontendChunkedBodyWriter<I> {
-    pub async fn write(&mut self, buf: &[u8]) -> FrontendResult<()> {
-        poll_fn(|cx| self.poll_write(cx, buf)).await
+impl<I: AsyncWrite + Unpin> FrontendIdleWriter<I> {
+    /// Write a single complete chunk (head + data + footer). Returns the updated
+    /// [`FrontendIdleWriter`] ready for the next chunk on success.
+    ///
+    /// No-ops when `buf` is empty to avoid writing a zero-length chunk.
+    pub async fn write(self, buf: &[u8]) -> FrontendResult<Self> {
+        if buf.is_empty() {
+            return Ok(self);
+        }
+        let idle = self
+            .inner
+            .start(buf.len() as u64)
+            .write()
+            .await
+            .map_err(FrontendError::BodyWriteError)?
+            .write(buf)
+            .await
+            .map_err(FrontendError::BodyWriteError)?
+            .write()
+            .await
+            .map_err(FrontendError::BodyWriteError)?;
+        Ok(FrontendIdleWriter { inner: idle })
+    }
+}
+
+/// Frontend typestate wrapper for [`HeadWriter`]. Writes the chunk header. Call
+/// [`finish`](FrontendHeadWriter::finish) to obtain a [`FrontendDataWriter`]
+/// once [`poll_write`](FrontendHeadWriter::poll_write) completes.
+pub struct FrontendHeadWriter<I> {
+    inner: HeadWriter<I>,
+}
+
+impl<I: AsyncWrite + Unpin> FrontendHeadWriter<I> {
+    /// Write the entire chunk header, returning a [`FrontendDataWriter`] on
+    /// success.
+    pub async fn write(mut self) -> FrontendResult<FrontendDataWriter<I>> {
+        poll_fn(|cx| self.poll_write(cx)).await?;
+        Ok(self.finish())
     }
 
-    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<FrontendResult<()>> {
-        if buf.is_empty() {
-            return Poll::Ready(Ok(()));
+    pub fn poll_write(&mut self, cx: &mut Context<'_>) -> Poll<FrontendResult<()>> {
+        self.inner
+            .poll_write(cx)
+            .map_err(FrontendError::BodyWriteError)
+    }
+
+    /// Finish the head writer and return a [`FrontendDataWriter`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chunk header has not been fully written via
+    /// [`Self::poll_write`].
+    pub fn finish(self) -> FrontendDataWriter<I> {
+        FrontendDataWriter {
+            inner: self.inner.finish(),
         }
-        loop {
-            let state = match self.state.take() {
-                None => {
-                    return ready_error(BodyError::WriteAfterError);
-                }
-                Some(s) => s,
-            };
-            match state {
-                FrontendChunkState::Idle(idle) => {
-                    self.state = Some(FrontendChunkState::WritingHead(
-                        idle.start(buf.len() as u64),
-                    ));
-                }
-                FrontendChunkState::WritingHead(mut head) => match head.poll_write(cx) {
-                    Poll::Pending => park!(self, FrontendChunkState::WritingHead(head)),
-                    Poll::Ready(Err(e)) => return ready_error(e),
-                    Poll::Ready(Ok(())) => {
-                        self.state = Some(FrontendChunkState::WritingData {
-                            writer: head.finish(),
-                            written: 0,
-                        });
-                    }
-                },
-                FrontendChunkState::WritingData {
-                    mut writer,
-                    written,
-                } => match writer.poll_write(cx, &buf[written..]) {
-                    Poll::Pending => {
-                        park!(self, FrontendChunkState::WritingData { writer, written })
-                    }
-                    Poll::Ready(Err(e)) => return ready_error(e),
-                    Poll::Ready(Ok(n)) => {
-                        let written = written + n;
-                        if writer.is_complete() {
-                            self.state = Some(FrontendChunkState::WritingFooter(writer.finish()));
-                        } else {
-                            park!(self, FrontendChunkState::WritingData { writer, written });
-                        }
-                    }
-                },
-                FrontendChunkState::WritingFooter(mut footer) => match footer.poll_complete(cx) {
-                    Poll::Pending => park!(self, FrontendChunkState::WritingFooter(footer)),
-                    Poll::Ready(Err(e)) => return ready_error(e),
-                    Poll::Ready(Ok(())) => {
-                        self.state = Some(FrontendChunkState::Idle(footer.finish()));
-                        return Poll::Ready(Ok(()));
-                    }
-                },
+    }
+}
+
+/// Frontend typestate wrapper for [`DataWriter`]. Writes the data bytes of a
+/// single chunk.
+pub struct FrontendDataWriter<I> {
+    inner: DataWriter<I>,
+}
+
+impl<I> FrontendDataWriter<I> {
+    /// Returns `true` when all declared bytes have been written.
+    pub fn is_complete(&self) -> bool {
+        self.inner.is_complete()
+    }
+
+    /// Finish the data writer and return a [`FrontendDataCompleter`].
+    ///
+    /// # Panics
+    ///
+    /// Panics if all declared bytes have not been written via
+    /// [`Self::poll_write`].
+    pub fn finish(self) -> FrontendDataCompleter<I> {
+        FrontendDataCompleter {
+            inner: self.inner.finish(),
+        }
+    }
+}
+
+impl<I: AsyncWrite + Unpin> FrontendDataWriter<I> {
+    pub async fn write_all(mut self, mut buf: &[u8]) -> FrontendResult<()> {
+        while !buf.is_empty() {
+            let written = poll_fn(|cx| self.poll_write(cx, buf)).await?;
+            let (_written, rest) = buf.split_at(written);
+            buf = rest;
+        }
+        Ok(())
+    }
+
+    pub fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<FrontendResult<usize>> {
+        self.inner
+            .poll_write(cx, buf)
+            .map_err(FrontendError::BodyWriteError)
+    }
+}
+
+/// Frontend typestate wrapper for [`DataCompleter`]. Writes the chunk footer
+/// (`\r\n`).
+pub struct FrontendDataCompleter<I> {
+    inner: DataCompleter<I>,
+}
+
+impl<I> FrontendDataCompleter<I> {
+    /// Finish the completer and return a [`FrontendIdleWriter`] ready for the
+    /// next chunk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the chunk footer has not been fully written via
+    /// [`Self::poll_complete`].
+    pub fn into_idle_writer(self) -> FrontendIdleWriter<I> {
+        FrontendIdleWriter {
+            inner: self.inner.finish(),
+        }
+    }
+}
+
+impl<I: AsyncWrite + Unpin> FrontendDataCompleter<I> {
+    /// Write the chunk footer, returning a [`FrontendIdleWriter`] on success.
+    pub async fn complete(mut self) -> FrontendResult<FrontendIdleWriter<I>> {
+        poll_fn(|cx| self.poll_complete(cx)).await?;
+        Ok(self.into_idle_writer())
+    }
+
+    pub fn poll_complete(&mut self, cx: &mut Context<'_>) -> Poll<FrontendResult<()>> {
+        self.inner
+            .poll_complete(cx)
+            .map_err(FrontendError::BodyWriteError)
+    }
+}
+
+/// Aborts a chunked frontend response by writing an invalid chunk header byte
+/// (`x`) and flushing.
+pub struct FrontendChunkedBodyAborter<I> {
+    /// `None` once the abort has been written and flushed.
+    inner: Option<AbortWriter<I>>,
+}
+
+impl<I: AsyncWrite + Unpin> FrontendChunkedBodyAborter<I> {
+    pub async fn abort(mut self) -> FrontendResult<()> {
+        poll_fn(|cx| self.poll_abort(cx)).await
+    }
+
+    pub fn poll_abort(&mut self, cx: &mut Context<'_>) -> Poll<FrontendResult<()>> {
+        let Some(inner) = self.inner.as_mut() else {
+            return ready_error(BodyError::WriteAfterError);
+        };
+        match inner.poll_abort(cx) {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Err(e)) => ready_error(e),
+            Poll::Ready(Ok(())) => {
+                self.inner = None;
+                Poll::Ready(Ok(()))
             }
         }
     }
 }
 
-impl<I: AsyncWriteExt + Unpin> FrontendChunkedBodyWriter<I> {
-    pub async fn finish_with_trailers(
-        self,
-        trailers: &Headers,
-    ) -> FrontendResult<FrontendWriter<I>> {
-        self.into_finisher(trailers)?.finish().await
-    }
-
-    pub async fn finish(self) -> FrontendResult<FrontendWriter<I>> {
-        self.finish_with_trailers(&Default::default()).await
-    }
-
-    pub async fn abort(self) -> FrontendResult<()> {
-        // Only write the abort byte when idle (between chunks). Mid-chunk,
-        // the partial write already leaves framing broken — which is the goal.
-        if let Some(FrontendChunkState::Idle(idle)) = self.state {
-            idle.abort()
-                .write()
-                .await
-                .map_err(FrontendError::BodyWriteError)?;
-        }
-        Ok(())
-    }
-}
-
 /// Writes the terminal chunk and trailers for a chunked frontend response.
-/// Obtained from [`FrontendChunkedBodyWriter::into_finisher`].
 pub struct FrontendChunkedBodyFinisher<I> {
     inner: Option<FinalWriter<I>>,
 }
@@ -519,7 +585,7 @@ impl<I: AsyncWriteExt + Unpin> FrontendChunkedBodyFinisher<I> {
 pub enum FrontendBodyWriter<I> {
     Bodyless(FrontendBodylessBodyWriter<I>),
     CL(FrontendContentLengthBodyWriter<I>),
-    TE(FrontendChunkedBodyWriter<I>),
+    TE(Option<FrontendIdleWriter<I>>),
     Close(FrontendEofBodyWriter<I>),
 }
 
@@ -530,7 +596,13 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
                 jrpxy_body::error::BodyError::BodyOverflow(buf.len() as u64),
             )),
             FrontendBodyWriter::CL(w) => w.write(buf).await,
-            FrontendBodyWriter::TE(w) => w.write(buf).await,
+            FrontendBodyWriter::TE(opt) => {
+                let idle = opt
+                    .take()
+                    .ok_or(FrontendError::BodyWriteError(BodyError::WriteAfterError))?;
+                *opt = Some(idle.write(buf).await?);
+                Ok(())
+            }
             FrontendBodyWriter::Close(w) => w.write(buf).await,
         }
     }
@@ -539,7 +611,13 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
         match self {
             FrontendBodyWriter::Bodyless(w) => w.finish().map(Some),
             FrontendBodyWriter::CL(w) => w.finish().await.map(Some),
-            FrontendBodyWriter::TE(w) => w.finish().await.map(Some),
+            FrontendBodyWriter::TE(opt) => {
+                let idle = opt.ok_or(FrontendError::BodyWriteError(BodyError::WriteAfterError))?;
+                idle.into_finisher(&Default::default())
+                    .finish()
+                    .await
+                    .map(Some)
+            }
             FrontendBodyWriter::Close(w) => {
                 let () = w.finish().await?;
                 Ok(None)
@@ -552,7 +630,14 @@ impl<I: AsyncWriteExt + Unpin> FrontendBodyWriter<I> {
             FrontendBodyWriter::Bodyless(_)
             | FrontendBodyWriter::CL(_)
             | FrontendBodyWriter::Close(_) => Ok(()),
-            FrontendBodyWriter::TE(w) => w.abort().await,
+            FrontendBodyWriter::TE(opt) => {
+                // Only write the abort byte when idle (between chunks). Mid-chunk,
+                // the partial write already leaves framing broken — which is the goal.
+                if let Some(idle) = opt {
+                    idle.into_aborter().abort().await?;
+                }
+                Ok(())
+            }
         }
     }
 }

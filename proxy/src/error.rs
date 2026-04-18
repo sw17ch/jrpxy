@@ -46,6 +46,8 @@ pub enum ProxyCopyError {
     FrontendError(#[from] FrontendError),
     #[error("Backend Error: {0}")]
     BackendError(#[from] BackendError),
+    #[error("The frontend writer went away while processing copying")]
+    FrontendWriterGone,
 }
 
 pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
