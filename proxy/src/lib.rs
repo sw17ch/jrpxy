@@ -23,16 +23,14 @@ use jrpxy_http_message::{
 use jrpxy_util::parse::is_valid_tchar;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-mod alt_body_forwarder;
 pub mod backend_writer;
 pub mod body_forwarder;
 pub mod error;
 pub mod frontend_writer;
-pub mod request_forwarder;
-pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
-use crate::error::ProxyBackendError;
-pub use crate::error::ProxyFrontendError;
+use crate::error::{
+    ProxyBackendError, ProxyCopyError, ProxyError, ProxyFrontendError, ProxyResult,
+};
 
 /// Options used to govern the behavior of a [`ProxyClient`]
 #[derive(Debug)]

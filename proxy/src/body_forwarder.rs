@@ -1,29 +1,76 @@
-use bytes::{Buf, Bytes};
-use jrpxy_backend::error::BackendError;
+use std::{
+    pin::Pin,
+    task::{Context, Poll},
+};
+
+use bytes::Bytes;
 use jrpxy_body::{
-    error::BodyError,
+    error::{BodyError, BodyResult},
+    reader::{
+        ChunkDataReader, ChunkHeadReader, ContentLengthBodyReader, EofBodyReader, FinalChunkReader,
+        NextChunk,
+    },
     writer::{
-        bodyless::BodylessBodyWriter,
         chunked::{DataCompleter, DataWriter, FinalWriter, HeadWriter, IdleWriter},
         content_length::ContentLengthBodyWriter,
     },
 };
-use jrpxy_frontend::{
-    error::FrontendResult,
-    reader::{FrontendBodyReader, FrontendChunkedBodyReader, FrontendContentLengthBodyReader},
-};
-use jrpxy_http_message::header::Headers;
-use std::{
-    future::poll_fn,
-    task::{Context, Poll},
-};
+use jrpxy_http_message::{header::Headers, message::ParseSlots};
+use jrpxy_util::io_buffer::BytesReader;
 use tokio::io::{AsyncRead, AsyncWrite};
 
-use crate::{
-    backend_writer::{ProxyBackendBodyWriter, ProxyBackendWriter},
-    error::ProxyCopyError,
-};
+// Assume we can glob length and eof into the same operations, we need the
+// following writers. ChunkToChunkBodyForwarder lets us preserve what we can
+// from chunk encoding.
+//
+// We will also make OtherToChunkedBodyForwarder and
+// ChunkedToOtherBodyForwarder.
 
+pub enum C2CState<R, W> {
+    /// On final chunk, transitions to `WriteFinal`. On normal chunk,
+    /// transitions to `WriteChunk`.
+    ReadChunk {
+        reader: ChunkHeadReader<R>,
+        writer: IdleWriter<W>,
+    },
+    // Once the chunk header has been written, transition to `ReadData`.
+    WriteChunk {
+        reader: ChunkDataReader<R>,
+        writer: HeadWriter<W>,
+    },
+    // Once the final chunk has been written, transition to `Done`.
+    WriteFinal {
+        reader: FinalChunkReader<R>,
+        writer: FinalWriter<W>,
+    },
+    // When more data is read, transition to `WriteData`. If no more data is read,
+    // transition to `CloseChunk`. Data may arrive in multiple reads.
+    ReadData {
+        reader: ChunkDataReader<R>,
+        writer: DataWriter<W>,
+    },
+    // When there is no more data to write, transition to `ReadData`.
+    WriteData {
+        reader: ChunkDataReader<R>,
+        writer: DataWriter<W>,
+        data: Bytes,
+    },
+    // After the chunk is closed, transition to `ReadChunk`.
+    CloseChunk {
+        reader: ChunkDataReader<R>,
+        writer: DataCompleter<W>,
+    },
+    // When we reach the terminal `Done` state, we no longer transition.
+    Done {
+        reader: (BytesReader<R>, ParseSlots, Headers),
+        writer: W,
+    },
+}
+
+const READ_SIZE: usize = 8192;
+
+/// Store `$state` and return `Poll::Pending` atomically, preventing the
+/// common mistake of storing state without returning.
 macro_rules! park {
     ($self:expr, $state:expr) => {{
         $self.state = Some($state);
@@ -31,196 +78,79 @@ macro_rules! park {
     }};
 }
 
-macro_rules! bail {
-    ($e:expr) => {{
-        return Poll::Ready(Err($e));
-    }};
+pub struct ChunkToChunkBodyForwarder<R, W> {
+    state: Option<C2CState<R, W>>,
 }
 
-/// Forwards a frontend request body to a backend body writer, driven by
-/// polling. Handles all framing combinations:
-///
-/// - **TE->TE**: body is re-chunked (chunk boundaries are not preserved).
-/// - **CL->TE**: content-length body re-framed as chunked.
-/// - **TE->CL**: chunked body re-framed as content-length.
-/// - **CL->CL**: content-length body forwarded verbatim.
-/// - **Bodyless->any**: writer is immediately finished.
-pub struct ProxyBodyForwarder<FR, BW> {
-    state: Option<State<FR, BW>>,
-    chunk_size: usize,
-}
+impl<R, W> ChunkToChunkBodyForwarder<R, W> {
+    pub fn new(reader: ChunkHeadReader<R>, writer: IdleWriter<W>) -> Self {
+        Self {
+            state: Some(C2CState::ReadChunk { reader, writer }),
+        }
+    }
 
-impl<FR, BW> ProxyBodyForwarder<FR, BW> {
-    /// Create a new forwarder from a frontend body reader and a backend body
-    /// writer.
-    ///
-    /// Returns an error for invalid framing combinations (a body-carrying
-    /// reader paired with a bodyless writer).
-    pub fn new(
-        reader: FrontendBodyReader<FR>,
-        body_writer: ProxyBackendBodyWriter<BW>,
-        chunk_size: usize,
-    ) -> Result<Self, ProxyCopyError> {
-        let state = match (reader, body_writer) {
-            // Bodyless reader: immediately finish the writer, regardless of
-            // which framing the backend expects.
-            (FrontendBodyReader::Bodyless(_), ProxyBackendBodyWriter::Bodyless(w)) => {
-                State::BodylessFinish(w)
-            }
-            (FrontendBodyReader::Bodyless(_), ProxyBackendBodyWriter::CL(w)) => State::FlushCL(w),
-            (FrontendBodyReader::Bodyless(_), ProxyBackendBodyWriter::TE(idle)) => {
-                State::WriteFinal(idle.into_final(&Headers::default()))
-            }
-
-            // Body-carrying reader with bodyless writer: the proxy should not
-            // create this combination; return an error.
-            (FrontendBodyReader::CL(_), ProxyBackendBodyWriter::Bodyless(_))
-            | (FrontendBodyReader::TE(_), ProxyBackendBodyWriter::Bodyless(_)) => {
-                return Err(backend_write_error(BodyError::BodyOverflow(0)));
-            }
-
-            // Any body reader -> TE backend: rechunk whatever bytes arrive.
-            (FrontendBodyReader::CL(r), ProxyBackendBodyWriter::TE(idle)) => State::ToChunkRead {
-                reader: BodyReader::CL(r),
-                writer: idle,
-            },
-            (FrontendBodyReader::TE(r), ProxyBackendBodyWriter::TE(idle)) => State::ToChunkRead {
-                reader: BodyReader::TE(r),
-                writer: idle,
-            },
-
-            // Any body reader -> CL backend: stream bytes verbatim.
-            (FrontendBodyReader::CL(r), ProxyBackendBodyWriter::CL(w)) => State::ToCLRead {
-                reader: BodyReader::CL(r),
-                writer: w,
-            },
-            (FrontendBodyReader::TE(r), ProxyBackendBodyWriter::CL(w)) => State::ToCLRead {
-                reader: BodyReader::TE(r),
-                writer: w,
-            },
-        };
-
-        Ok(Self {
-            state: Some(state),
-            chunk_size,
-        })
+    /// Recover the writer after [`poll_forward`](Self::poll_forward) returns
+    /// `Ready(Ok(()))`. Panics if forwarding has not completed.
+    pub fn into_writer(self) -> W {
+        match self.state {
+            Some(C2CState::Done { writer, .. }) => writer,
+            _ => panic!("into_writer() called before poll_forward completed"),
+        }
     }
 }
 
-impl<FR, BW> ProxyBodyForwarder<FR, BW>
+impl<R, W> ChunkToChunkBodyForwarder<R, W>
 where
-    FR: AsyncRead + Unpin,
-    BW: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
 {
-    /// Poll the forwarder, advancing the body copy. Returns `Ready(Ok(()))` when
-    /// the body has been fully forwarded; call [`finish`](Self::finish) after
-    /// that to recover the backend writer.
-    pub fn poll_forward(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), ProxyCopyError>> {
+    pub fn poll_forward(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
         loop {
             let Some(state) = self.state.take() else {
-                return Poll::Ready(Err(ProxyCopyError::BackendWriterGone));
+                return Poll::Ready(Err(BodyError::ForwardAfterError));
             };
-
             match state {
-                // Read the next buffer; create a same-sized chunk on the backend.
-                State::ToChunkRead { mut reader, writer } => {
-                    match reader.poll_read(cx, self.chunk_size) {
-                        Poll::Pending => park!(self, State::ToChunkRead { reader, writer }),
-                        Poll::Ready(Err(e)) => bail!(ProxyCopyError::FrontendError(e)),
+                C2CState::ReadChunk { mut reader, writer } => match reader.poll_read_chunk(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, C2CState::ReadChunk { reader, writer }),
+                    Poll::Ready(Ok(())) => match reader.finish() {
+                        NextChunk::Data(reader) => {
+                            let writer = writer.start(reader.size());
+                            self.state = Some(C2CState::WriteChunk { reader, writer })
+                        }
+                        NextChunk::Final(reader) => {
+                            let writer = writer.into_final(reader.trailers());
+                            self.state = Some(C2CState::WriteFinal { reader, writer })
+                        }
+                    },
+                },
+                C2CState::WriteChunk { reader, mut writer } => match writer.poll_write(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, C2CState::WriteChunk { reader, writer }),
+                    Poll::Ready(Ok(())) => {
+                        let writer = writer.finish();
+                        self.state = Some(C2CState::ReadData { reader, writer });
+                    }
+                },
+                C2CState::WriteFinal { reader, mut writer } => match writer.poll_write(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, C2CState::WriteFinal { reader, writer }),
+                    Poll::Ready(Ok(())) => {
+                        let reader = reader.into_parts();
+                        let writer = writer.finish();
+                        self.state = Some(C2CState::Done { reader, writer });
+                    }
+                },
+                C2CState::ReadData { mut reader, writer } => {
+                    match reader.poll_read(cx, READ_SIZE) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => park!(self, C2CState::ReadData { reader, writer }),
                         Poll::Ready(Ok(None)) => {
-                            // Body fully read; write the terminal chunk.
-                            self.state =
-                                Some(State::WriteFinal(writer.into_final(&Headers::default())));
+                            let writer = writer.finish();
+                            self.state = Some(C2CState::CloseChunk { reader, writer });
                         }
                         Poll::Ready(Ok(Some(data))) => {
-                            let head = writer.start(data.len() as u64);
-                            self.state = Some(State::ToChunkWriteHead {
-                                reader,
-                                writer: head,
-                                data,
-                            });
-                        }
-                    }
-                }
-
-                // Write the backend chunk header for the current data buffer.
-                State::ToChunkWriteHead {
-                    reader,
-                    mut writer,
-                    data,
-                } => match writer.poll_write(cx) {
-                    Poll::Pending => park!(
-                        self,
-                        State::ToChunkWriteHead {
-                            reader,
-                            writer,
-                            data
-                        }
-                    ),
-                    Poll::Ready(Err(e)) => bail!(backend_write_error(e)),
-                    Poll::Ready(Ok(())) => {
-                        self.state = Some(State::ToChunkWriteData {
-                            reader,
-                            writer: writer.finish(),
-                            data,
-                        });
-                    }
-                },
-
-                // Write the data bytes of the current chunk.
-                State::ToChunkWriteData {
-                    reader,
-                    mut writer,
-                    mut data,
-                } => match writer.poll_write(cx, &data) {
-                    Poll::Pending => park!(
-                        self,
-                        State::ToChunkWriteData {
-                            reader,
-                            writer,
-                            data
-                        }
-                    ),
-                    Poll::Ready(Err(e)) => bail!(backend_write_error(e)),
-                    Poll::Ready(Ok(n)) => {
-                        data.advance(n);
-                        self.state = Some(if data.is_empty() {
-                            State::ToChunkCloseChunk {
-                                reader,
-                                writer: writer.finish(),
-                            }
-                        } else {
-                            State::ToChunkWriteData {
-                                reader,
-                                writer,
-                                data,
-                            }
-                        });
-                    }
-                },
-
-                // Write the chunk footer, then loop back to read more data.
-                State::ToChunkCloseChunk { reader, mut writer } => match writer.poll_complete(cx) {
-                    Poll::Pending => park!(self, State::ToChunkCloseChunk { reader, writer }),
-                    Poll::Ready(Err(e)) => bail!(backend_write_error(e)),
-                    Poll::Ready(Ok(())) => {
-                        self.state = Some(State::ToChunkRead {
-                            reader,
-                            writer: writer.finish(),
-                        });
-                    }
-                },
-
-                // Read bytes and write them directly to the CL backend writer.
-                State::ToCLRead { mut reader, writer } => {
-                    match reader.poll_read(cx, self.chunk_size) {
-                        Poll::Pending => park!(self, State::ToCLRead { reader, writer }),
-                        Poll::Ready(Err(e)) => bail!(ProxyCopyError::FrontendError(e)),
-                        Poll::Ready(Ok(None)) => {
-                            self.state = Some(State::FlushCL(writer));
-                        }
-                        Poll::Ready(Ok(Some(data))) => {
-                            self.state = Some(State::ToCLWrite {
+                            self.state = Some(C2CState::WriteData {
                                 reader,
                                 writer,
                                 data,
@@ -228,154 +158,607 @@ where
                         }
                     }
                 }
-
-                State::ToCLWrite {
+                C2CState::WriteData {
                     reader,
                     mut writer,
                     mut data,
                 } => match writer.poll_write(cx, &data) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                     Poll::Pending => park!(
                         self,
-                        State::ToCLWrite {
+                        C2CState::WriteData {
                             reader,
                             writer,
                             data
                         }
                     ),
-                    Poll::Ready(Err(e)) => bail!(backend_write_error(e)),
-                    Poll::Ready(Ok(n)) => {
-                        data.advance(n);
-                        self.state = Some(if data.is_empty() {
-                            State::ToCLRead { reader, writer }
-                        } else {
-                            State::ToCLWrite {
+                    Poll::Ready(Ok(len)) => {
+                        let _written = data.split_to(len);
+                        self.state = if !data.is_empty() {
+                            Some(C2CState::WriteData {
                                 reader,
                                 writer,
                                 data,
-                            }
-                        });
+                            })
+                        } else {
+                            Some(C2CState::ReadData { reader, writer })
+                        };
                     }
                 },
-
-                // Write the terminal chunk and flush.
-                State::WriteFinal(mut writer) => match writer.poll_write(cx) {
-                    Poll::Pending => park!(self, State::WriteFinal(writer)),
-                    Poll::Ready(Err(e)) => bail!(backend_write_error(e)),
+                C2CState::CloseChunk { reader, mut writer } => match writer.poll_complete(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, C2CState::CloseChunk { reader, writer }),
                     Poll::Ready(Ok(())) => {
-                        self.state =
-                            Some(State::Finished(ProxyBackendWriter::new(writer.finish())));
+                        let reader = reader.finish();
+                        let writer = writer.finish();
+                        self.state = Some(C2CState::ReadChunk { reader, writer })
                     }
                 },
-
-                // Flush the CL writer and extract the inner writer.
-                State::FlushCL(mut writer) => match writer.poll_flush(cx) {
-                    Poll::Pending => park!(self, State::FlushCL(writer)),
-                    Poll::Ready(Err(e)) => bail!(backend_write_error(e)),
-                    Poll::Ready(Ok(())) => {
-                        let w = writer.into_writer().map_err(backend_write_error)?;
-                        self.state = Some(State::Finished(ProxyBackendWriter::new(w)));
-                    }
-                },
-
-                // Bodyless writer: no framing to write, just unwrap.
-                State::BodylessFinish(writer) => {
-                    self.state = Some(State::Finished(ProxyBackendWriter::new(writer.finish())));
-                }
-
-                State::Finished(_) => {
-                    self.state = Some(state);
-                    return Poll::Ready(Ok(()));
-                }
+                C2CState::Done { .. } => return Poll::Ready(Ok(())),
             }
         }
     }
+}
 
-    /// Recover the backend writer after [`poll_forward`](Self::poll_forward)
-    /// has returned `Ready(Ok(()))`. Panics if called before forwarding
-    /// completes.
-    pub fn finish(self) -> ProxyBackendWriter<BW> {
-        match self.state {
-            Some(State::Finished(w)) => w,
-            _ => panic!("finish() called before poll_forward completed"),
+// i could build a ChunkForwarder. Would that be nuts?
+
+/// A writer for a body that is not chunk-encoded: either content-length
+/// framed, or EOF-framed (a raw `W`).
+pub enum OtherBodyWriter<W> {
+    ContentLength(ContentLengthBodyWriter<W>),
+    /// The inner writer is the body stream; callers signal end-of-body by
+    /// finishing the forwarder rather than by writing any framing byte.
+    Eof(W),
+}
+
+impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
+    fn poll_write(&mut self, cx: &mut Context<'_>, buf: &[u8]) -> Poll<BodyResult<usize>> {
+        match self {
+            OtherBodyWriter::ContentLength(w) => w.poll_write(cx, buf),
+            OtherBodyWriter::Eof(w) => match Pin::new(w).poll_write(cx, buf) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
+            },
         }
     }
 
-    /// Drive the forwarder to completion, returning the recovered backend
-    /// writer when done.
-    pub async fn forward(mut self) -> Result<ProxyBackendWriter<BW>, ProxyCopyError> {
-        poll_fn(|cx| self.poll_forward(cx)).await?;
-        Ok(self.finish())
+    fn poll_flush(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        match self {
+            OtherBodyWriter::ContentLength(w) => w.poll_flush(cx),
+            OtherBodyWriter::Eof(w) => match Pin::new(w).poll_flush(cx) {
+                Poll::Pending => Poll::Pending,
+                Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
+                Poll::Ready(Err(e)) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
+            },
+        }
+    }
+
+    fn into_writer(self) -> BodyResult<Option<W>> {
+        match self {
+            OtherBodyWriter::ContentLength(w) => w.into_writer().map(Some),
+            // Do not allow extracting out the EOF writer. We drop it to
+            // indicate that things are finished. There's no way to indicate
+            // that something has gone wrong. Use non-EOF writers and readers if
+            // you want to avoid this ambiguous error condition.
+            OtherBodyWriter::Eof(_w) => Ok(None),
+        }
     }
 }
 
-enum BodyReader<FR> {
-    CL(FrontendContentLengthBodyReader<FR>),
-    TE(FrontendChunkedBodyReader<FR>),
+pub enum C2OState<R, W> {
+    /// Reading the next chunk header. On a data chunk, transitions to
+    /// `ReadData`. On the final chunk, transitions to `FlushWriter`.
+    ReadChunk {
+        reader: ChunkHeadReader<R>,
+        writer: OtherBodyWriter<W>,
+    },
+    /// Reading chunk body bytes. On data, transitions to `WriteData`. When
+    /// exhausted, transitions back to `ReadChunk`.
+    ReadData {
+        reader: ChunkDataReader<R>,
+        writer: OtherBodyWriter<W>,
+    },
+    /// Writing chunk body bytes to the output. When the buffer is empty,
+    /// transitions back to `ReadData`.
+    WriteData {
+        reader: ChunkDataReader<R>,
+        writer: OtherBodyWriter<W>,
+        data: Bytes,
+    },
+    /// All chunk data has been forwarded. Flush the writer, then validate
+    /// completeness (relevant for content-length) and transition to `Done`.
+    FlushWriter {
+        reader: FinalChunkReader<R>,
+        writer: OtherBodyWriter<W>,
+    },
+    Done {
+        reader: (BytesReader<R>, ParseSlots, Headers),
+        writer: Option<W>,
+    },
 }
 
-impl<FR: AsyncRead + Unpin> BodyReader<FR> {
+pub struct ChunkToOtherBodyForwarder<R, W> {
+    state: Option<C2OState<R, W>>,
+}
+
+impl<R, W> ChunkToOtherBodyForwarder<R, W> {
+    pub fn new(reader: ChunkHeadReader<R>, writer: OtherBodyWriter<W>) -> Self {
+        Self {
+            state: Some(C2OState::ReadChunk { reader, writer }),
+        }
+    }
+
+    /// Recover the writer after [`poll_forward`](Self::poll_forward) returns
+    /// `Ready(Ok(()))`. Returns `None` for EOF-framed output. Panics if
+    /// forwarding has not completed.
+    pub fn into_writer(self) -> Option<W> {
+        match self.state {
+            Some(C2OState::Done { writer, .. }) => writer,
+            _ => panic!("into_writer() called before poll_forward completed"),
+        }
+    }
+}
+
+impl<R, W> ChunkToOtherBodyForwarder<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pub fn poll_forward(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        loop {
+            let Some(state) = self.state.take() else {
+                return Poll::Ready(Err(BodyError::ForwardAfterError));
+            };
+            match state {
+                C2OState::ReadChunk { mut reader, writer } => match reader.poll_read_chunk(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, C2OState::ReadChunk { reader, writer }),
+                    Poll::Ready(Ok(())) => match reader.finish() {
+                        NextChunk::Data(reader) => {
+                            self.state = Some(C2OState::ReadData { reader, writer });
+                        }
+                        NextChunk::Final(reader) => {
+                            self.state = Some(C2OState::FlushWriter { reader, writer });
+                        }
+                    },
+                },
+                C2OState::ReadData { mut reader, writer } => {
+                    match reader.poll_read(cx, READ_SIZE) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => park!(self, C2OState::ReadData { reader, writer }),
+                        Poll::Ready(Ok(None)) => {
+                            let reader = reader.finish();
+                            self.state = Some(C2OState::ReadChunk { reader, writer });
+                        }
+                        Poll::Ready(Ok(Some(data))) => {
+                            self.state = Some(C2OState::WriteData {
+                                reader,
+                                writer,
+                                data,
+                            });
+                        }
+                    }
+                }
+                C2OState::WriteData {
+                    reader,
+                    mut writer,
+                    mut data,
+                } => match writer.poll_write(cx, &data) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(
+                        self,
+                        C2OState::WriteData {
+                            reader,
+                            writer,
+                            data
+                        }
+                    ),
+                    Poll::Ready(Ok(len)) => {
+                        let _written = data.split_to(len);
+                        self.state = if !data.is_empty() {
+                            Some(C2OState::WriteData {
+                                reader,
+                                writer,
+                                data,
+                            })
+                        } else {
+                            Some(C2OState::ReadData { reader, writer })
+                        };
+                    }
+                },
+                C2OState::FlushWriter { reader, mut writer } => match writer.poll_flush(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, C2OState::FlushWriter { reader, writer }),
+                    Poll::Ready(Ok(())) => {
+                        let writer = match writer.into_writer() {
+                            Ok(w) => w,
+                            Err(e) => return Poll::Ready(Err(e)),
+                        };
+                        let reader = reader.into_parts();
+                        self.state = Some(C2OState::Done { reader, writer });
+                    }
+                },
+                C2OState::Done { .. } => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+/// A reader for a body that is not chunk-encoded: either content-length
+/// framed, or EOF-framed.
+pub enum OtherBodyReader<R> {
+    ContentLength(ContentLengthBodyReader<R>),
+    /// The body ends when the underlying connection is closed.
+    Eof(EofBodyReader<R>),
+}
+
+impl<R: AsyncRead + Unpin> OtherBodyReader<R> {
     fn poll_read(
         &mut self,
         cx: &mut Context<'_>,
         max_len: usize,
-    ) -> Poll<FrontendResult<Option<Bytes>>> {
+    ) -> Poll<BodyResult<Option<Bytes>>> {
         match self {
-            BodyReader::CL(r) => r.poll_read(cx, max_len),
-            BodyReader::TE(r) => r.poll_read(cx, max_len),
+            OtherBodyReader::ContentLength(r) => r.poll_read(cx, max_len),
+            OtherBodyReader::Eof(r) => r.poll_read(cx, max_len),
+        }
+    }
+
+    /// Consume the reader after `poll_read` has returned `Ok(None)`.
+    /// Returns `(parse_slots, Some(reader))` for content-length (IO is still
+    /// viable for pipelining) and `(parse_slots, None)` for EOF (connection
+    /// is consumed).
+    fn into_done(self) -> (ParseSlots, Option<BytesReader<R>>) {
+        match self {
+            OtherBodyReader::ContentLength(r) => {
+                let (reader, parse_slots) = r.finish();
+                (parse_slots, Some(reader))
+            }
+            OtherBodyReader::Eof(r) => (r.drain(), None),
         }
     }
 }
 
-enum State<FR, BW> {
-    // Any reader -> TE backend (re-chunks)
-    /// Read a buffer from the frontend; size it to a new backend chunk.
-    ToChunkRead {
-        reader: BodyReader<FR>,
-        writer: IdleWriter<BW>,
+pub enum O2CState<R, W> {
+    /// Reading body bytes from the source. On data, transitions to
+    /// `WriteHead`. On EOF/end, transitions to `WriteFinal`.
+    ReadData {
+        reader: OtherBodyReader<R>,
+        writer: IdleWriter<W>,
     },
-    /// Write the backend chunk header for the pending data buffer.
-    ToChunkWriteHead {
-        reader: BodyReader<FR>,
-        writer: HeadWriter<BW>,
+    /// Writing the chunk header for the next data chunk. Once complete,
+    /// transitions to `WriteData`.
+    WriteHead {
+        reader: OtherBodyReader<R>,
+        writer: HeadWriter<W>,
         data: Bytes,
     },
-    /// Write the data bytes of the current chunk.
-    ToChunkWriteData {
-        reader: BodyReader<FR>,
-        writer: DataWriter<BW>,
+    /// Writing the chunk body bytes. When the buffer is empty, transitions to
+    /// `CloseChunk`.
+    WriteData {
+        reader: OtherBodyReader<R>,
+        writer: DataWriter<W>,
         data: Bytes,
     },
-    /// Write the chunk footer, then loop back to `ToChunkRead`.
-    ToChunkCloseChunk {
-        reader: BodyReader<FR>,
-        writer: DataCompleter<BW>,
+    /// Writing the chunk footer (`\r\n`). Once complete, transitions back to
+    /// `ReadData` for the next chunk.
+    CloseChunk {
+        reader: OtherBodyReader<R>,
+        writer: DataCompleter<W>,
     },
-
-    // Any reader -> CL backend
-    /// Read bytes from the frontend body.
-    ToCLRead {
-        reader: BodyReader<FR>,
-        writer: ContentLengthBodyWriter<BW>,
+    /// Writing the terminal chunk (`0\r\n\r\n`) and flushing. Once complete,
+    /// transitions to `Done`.
+    WriteFinal {
+        reader: OtherBodyReader<R>,
+        writer: FinalWriter<W>,
     },
-    /// Write a pending buffer to the CL backend writer.
-    ToCLWrite {
-        reader: BodyReader<FR>,
-        writer: ContentLengthBodyWriter<BW>,
-        data: Bytes,
+    Done {
+        reader: (ParseSlots, Option<BytesReader<R>>),
+        writer: W,
     },
-
-    // Shared terminal states
-    /// Write the terminal chunk (`0\r\n[trailers]\r\n`) for a TE backend.
-    WriteFinal(FinalWriter<BW>),
-    /// Flush a CL backend writer before extracting the inner writer.
-    FlushCL(ContentLengthBodyWriter<BW>),
-    /// Finish a bodyless backend writer (no I/O needed).
-    BodylessFinish(BodylessBodyWriter<BW>),
-    /// Forwarding complete; holds the recovered backend writer until
-    /// [`ProxyBodyForwarder::finish`] is called.
-    Finished(ProxyBackendWriter<BW>),
 }
 
-fn backend_write_error(e: BodyError) -> ProxyCopyError {
-    ProxyCopyError::BackendError(BackendError::BodyWriteError(e))
+pub struct OtherToChunkedBodyForwarder<R, W> {
+    state: Option<O2CState<R, W>>,
+}
+
+impl<R, W> OtherToChunkedBodyForwarder<R, W> {
+    pub fn new(reader: OtherBodyReader<R>, writer: IdleWriter<W>) -> Self {
+        Self {
+            state: Some(O2CState::ReadData { reader, writer }),
+        }
+    }
+
+    /// Recover the writer after [`poll_forward`](Self::poll_forward) returns
+    /// `Ready(Ok(()))`. Panics if forwarding has not completed.
+    pub fn into_writer(self) -> W {
+        match self.state {
+            Some(O2CState::Done { writer, .. }) => writer,
+            _ => panic!("into_writer() called before poll_forward completed"),
+        }
+    }
+}
+
+impl<R, W> OtherToChunkedBodyForwarder<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pub fn poll_forward(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        loop {
+            let Some(state) = self.state.take() else {
+                return Poll::Ready(Err(BodyError::ForwardAfterError));
+            };
+            match state {
+                O2CState::ReadData { mut reader, writer } => {
+                    match reader.poll_read(cx, READ_SIZE) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => park!(self, O2CState::ReadData { reader, writer }),
+                        Poll::Ready(Ok(None)) => {
+                            let writer = writer.into_final(&Default::default());
+                            self.state = Some(O2CState::WriteFinal { reader, writer });
+                        }
+                        Poll::Ready(Ok(Some(data))) => {
+                            let writer = writer.start(data.len() as u64);
+                            self.state = Some(O2CState::WriteHead {
+                                reader,
+                                writer,
+                                data,
+                            });
+                        }
+                    }
+                }
+                O2CState::WriteHead {
+                    reader,
+                    mut writer,
+                    data,
+                } => match writer.poll_write(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(
+                        self,
+                        O2CState::WriteHead {
+                            reader,
+                            writer,
+                            data
+                        }
+                    ),
+                    Poll::Ready(Ok(())) => {
+                        let writer = writer.finish();
+                        self.state = Some(O2CState::WriteData {
+                            reader,
+                            writer,
+                            data,
+                        });
+                    }
+                },
+                O2CState::WriteData {
+                    reader,
+                    mut writer,
+                    mut data,
+                } => match writer.poll_write(cx, &data) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(
+                        self,
+                        O2CState::WriteData {
+                            reader,
+                            writer,
+                            data
+                        }
+                    ),
+                    Poll::Ready(Ok(len)) => {
+                        let _written = data.split_to(len);
+                        self.state = if !data.is_empty() {
+                            Some(O2CState::WriteData {
+                                reader,
+                                writer,
+                                data,
+                            })
+                        } else {
+                            let writer = writer.finish();
+                            Some(O2CState::CloseChunk { reader, writer })
+                        };
+                    }
+                },
+                O2CState::CloseChunk { reader, mut writer } => match writer.poll_complete(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, O2CState::CloseChunk { reader, writer }),
+                    Poll::Ready(Ok(())) => {
+                        let writer = writer.finish();
+                        self.state = Some(O2CState::ReadData { reader, writer });
+                    }
+                },
+                O2CState::WriteFinal { reader, mut writer } => match writer.poll_write(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, O2CState::WriteFinal { reader, writer }),
+                    Poll::Ready(Ok(())) => {
+                        let writer = writer.finish();
+                        let reader = reader.into_done();
+                        self.state = Some(O2CState::Done { reader, writer });
+                    }
+                },
+                O2CState::Done { .. } => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+pub enum O2OState<R, W> {
+    /// Reading body bytes from the source. On data, transitions to
+    /// `WriteData`. On EOF/end, transitions to `FlushWriter`.
+    ReadData {
+        reader: OtherBodyReader<R>,
+        writer: OtherBodyWriter<W>,
+    },
+    /// Writing body bytes to the destination. When the buffer is empty,
+    /// transitions back to `ReadData`.
+    WriteData {
+        reader: OtherBodyReader<R>,
+        writer: OtherBodyWriter<W>,
+        data: Bytes,
+    },
+    /// All body bytes have been forwarded. Flush and validate the writer
+    /// (relevant for content-length), then transition to `Done`.
+    FlushWriter {
+        reader: OtherBodyReader<R>,
+        writer: OtherBodyWriter<W>,
+    },
+    Done {
+        reader: (ParseSlots, Option<BytesReader<R>>),
+        writer: Option<W>,
+    },
+}
+
+pub struct OtherToOtherBodyForwarder<R, W> {
+    state: Option<O2OState<R, W>>,
+}
+
+impl<R, W> OtherToOtherBodyForwarder<R, W> {
+    pub fn new(reader: OtherBodyReader<R>, writer: OtherBodyWriter<W>) -> Self {
+        Self {
+            state: Some(O2OState::ReadData { reader, writer }),
+        }
+    }
+
+    /// Recover the writer after [`poll_forward`](Self::poll_forward) returns
+    /// `Ready(Ok(()))`. Returns `None` for EOF-framed output. Panics if
+    /// forwarding has not completed.
+    pub fn into_writer(self) -> Option<W> {
+        match self.state {
+            Some(O2OState::Done { writer, .. }) => writer,
+            _ => panic!("into_writer() called before poll_forward completed"),
+        }
+    }
+}
+
+impl<R, W> OtherToOtherBodyForwarder<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pub fn poll_forward(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        loop {
+            let Some(state) = self.state.take() else {
+                return Poll::Ready(Err(BodyError::ForwardAfterError));
+            };
+            match state {
+                O2OState::ReadData { mut reader, writer } => {
+                    match reader.poll_read(cx, READ_SIZE) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => park!(self, O2OState::ReadData { reader, writer }),
+                        Poll::Ready(Ok(None)) => {
+                            self.state = Some(O2OState::FlushWriter { reader, writer });
+                        }
+                        Poll::Ready(Ok(Some(data))) => {
+                            self.state = Some(O2OState::WriteData {
+                                reader,
+                                writer,
+                                data,
+                            });
+                        }
+                    }
+                }
+                O2OState::WriteData {
+                    reader,
+                    mut writer,
+                    mut data,
+                } => match writer.poll_write(cx, &data) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(
+                        self,
+                        O2OState::WriteData {
+                            reader,
+                            writer,
+                            data
+                        }
+                    ),
+                    Poll::Ready(Ok(len)) => {
+                        let _written = data.split_to(len);
+                        self.state = if !data.is_empty() {
+                            Some(O2OState::WriteData {
+                                reader,
+                                writer,
+                                data,
+                            })
+                        } else {
+                            Some(O2OState::ReadData { reader, writer })
+                        };
+                    }
+                },
+                O2OState::FlushWriter { reader, mut writer } => match writer.poll_flush(cx) {
+                    Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                    Poll::Pending => park!(self, O2OState::FlushWriter { reader, writer }),
+                    Poll::Ready(Ok(())) => {
+                        let writer = match writer.into_writer() {
+                            Ok(w) => w,
+                            Err(e) => return Poll::Ready(Err(e)),
+                        };
+                        let reader = reader.into_done();
+                        self.state = Some(O2OState::Done { reader, writer });
+                    }
+                },
+                O2OState::Done { .. } => return Poll::Ready(Ok(())),
+            }
+        }
+    }
+}
+
+pub enum BodyForwarder<R, W> {
+    C2C(ChunkToChunkBodyForwarder<R, W>),
+    C2O(ChunkToOtherBodyForwarder<R, W>),
+    O2C(OtherToChunkedBodyForwarder<R, W>),
+    O2O(OtherToOtherBodyForwarder<R, W>),
+}
+
+impl<R, W> From<ChunkToChunkBodyForwarder<R, W>> for BodyForwarder<R, W> {
+    fn from(f: ChunkToChunkBodyForwarder<R, W>) -> Self {
+        BodyForwarder::C2C(f)
+    }
+}
+
+impl<R, W> From<ChunkToOtherBodyForwarder<R, W>> for BodyForwarder<R, W> {
+    fn from(f: ChunkToOtherBodyForwarder<R, W>) -> Self {
+        BodyForwarder::C2O(f)
+    }
+}
+
+impl<R, W> From<OtherToChunkedBodyForwarder<R, W>> for BodyForwarder<R, W> {
+    fn from(f: OtherToChunkedBodyForwarder<R, W>) -> Self {
+        BodyForwarder::O2C(f)
+    }
+}
+
+impl<R, W> From<OtherToOtherBodyForwarder<R, W>> for BodyForwarder<R, W> {
+    fn from(f: OtherToOtherBodyForwarder<R, W>) -> Self {
+        BodyForwarder::O2O(f)
+    }
+}
+
+impl<R, W> BodyForwarder<R, W> {
+    /// Recover the writer after [`poll_forward`](Self::poll_forward) returns
+    /// `Ready(Ok(()))`. Returns `None` for EOF-framed output where the
+    /// connection is consumed. Panics if forwarding has not completed.
+    pub fn into_writer(self) -> Option<W> {
+        match self {
+            BodyForwarder::C2C(f) => Some(f.into_writer()),
+            BodyForwarder::C2O(f) => f.into_writer(),
+            BodyForwarder::O2C(f) => Some(f.into_writer()),
+            BodyForwarder::O2O(f) => f.into_writer(),
+        }
+    }
+}
+
+impl<R, W> BodyForwarder<R, W>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    pub fn poll_forward(&mut self, cx: &mut Context<'_>) -> Poll<BodyResult<()>> {
+        match self {
+            BodyForwarder::C2C(f) => f.poll_forward(cx),
+            BodyForwarder::C2O(f) => f.poll_forward(cx),
+            BodyForwarder::O2C(f) => f.poll_forward(cx),
+            BodyForwarder::O2O(f) => f.poll_forward(cx),
+        }
+    }
 }
