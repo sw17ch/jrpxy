@@ -26,6 +26,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub mod backend_writer;
 pub mod body_forwarder;
 pub mod error;
+pub mod frontend_writer;
 pub mod request_forwarder;
 pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
