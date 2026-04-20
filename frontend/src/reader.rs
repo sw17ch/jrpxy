@@ -64,6 +64,18 @@ pub struct FrontendReader<I> {
 }
 
 impl<I> FrontendReader<I> {
+    /// Create a new [`FrontendReader`].
+    pub fn new(reader: I, max_headers: usize) -> Self {
+        Self::new_with_buffer(BytesReader::new(reader), max_headers)
+    }
+
+    pub fn new_with_buffer(reader: BytesReader<I>, max_headers: usize) -> FrontendReader<I> {
+        Self {
+            reader,
+            parse_slots: ParseSlots::new(max_headers),
+        }
+    }
+
     pub fn into_inner(self) -> BytesReader<I> {
         let Self {
             reader,
@@ -79,18 +91,6 @@ impl<I> FrontendReader<I> {
 }
 
 impl<I: AsyncReadExt + Unpin> FrontendReader<I> {
-    /// Create a new [`FrontendReader`].
-    pub fn new(reader: I, max_headers: usize) -> Self {
-        Self::new_with_buffer(BytesReader::new(reader), max_headers)
-    }
-
-    pub fn new_with_buffer(reader: BytesReader<I>, max_headers: usize) -> FrontendReader<I> {
-        Self {
-            reader,
-            parse_slots: ParseSlots::new(max_headers),
-        }
-    }
-
     /// Wait for the full frontend head to be available.
     async fn head(&mut self, max_head_length: usize) -> FrontendResult<Request> {
         loop {
