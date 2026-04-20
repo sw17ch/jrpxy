@@ -23,6 +23,7 @@ use jrpxy_http_message::{
 use jrpxy_util::parse::is_valid_tchar;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+mod alt_body_forwarder;
 pub mod backend_writer;
 pub mod body_forwarder;
 pub mod error;
