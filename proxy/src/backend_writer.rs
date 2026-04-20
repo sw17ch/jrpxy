@@ -1,4 +1,3 @@
-use jrpxy_backend::error::{BackendError, BackendResult};
 use jrpxy_body::writer::{
     bodyless::BodylessBodyWriter, chunked::IdleWriter, content_length::ContentLengthBodyWriter,
 };
@@ -7,6 +6,8 @@ use jrpxy_http_message::{
     message::Request,
 };
 use tokio::io::{self, AsyncWriteExt};
+
+use crate::error::{ProxyBackendWriterError, ProxyBackendWriterResult};
 
 /// Proxy-owned backend writer. Mirrors [`jrpxy_backend::writer::BackendWriter`]
 /// but produces a [`ProxyBackendWriter`] on completion rather than a
@@ -24,11 +25,11 @@ impl<I: AsyncWriteExt + Unpin> ProxyBackendWriter<I> {
     pub async fn send_as_chunked(
         self,
         request: &Request,
-    ) -> BackendResult<ProxyBackendBodyWriter<I>> {
+    ) -> ProxyBackendWriterResult<ProxyBackendBodyWriter<I>> {
         let Self { mut writer } = self;
         write_request_to(request, WriteFraming::Chunked, &mut writer)
             .await
-            .map_err(BackendError::WriteError)?;
+            .map_err(ProxyBackendWriterError::WriteError)?;
         Ok(ProxyBackendBodyWriter::TE(IdleWriter::new(writer)))
     }
 
@@ -36,11 +37,11 @@ impl<I: AsyncWriteExt + Unpin> ProxyBackendWriter<I> {
         self,
         request: &Request,
         body_len: u64,
-    ) -> BackendResult<ProxyBackendBodyWriter<I>> {
+    ) -> ProxyBackendWriterResult<ProxyBackendBodyWriter<I>> {
         let Self { mut writer } = self;
         write_request_to(request, WriteFraming::Length(body_len), &mut writer)
             .await
-            .map_err(BackendError::WriteError)?;
+            .map_err(ProxyBackendWriterError::WriteError)?;
         Ok(ProxyBackendBodyWriter::CL(ContentLengthBodyWriter::new(
             body_len, writer,
         )))
@@ -49,11 +50,11 @@ impl<I: AsyncWriteExt + Unpin> ProxyBackendWriter<I> {
     pub async fn send_as_bodyless(
         self,
         request: &Request,
-    ) -> BackendResult<ProxyBackendBodyWriter<I>> {
+    ) -> ProxyBackendWriterResult<ProxyBackendBodyWriter<I>> {
         let Self { mut writer } = self;
         write_request_to(request, WriteFraming::PreserveFraming, &mut writer)
             .await
-            .map_err(BackendError::WriteError)?;
+            .map_err(ProxyBackendWriterError::WriteError)?;
         Ok(ProxyBackendBodyWriter::Bodyless(BodylessBodyWriter::new(
             writer,
         )))

@@ -1,17 +1,14 @@
 use jrpxy_body::writer::{
     bodyless::BodylessBodyWriter, chunked::IdleWriter, content_length::ContentLengthBodyWriter,
 };
-use jrpxy_frontend::error::{FrontendError, FrontendResult};
 use jrpxy_http_message::{
     framing::{WriteFraming, is_framing_header},
     message::Response,
 };
 use tokio::io::{self, AsyncWriteExt};
 
-/// Proxy-owned frontend writer. Mirrors [`jrpxy_frontend::writer::FrontendWriter`]
-/// but produces a [`ProxyFrontendWriter`] on completion rather than a
-/// [`jrpxy_frontend::writer::FrontendWriter`], keeping the proxy's type system
-/// sealed.
+use crate::error::{ProxyFrontendWriterError, ProxyFrontendWriterResult};
+
 pub struct ProxyFrontendWriter<I> {
     writer: I,
 }
@@ -25,11 +22,11 @@ impl<I: AsyncWriteExt + Unpin> ProxyFrontendWriter<I> {
     pub async fn send_as_chunked(
         self,
         response: &Response,
-    ) -> FrontendResult<ProxyFrontendBodyWriter<I>> {
+    ) -> ProxyFrontendWriterResult<ProxyFrontendBodyWriter<I>> {
         let Self { mut writer } = self;
         write_response_to(response, WriteFraming::Chunked, &mut writer)
             .await
-            .map_err(FrontendError::WriteError)?;
+            .map_err(ProxyFrontendWriterError::WriteError)?;
         Ok(ProxyFrontendBodyWriter::TE(IdleWriter::new(writer)))
     }
 
@@ -38,11 +35,11 @@ impl<I: AsyncWriteExt + Unpin> ProxyFrontendWriter<I> {
         self,
         response: &Response,
         body_len: u64,
-    ) -> FrontendResult<ProxyFrontendBodyWriter<I>> {
+    ) -> ProxyFrontendWriterResult<ProxyFrontendBodyWriter<I>> {
         let Self { mut writer } = self;
         write_response_to(response, WriteFraming::Length(body_len), &mut writer)
             .await
-            .map_err(FrontendError::WriteError)?;
+            .map_err(ProxyFrontendWriterError::WriteError)?;
         Ok(ProxyFrontendBodyWriter::CL(ContentLengthBodyWriter::new(
             body_len, writer,
         )))
@@ -53,11 +50,11 @@ impl<I: AsyncWriteExt + Unpin> ProxyFrontendWriter<I> {
     pub async fn send_as_bodyless(
         self,
         response: &Response,
-    ) -> FrontendResult<ProxyFrontendBodyWriter<I>> {
+    ) -> ProxyFrontendWriterResult<ProxyFrontendBodyWriter<I>> {
         let Self { mut writer } = self;
         write_response_to(response, WriteFraming::PreserveFraming, &mut writer)
             .await
-            .map_err(FrontendError::WriteError)?;
+            .map_err(ProxyFrontendWriterError::WriteError)?;
         Ok(ProxyFrontendBodyWriter::Bodyless(BodylessBodyWriter::new(
             writer,
         )))
@@ -69,11 +66,11 @@ impl<I: AsyncWriteExt + Unpin> ProxyFrontendWriter<I> {
     pub async fn send_as_eof(
         self,
         response: &Response,
-    ) -> FrontendResult<ProxyFrontendBodyWriter<I>> {
+    ) -> ProxyFrontendWriterResult<ProxyFrontendBodyWriter<I>> {
         let Self { mut writer } = self;
         write_response_to(response, WriteFraming::StripFraming, &mut writer)
             .await
-            .map_err(FrontendError::WriteError)?;
+            .map_err(ProxyFrontendWriterError::WriteError)?;
         Ok(ProxyFrontendBodyWriter::Eof(writer))
     }
 

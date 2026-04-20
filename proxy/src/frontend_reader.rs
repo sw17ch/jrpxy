@@ -4,45 +4,16 @@ use std::{
 };
 
 use bytes::Bytes;
-use jrpxy_body::{
-    error::BodyError,
-    reader::{BodylessBodyReader, ChunkHeadReader, ChunkedBodyReader, ContentLengthBodyReader},
-};
+use jrpxy_body::reader::{BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader};
 use jrpxy_http_message::{
     framing::ParsedFraming,
-    header::{HeaderError, Headers},
-    message::{MessageError, ParseSlots, Request},
+    header::Headers,
+    message::{ParseSlots, Request},
 };
 use jrpxy_util::io_buffer::BytesReader;
 use tokio::io::AsyncReadExt;
 
-// ---------------------------------------------------------------------------
-// Error type
-// ---------------------------------------------------------------------------
-
-#[derive(thiserror::Error, Debug)]
-pub enum ProxyFrontendReaderError {
-    #[error("Failed to read frontend: {0}")]
-    ReadError(std::io::Error),
-    #[error("Failed to read body: {0}")]
-    BodyReadError(BodyError),
-    #[error("First read returned EOF")]
-    FirstReadEOF,
-    #[error("Unexpected end of file while reading")]
-    UnexpectedEOF,
-    #[error("Failed to parse request: {0}")]
-    ParseError(MessageError),
-    #[error("Header error: {0}")]
-    HeaderError(#[from] HeaderError),
-    #[error("Request head exceeded size limit: {0} >= {1}")]
-    MaxHeadLenExceeded(usize, usize),
-}
-
-pub type ProxyFrontendReaderResult<T> = Result<T, ProxyFrontendReaderError>;
-
-// ---------------------------------------------------------------------------
-// Reader
-// ---------------------------------------------------------------------------
+use crate::error::{ProxyFrontendReaderError, ProxyFrontendReaderResult};
 
 /// Reads a stream of HTTP/1.x requests from a frontend connection.
 pub struct ProxyFrontendReader<I> {

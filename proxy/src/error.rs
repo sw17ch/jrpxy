@@ -1,6 +1,9 @@
+use std::io;
+
 use jrpxy_backend::error::BackendError;
+use jrpxy_body::error::BodyError;
 use jrpxy_frontend::error::FrontendError;
-use jrpxy_http_message::header::HeaderError;
+use jrpxy_http_message::{header::HeaderError, message::MessageError};
 
 use crate::ConnectionTokenParserError;
 
@@ -53,3 +56,69 @@ pub enum ProxyCopyError {
 }
 
 pub type ProxyResult<T> = std::result::Result<T, ProxyError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyBackendReaderError {
+    #[error("Failed to read backend: {0}")]
+    ReadError(std::io::Error),
+    #[error("Failed to read body: {0}")]
+    BodyReadError(BodyError),
+    #[error("First read returned EOF")]
+    FirstReadEOF,
+    #[error("Unexpected end of file while reading")]
+    UnexpectedEOF,
+    #[error("Failed to parse response: {0}")]
+    ParseError(MessageError),
+    #[error("Header error: {0}")]
+    HeaderError(#[from] HeaderError),
+    #[error("Response head exceeded size limit: {0} >= {1}")]
+    MaxHeadLenExceeded(usize, usize),
+    #[error("101 Switching Protocols is not supported")]
+    SwitchingProtocolsUnsupported,
+    #[error("102 Processing is deprecated and not supported")]
+    ProcessingUnsupported,
+    #[error("Unsupported informational status code: {0}")]
+    UnsupportedInformational(u16),
+    #[error("1xx informational response contains framing headers")]
+    FramingHeadersOnInformationalResponse,
+    #[error("204 No Content response contains framing headers")]
+    FramingHeadersOn204NoContentResponse,
+}
+
+pub type ProxyBackendReaderResult<T> = Result<T, ProxyBackendReaderError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyFrontendReaderError {
+    #[error("Failed to read frontend: {0}")]
+    ReadError(std::io::Error),
+    #[error("Failed to read body: {0}")]
+    BodyReadError(BodyError),
+    #[error("First read returned EOF")]
+    FirstReadEOF,
+    #[error("Unexpected end of file while reading")]
+    UnexpectedEOF,
+    #[error("Failed to parse request: {0}")]
+    ParseError(MessageError),
+    #[error("Header error: {0}")]
+    HeaderError(#[from] HeaderError),
+    #[error("Request head exceeded size limit: {0} >= {1}")]
+    MaxHeadLenExceeded(usize, usize),
+}
+
+pub type ProxyFrontendReaderResult<T> = Result<T, ProxyFrontendReaderError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyBackendWriterError {
+    #[error("Write error: {0}")]
+    WriteError(io::Error),
+}
+
+pub type ProxyBackendWriterResult<T> = Result<T, ProxyBackendWriterError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyFrontendWriterError {
+    #[error("Write error: {0}")]
+    WriteError(io::Error),
+}
+
+pub type ProxyFrontendWriterResult<T> = Result<T, ProxyFrontendWriterError>;

@@ -21,7 +21,7 @@ pub struct BackendReader<I> {
     parse_slots: ParseSlots,
 }
 
-impl<I: AsyncReadExt + Unpin> BackendReader<I> {
+impl<I> BackendReader<I> {
     pub fn new(reader: I, max_headers: usize) -> Self {
         Self::new_with_iobuffer(BytesReader::new(reader), max_headers)
     }
@@ -33,6 +33,16 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         }
     }
 
+    pub fn into_parts(self) -> BytesReader<I> {
+        let Self {
+            reader,
+            parse_slots: _,
+        } = self;
+        reader
+    }
+}
+
+impl<I: AsyncReadExt + Unpin> BackendReader<I> {
     async fn head(&mut self, max_head_length: usize) -> BackendResult<Response> {
         loop {
             if let Some(res) = self
@@ -172,14 +182,6 @@ impl<I: AsyncReadExt + Unpin> BackendReader<I> {
         };
 
         Ok(ResponseStream::Response(BackendResponse { res, reader }))
-    }
-
-    pub fn into_parts(self) -> BytesReader<I> {
-        let Self {
-            reader,
-            parse_slots: _,
-        } = self;
-        reader
     }
 }
 
