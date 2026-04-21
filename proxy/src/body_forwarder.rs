@@ -7,10 +7,11 @@ use bytes::Bytes;
 use jrpxy_body::{
     error::{BodyError, BodyResult},
     reader::{
-        ChunkDataReader, ChunkHeadReader, ContentLengthBodyReader, EofBodyReader, FinalChunkReader,
-        NextChunk,
+        BodylessBodyReader, ChunkDataReader, ChunkHeadReader, ContentLengthBodyReader,
+        EofBodyReader, FinalChunkReader, NextChunk,
     },
     writer::{
+        bodyless::BodylessBodyWriter,
         chunked::{DataCompleter, DataWriter, FinalWriter, HeadWriter, IdleWriter},
         content_length::ContentLengthBodyWriter,
     },
@@ -202,13 +203,18 @@ where
 
 // i could build a ChunkForwarder. Would that be nuts?
 
-/// A writer for a body that is not chunk-encoded: either content-length
-/// framed, or EOF-framed (a raw `W`).
+/// A writer for a body that is not chunk-encoded: content-length framed,
+/// EOF-framed (a raw `W`), or bodyless (the destination has been framed as
+/// having no body, so any attempted write is rejected with
+/// [`BodyError::BodyOverflow`]).
 pub enum OtherBodyWriter<W> {
     ContentLength(ContentLengthBodyWriter<W>),
     /// The inner writer is the body stream; callers signal end-of-body by
     /// finishing the forwarder rather than by writing any framing byte.
     Eof(W),
+    /// Rejects any write with [`BodyError::BodyOverflow`]. Used when the
+    /// destination has been framed as having no body.
+    Bodyless(BodylessBodyWriter<W>),
 }
 
 impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
@@ -220,6 +226,9 @@ impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
                 Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
                 Poll::Ready(Err(e)) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
             },
+            OtherBodyWriter::Bodyless(_) => {
+                Poll::Ready(Err(BodyError::BodyOverflow(buf.len() as u64)))
+            }
         }
     }
 
@@ -231,6 +240,7 @@ impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
                 Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
                 Poll::Ready(Err(e)) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
             },
+            OtherBodyWriter::Bodyless(_) => Poll::Ready(Ok(())),
         }
     }
 
@@ -242,6 +252,7 @@ impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
             // that something has gone wrong. Use non-EOF writers and readers if
             // you want to avoid this ambiguous error condition.
             OtherBodyWriter::Eof(_w) => Ok(None),
+            OtherBodyWriter::Bodyless(w) => Ok(Some(w.finish())),
         }
     }
 }
@@ -385,12 +396,14 @@ where
     }
 }
 
-/// A reader for a body that is not chunk-encoded: either content-length
-/// framed, or EOF-framed.
+/// A reader for a body that is not chunk-encoded: content-length framed,
+/// EOF-framed, or bodyless (no body bytes to read).
 pub enum OtherBodyReader<R> {
     ContentLength(ContentLengthBodyReader<R>),
     /// The body ends when the underlying connection is closed.
     Eof(EofBodyReader<R>),
+    /// There are no body bytes to read; `poll_read` returns `None` immediately.
+    Bodyless(BodylessBodyReader<R>),
 }
 
 impl<R: AsyncRead + Unpin> OtherBodyReader<R> {
@@ -402,13 +415,14 @@ impl<R: AsyncRead + Unpin> OtherBodyReader<R> {
         match self {
             OtherBodyReader::ContentLength(r) => r.poll_read(cx, max_len),
             OtherBodyReader::Eof(r) => r.poll_read(cx, max_len),
+            OtherBodyReader::Bodyless(_) => Poll::Ready(Ok(None)),
         }
     }
 
     /// Consume the reader after `poll_read` has returned `Ok(None)`.
-    /// Returns `(parse_slots, Some(reader))` for content-length (IO is still
-    /// viable for pipelining) and `(parse_slots, None)` for EOF (connection
-    /// is consumed).
+    /// Returns `(parse_slots, Some(reader))` for content-length and bodyless
+    /// (IO is still viable for pipelining) and `(parse_slots, None)` for EOF
+    /// (connection is consumed).
     fn into_done(self) -> (ParseSlots, Option<BytesReader<R>>) {
         match self {
             OtherBodyReader::ContentLength(r) => {
@@ -416,6 +430,10 @@ impl<R: AsyncRead + Unpin> OtherBodyReader<R> {
                 (parse_slots, Some(reader))
             }
             OtherBodyReader::Eof(r) => (r.drain(), None),
+            OtherBodyReader::Bodyless(r) => {
+                let (reader, parse_slots) = r.drain();
+                (parse_slots, Some(reader))
+            }
         }
     }
 }
