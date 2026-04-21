@@ -29,6 +29,7 @@ pub mod body_forwarder;
 pub mod error;
 pub mod frontend_reader;
 pub mod frontend_writer;
+pub mod request_body_forwarder;
 
 use crate::error::{
     ProxyBackendError, ProxyCopyError, ProxyError, ProxyFrontendError, ProxyResult,
@@ -1338,7 +1339,12 @@ impl<FR, FW> BackendProxyRequest<FR, FW> {
     /// Decompose into the prepared request, frontend body reader, and pending
     /// frontend response.
     fn into_parts(self) -> (Request, FrontendBodyReader<FR>, PendingFrontendResponse<FW>) {
-        (self.request, self.body_reader, self.pending)
+        let Self {
+            request,
+            body_reader,
+            pending,
+        } = self;
+        (request, body_reader, pending)
     }
 
     /// Write this backend request to the given backend connection.

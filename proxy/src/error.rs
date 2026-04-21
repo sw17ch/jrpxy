@@ -122,3 +122,15 @@ pub enum ProxyFrontendWriterError {
 }
 
 pub type ProxyFrontendWriterResult<T> = Result<T, ProxyFrontendWriterError>;
+
+#[derive(thiserror::Error, Debug)]
+pub enum ProxyRequestBodyForwarderError {
+    #[error("Frontend chunked body reader is not at a chunk boundary; cannot forward")]
+    ChunkedNotAtBoundary,
+    #[error("Frontend chunked body reader is in an error state")]
+    ChunkedInErrorState,
+    #[error("Body error: {0}")]
+    BodyError(#[from] BodyError),
+}
+
+pub type ProxyRequestBodyForwarderResult<T> = Result<T, ProxyRequestBodyForwarderError>;
