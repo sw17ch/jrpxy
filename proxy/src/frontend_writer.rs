@@ -27,7 +27,9 @@ impl<I: AsyncWriteExt + Unpin> ProxyFrontendWriter<I> {
         write_response_to(response, WriteFraming::Chunked, &mut writer)
             .await
             .map_err(ProxyFrontendWriterError::WriteError)?;
-        Ok(ProxyFrontendBodyWriter::TE(IdleWriter::new(writer)))
+        Ok(ProxyFrontendBodyWriter {
+            kind: ProxyFrontendBodyWriterKind::TE(IdleWriter::new(writer)),
+        })
     }
 
     /// Send the response with a content-length-delimited body.
@@ -40,9 +42,9 @@ impl<I: AsyncWriteExt + Unpin> ProxyFrontendWriter<I> {
         write_response_to(response, WriteFraming::Length(body_len), &mut writer)
             .await
             .map_err(ProxyFrontendWriterError::WriteError)?;
-        Ok(ProxyFrontendBodyWriter::CL(ContentLengthBodyWriter::new(
-            body_len, writer,
-        )))
+        Ok(ProxyFrontendBodyWriter {
+            kind: ProxyFrontendBodyWriterKind::CL(ContentLengthBodyWriter::new(body_len, writer)),
+        })
     }
 
     /// Send the response with no body, preserving any framing headers from the
@@ -55,9 +57,9 @@ impl<I: AsyncWriteExt + Unpin> ProxyFrontendWriter<I> {
         write_response_to(response, WriteFraming::PreserveFraming, &mut writer)
             .await
             .map_err(ProxyFrontendWriterError::WriteError)?;
-        Ok(ProxyFrontendBodyWriter::Bodyless(BodylessBodyWriter::new(
-            writer,
-        )))
+        Ok(ProxyFrontendBodyWriter {
+            kind: ProxyFrontendBodyWriterKind::Bodyless(BodylessBodyWriter::new(writer)),
+        })
     }
 
     /// Send the response with a body terminated by connection close (RFC 9112
@@ -71,7 +73,9 @@ impl<I: AsyncWriteExt + Unpin> ProxyFrontendWriter<I> {
         write_response_to(response, WriteFraming::StripFraming, &mut writer)
             .await
             .map_err(ProxyFrontendWriterError::WriteError)?;
-        Ok(ProxyFrontendBodyWriter::Eof(writer))
+        Ok(ProxyFrontendBodyWriter {
+            kind: ProxyFrontendBodyWriterKind::Eof(writer),
+        })
     }
 
     pub fn into_inner(self) -> I {
@@ -125,10 +129,16 @@ async fn write_response_to<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// The body writer for a proxy-owned frontend connection, holding raw body-crate
-/// writer types. Pass to [`crate::response_forwarder::ProxyResponseBodyForwarder`]
-/// to forward the body. Finishing always produces a [`ProxyFrontendWriter`].
-pub enum ProxyFrontendBodyWriter<I> {
+/// The body writer for a proxy-owned frontend connection. Finishing always
+/// produces a [`ProxyFrontendWriter`].
+///
+/// The inner writer kind is crate-private so that raw body-crate writers
+/// cannot be extracted and reused on a backend connection.
+pub struct ProxyFrontendBodyWriter<I> {
+    pub(crate) kind: ProxyFrontendBodyWriterKind<I>,
+}
+
+pub(crate) enum ProxyFrontendBodyWriterKind<I> {
     Bodyless(BodylessBodyWriter<I>),
     CL(ContentLengthBodyWriter<I>),
     TE(IdleWriter<I>),

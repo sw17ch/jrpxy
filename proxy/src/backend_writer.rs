@@ -30,7 +30,9 @@ impl<I: AsyncWriteExt + Unpin> ProxyBackendWriter<I> {
         write_request_to(request, WriteFraming::Chunked, &mut writer)
             .await
             .map_err(ProxyBackendWriterError::WriteError)?;
-        Ok(ProxyBackendBodyWriter::TE(IdleWriter::new(writer)))
+        Ok(ProxyBackendBodyWriter {
+            kind: ProxyBackendBodyWriterKind::TE(IdleWriter::new(writer)),
+        })
     }
 
     pub async fn send_as_content_length(
@@ -42,9 +44,9 @@ impl<I: AsyncWriteExt + Unpin> ProxyBackendWriter<I> {
         write_request_to(request, WriteFraming::Length(body_len), &mut writer)
             .await
             .map_err(ProxyBackendWriterError::WriteError)?;
-        Ok(ProxyBackendBodyWriter::CL(ContentLengthBodyWriter::new(
-            body_len, writer,
-        )))
+        Ok(ProxyBackendBodyWriter {
+            kind: ProxyBackendBodyWriterKind::CL(ContentLengthBodyWriter::new(body_len, writer)),
+        })
     }
 
     pub async fn send_as_bodyless(
@@ -55,9 +57,9 @@ impl<I: AsyncWriteExt + Unpin> ProxyBackendWriter<I> {
         write_request_to(request, WriteFraming::PreserveFraming, &mut writer)
             .await
             .map_err(ProxyBackendWriterError::WriteError)?;
-        Ok(ProxyBackendBodyWriter::Bodyless(BodylessBodyWriter::new(
-            writer,
-        )))
+        Ok(ProxyBackendBodyWriter {
+            kind: ProxyBackendBodyWriterKind::Bodyless(BodylessBodyWriter::new(writer)),
+        })
     }
 
     pub fn into_inner(self) -> I {
@@ -106,10 +108,16 @@ async fn write_request_to<W: AsyncWriteExt + Unpin>(
     Ok(())
 }
 
-/// The body writer for a proxy-owned backend connection, holding raw body-crate
-/// writer types. Pass to [`crate::body_forwarder::ProxyBodyForwarder`] to
-/// forward the body. Finishing always produces a [`ProxyBackendWriter`].
-pub enum ProxyBackendBodyWriter<I> {
+/// The body writer for a proxy-owned backend connection. Finishing always
+/// produces a [`ProxyBackendWriter`].
+///
+/// The inner writer kind is crate-private so that raw body-crate writers
+/// cannot be extracted and reused on a frontend connection.
+pub struct ProxyBackendBodyWriter<I> {
+    pub(crate) kind: ProxyBackendBodyWriterKind<I>,
+}
+
+pub(crate) enum ProxyBackendBodyWriterKind<I> {
     Bodyless(BodylessBodyWriter<I>),
     CL(ContentLengthBodyWriter<I>),
     TE(IdleWriter<I>),
