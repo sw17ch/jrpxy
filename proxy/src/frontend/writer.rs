@@ -3,7 +3,7 @@
 //! We can use [`FrontendWriter`] to write a stream of requests.
 //!
 //! ```rust
-//! use jrpxy_frontend::writer::FrontendWriter;
+//! use jrpxy_proxy::frontend::writer::FrontendWriter;
 //! use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 //!
 //! #[tokio::main(flavor = "current_thread")]
@@ -68,7 +68,7 @@
 //! }
 //! ```
 
-use crate::error::{FrontendError, FrontendResult};
+use crate::frontend::error::{FrontendError, FrontendResult};
 use jrpxy_body::{
     error::BodyError,
     writer::{
@@ -647,7 +647,7 @@ mod test {
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
     use jrpxy_util::debug::AsciiDebug;
 
-    use crate::{error::FrontendError, writer::FrontendWriter};
+    use crate::frontend::{error::FrontendError, writer::FrontendWriter};
 
     #[tokio::test]
     async fn frontend_writer() {

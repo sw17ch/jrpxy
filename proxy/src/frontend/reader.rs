@@ -3,7 +3,7 @@
 //! We can use [`FrontendReader`] to read a stream of requests.
 //!
 //! ```rust
-//! use jrpxy_frontend::reader::FrontendReader;
+//! use jrpxy_proxy::frontend::reader::FrontendReader;
 //!
 //! #[tokio::main(flavor = "current_thread")]
 //! async fn main() {
@@ -53,7 +53,7 @@ use jrpxy_http_message::{
 use jrpxy_util::io_buffer::BytesReader;
 use tokio::io::AsyncReadExt;
 
-use crate::error::{FrontendError, FrontendResult};
+use crate::frontend::error::{FrontendError, FrontendResult};
 
 /// Reads a request from a frontend reader. When `read()` is called, this type
 /// is consumed, and a [`FrontendRequest`] is returned.
@@ -335,7 +335,7 @@ mod test {
     use jrpxy_body::error::BodyError;
     use tokio::io::AsyncWriteExt;
 
-    use crate::{error::FrontendError, reader::FrontendReader};
+    use crate::frontend::{error::FrontendError, reader::FrontendReader};
 
     #[tokio::test]
     async fn read_cl_frontend() {

@@ -1,6 +1,7 @@
-use jrpxy_backend::error::BackendError;
-use jrpxy_frontend::error::FrontendError;
 use jrpxy_http_message::header::HeaderError;
+
+use crate::backend::error::BackendError;
+use crate::frontend::error::FrontendError;
 
 use crate::ConnectionTokenParserError;
 

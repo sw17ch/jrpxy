@@ -3,18 +3,6 @@ use std::future::Future;
 use std::task::Poll;
 
 use bytes::{Buf, Bytes};
-use jrpxy_backend::{
-    error::BackendError,
-    reader::{
-        BackendBodyReader, BackendReader, BackendResponse as BackendReaderResponse,
-        BackendStreamReader, ResponseStream,
-    },
-    writer::{BackendBodyWriter, BackendWriter},
-};
-use jrpxy_frontend::{
-    reader::{FrontendBodyReader, FrontendReader, FrontendRequest},
-    writer::{FrontendBodyWriter, FrontendWriter},
-};
 use jrpxy_http_message::{
     header::Headers,
     message::{Request, Response},
@@ -23,7 +11,22 @@ use jrpxy_http_message::{
 use jrpxy_util::parse::is_valid_tchar;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+pub mod backend;
 pub mod error;
+pub mod frontend;
+
+use crate::backend::{
+    error::BackendError,
+    reader::{
+        BackendBodyReader, BackendReader, BackendResponse as BackendReaderResponse,
+        BackendStreamReader, ResponseStream,
+    },
+    writer::{BackendBodyWriter, BackendWriter},
+};
+use crate::frontend::{
+    reader::{FrontendBodyReader, FrontendReader, FrontendRequest},
+    writer::{FrontendBodyWriter, FrontendWriter},
+};
 pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
 use crate::error::ProxyBackendError;
@@ -1521,8 +1524,8 @@ impl<I: std::fmt::Debug> std::fmt::Debug for ProxyResponseStream<I> {
 
 #[cfg(test)]
 mod test {
-    use jrpxy_backend::{reader::BackendReader, writer::BackendWriter};
-    use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
+    use crate::backend::{reader::BackendReader, writer::BackendWriter};
+    use crate::frontend::{reader::FrontendReader, writer::FrontendWriter};
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 
     use crate::{

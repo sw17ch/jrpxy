@@ -18,7 +18,7 @@ use std::{
 
 use tokio::io::{self, AsyncWrite, AsyncWriteExt};
 
-use crate::error::{BackendError, BackendResult};
+use crate::backend::error::{BackendError, BackendResult};
 
 pub struct BackendWriter<I> {
     writer: I,
@@ -453,7 +453,7 @@ mod test {
     use jrpxy_body::error::BodyError;
     use jrpxy_http_message::{message::RequestBuilder, version::HttpVersion};
 
-    use crate::{error::BackendError, writer::BackendWriter};
+    use crate::backend::{error::BackendError, writer::BackendWriter};
 
     #[tokio::test]
     async fn write_cl_backend() {

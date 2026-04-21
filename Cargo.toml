@@ -1,18 +1,14 @@
 [workspace]
 resolver = "3"
 members = [
-    "backend",
     "body",
-    "frontend",
     "http-message",
     "proxy",
     "util",
 ]
 
 [workspace.dependencies]
-jrpxy-backend = { path = "backend" }
 jrpxy-body = { path = "body" }
-jrpxy-frontend = { path = "frontend" }
 jrpxy-http-message = { path = "http-message" }
 jrpxy-proxy = { path = "proxy" }
 jrpxy-util = { path = "util" }

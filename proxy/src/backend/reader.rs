@@ -13,7 +13,7 @@ use jrpxy_http_message::{
 use jrpxy_util::io_buffer::BytesReader;
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::error::{BackendError, BackendResult};
+use crate::backend::error::{BackendError, BackendResult};
 
 #[derive(Debug)]
 pub struct BackendReader<I> {
@@ -477,7 +477,7 @@ mod test {
     use bytes::Bytes;
     use jrpxy_http_message::version::HttpVersion;
 
-    use crate::reader::BackendReader;
+    use crate::backend::reader::BackendReader;
 
     #[tokio::test]
     async fn read_cl_backend() {
