@@ -20,10 +20,6 @@ use crate::{
     },
 };
 
-pub mod error;
-pub mod reader;
-pub mod writer;
-
 // Assume we can glob length and eof into the same operations, we need the
 // following writers. ChunkToChunkBodyForwarder lets us preserve what we can
 // from chunk encoding.
