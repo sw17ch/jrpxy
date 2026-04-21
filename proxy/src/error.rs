@@ -119,6 +119,8 @@ pub type ProxyBackendWriterResult<T> = Result<T, ProxyBackendWriterError>;
 pub enum ProxyFrontendWriterError {
     #[error("Write error: {0}")]
     WriteError(io::Error),
+    #[error("Body write error: {0}")]
+    BodyWriteError(#[from] BodyError),
 }
 
 pub type ProxyFrontendWriterResult<T> = Result<T, ProxyFrontendWriterError>;
