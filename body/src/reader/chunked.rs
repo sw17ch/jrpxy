@@ -347,7 +347,7 @@ pub struct ChunkHeadReader<I> {
 }
 
 impl<I> ChunkHeadReader<I> {
-    fn new(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
+    pub fn new(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
         Self {
             reader,
             parse_slots,

@@ -4,7 +4,13 @@ use std::{
 };
 
 use bytes::Bytes;
-use jrpxy_body::reader::{BodylessBodyReader, ChunkedBodyReader, ContentLengthBodyReader};
+use jrpxy_body::{
+    error::BodyError,
+    reader::{
+        BodylessBodyReader, ChunkDataReader, ChunkHeadReader, ContentLengthBodyReader,
+        FinalChunkReader, NextChunk,
+    },
+};
 use jrpxy_http_message::{
     framing::ParsedFraming,
     header::Headers,
@@ -14,6 +20,24 @@ use jrpxy_util::io_buffer::BytesReader;
 use tokio::io::AsyncReadExt;
 
 use crate::error::{ProxyFrontendReaderError, ProxyFrontendReaderResult};
+
+const DRAIN_SIZE: usize = 4096;
+
+/// Store `$state` and return `Poll::Pending` atomically, preventing the
+/// common mistake of storing state without returning.
+macro_rules! park {
+    ($self:expr, $state:expr) => {{
+        $self.state = Some($state);
+        return Poll::Pending;
+    }};
+}
+
+/// Wrap `$err` in `Poll::Ready(Err(_))` and return.
+macro_rules! bail {
+    ($err:expr) => {{
+        return Poll::Ready(Err($err));
+    }};
+}
 
 /// Reads a stream of HTTP/1.x requests from a frontend connection.
 pub struct ProxyFrontendReader<I> {
@@ -101,9 +125,9 @@ impl<I: AsyncReadExt + Unpin> ProxyFrontendReader<I> {
                     inner: ContentLengthBodyReader::new(cl, reader, parse_slots),
                 })
             }
-            ParsedFraming::Chunked => ProxyFrontendBodyReader::TE(ProxyFrontendChunkedBodyReader {
-                inner: ChunkedBodyReader::new(reader, parse_slots),
-            }),
+            ParsedFraming::Chunked => ProxyFrontendBodyReader::TE(
+                ProxyFrontendChunkedBodyReader::new(reader, parse_slots),
+            ),
             ParsedFraming::NoFraming => {
                 ProxyFrontendBodyReader::Bodyless(ProxyFrontendBodylessBodyReader {
                     inner: BodylessBodyReader::new(reader, parse_slots),
@@ -137,7 +161,7 @@ impl<I> ProxyFrontendRequest<I> {
 }
 
 pub struct ProxyFrontendBodylessBodyReader<I> {
-    inner: BodylessBodyReader<I>,
+    pub(crate) inner: BodylessBodyReader<I>,
 }
 
 impl<I> ProxyFrontendBodylessBodyReader<I> {
@@ -151,7 +175,7 @@ impl<I> ProxyFrontendBodylessBodyReader<I> {
 }
 
 pub struct ProxyFrontendContentLengthBodyReader<I> {
-    inner: ContentLengthBodyReader<I>,
+    pub(crate) inner: ContentLengthBodyReader<I>,
 }
 
 impl<I> ProxyFrontendContentLengthBodyReader<I> {
@@ -198,26 +222,51 @@ impl<I: AsyncReadExt + Unpin> ProxyFrontendContentLengthBodyReader<I> {
     }
 }
 
+pub(crate) enum FrontendChunkedState<I> {
+    Between(ChunkHeadReader<I>),
+    InChunk(ChunkDataReader<I>),
+    Done(FinalChunkReader<I>),
+}
+
 pub struct ProxyFrontendChunkedBodyReader<I> {
-    inner: ChunkedBodyReader<I>,
+    pub(crate) state: Option<FrontendChunkedState<I>>,
 }
 
 impl<I> ProxyFrontendChunkedBodyReader<I> {
+    pub(crate) fn new(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
+        Self {
+            state: Some(FrontendChunkedState::Between(ChunkHeadReader::new(
+                reader,
+                parse_slots,
+            ))),
+        }
+    }
+
     pub fn drained(&self) -> bool {
-        self.inner.drained()
+        matches!(self.state, None | Some(FrontendChunkedState::Done(_)))
     }
 
     /// Recover the [`ProxyFrontendReader`] and trailers after the body has been
     /// fully drained. Panics if called before draining.
     pub fn finish(self) -> (ProxyFrontendReader<I>, Headers) {
-        let (reader, parse_slots, trailers) = self.inner.finish();
-        (
-            ProxyFrontendReader {
-                reader,
-                parse_slots,
-            },
-            trailers,
-        )
+        let Self { state } = self;
+        match state {
+            Some(FrontendChunkedState::Done(r)) => {
+                let (reader, parse_slots, trailers) = r.into_parts();
+                (
+                    ProxyFrontendReader {
+                        reader,
+                        parse_slots,
+                    },
+                    trailers,
+                )
+            }
+            // TODO: this should not panic. return an error if in the wrong state.
+            Some(_) => {
+                panic!("attempted to finish the chunked body reader before it was fully drained")
+            }
+            None => panic!("attempted to finish the chunked body reader after an error"),
+        }
     }
 }
 
@@ -231,10 +280,42 @@ impl<I: AsyncReadExt + Unpin> ProxyFrontendChunkedBodyReader<I> {
         cx: &mut Context<'_>,
         max_len: usize,
     ) -> Poll<ProxyFrontendReaderResult<Option<Bytes>>> {
-        Poll::Ready(
-            ready!(self.inner.poll_read(cx, max_len))
-                .map_err(ProxyFrontendReaderError::BodyReadError),
-        )
+        loop {
+            let Some(current) = self.state.take() else {
+                bail!(ProxyFrontendReaderError::BodyReadError(
+                    BodyError::ReadAfterError,
+                ));
+            };
+            match current {
+                FrontendChunkedState::InChunk(mut r) => match r.poll_read(cx, max_len) {
+                    Poll::Pending => park!(self, FrontendChunkedState::InChunk(r)),
+                    Poll::Ready(Err(e)) => bail!(ProxyFrontendReaderError::BodyReadError(e)),
+                    Poll::Ready(Ok(Some(b))) => {
+                        self.state = Some(FrontendChunkedState::InChunk(r));
+                        return Poll::Ready(Ok(Some(b)));
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        self.state = Some(FrontendChunkedState::Between(r.finish()));
+                    }
+                },
+                FrontendChunkedState::Between(mut r) => match r.poll_read_chunk(cx) {
+                    Poll::Pending => park!(self, FrontendChunkedState::Between(r)),
+                    Poll::Ready(Err(e)) => bail!(ProxyFrontendReaderError::BodyReadError(e)),
+                    Poll::Ready(Ok(())) => match r.finish() {
+                        NextChunk::Data(r) => {
+                            self.state = Some(FrontendChunkedState::InChunk(r));
+                        }
+                        NextChunk::Final(r) => {
+                            self.state = Some(FrontendChunkedState::Done(r));
+                        }
+                    },
+                },
+                FrontendChunkedState::Done(r) => {
+                    self.state = Some(FrontendChunkedState::Done(r));
+                    return Poll::Ready(Ok(None));
+                }
+            }
+        }
     }
 
     pub async fn drain(mut self) -> ProxyFrontendReaderResult<(ProxyFrontendReader<I>, Headers)> {
@@ -243,9 +324,13 @@ impl<I: AsyncReadExt + Unpin> ProxyFrontendChunkedBodyReader<I> {
     }
 
     pub fn poll_drain(&mut self, cx: &mut Context<'_>) -> Poll<ProxyFrontendReaderResult<()>> {
-        Poll::Ready(
-            ready!(self.inner.poll_drain(cx)).map_err(ProxyFrontendReaderError::BodyReadError),
-        )
+        loop {
+            match ready!(self.poll_read(cx, DRAIN_SIZE)) {
+                Err(e) => bail!(e),
+                Ok(None) => return Poll::Ready(Ok(())),
+                Ok(Some(_)) => continue,
+            }
+        }
     }
 }
 
@@ -272,7 +357,7 @@ impl<I: AsyncReadExt + Unpin> ProxyFrontendBodyReader<I> {
         match self {
             ProxyFrontendBodyReader::Bodyless(_) => true,
             ProxyFrontendBodyReader::CL(r) => r.inner.drained(),
-            ProxyFrontendBodyReader::TE(r) => r.inner.drained(),
+            ProxyFrontendBodyReader::TE(r) => r.drained(),
         }
     }
 
