@@ -76,6 +76,16 @@ impl<I> FrontendReader<I> {
         }
     }
 
+    /// Reassemble a [`FrontendReader`] from its raw parts. Used by the request
+    /// body pump to hand a reader back to the caller once the body has been
+    /// fully drained.
+    pub(crate) fn from_parts(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
+        Self {
+            reader,
+            parse_slots,
+        }
+    }
+
     pub fn into_inner(self) -> BytesReader<I> {
         let Self {
             reader,
@@ -186,6 +196,13 @@ pub struct FrontendBodylessBodyReader<I> {
     inner: BodylessBodyReader<I>,
 }
 
+impl<I> FrontendBodylessBodyReader<I> {
+    pub(crate) fn into_inner(self) -> BodylessBodyReader<I> {
+        let Self { inner } = self;
+        inner
+    }
+}
+
 impl<I: AsyncReadExt + Unpin> FrontendBodylessBodyReader<I> {
     pub fn drain(self) -> FrontendResult<FrontendReader<I>> {
         let (reader, parse_slots) = self.inner.drain();
@@ -213,6 +230,11 @@ impl<I> FrontendContentLengthBodyReader<I> {
             reader,
             parse_slots,
         }
+    }
+
+    pub(crate) fn into_inner(self) -> ContentLengthBodyReader<I> {
+        let Self { inner } = self;
+        inner
     }
 }
 
@@ -259,6 +281,11 @@ impl<I> FrontendChunkedBodyReader<I> {
             },
             trailers,
         )
+    }
+
+    pub(crate) fn into_inner(self) -> ChunkedBodyReader<I> {
+        let Self { inner } = self;
+        inner
     }
 }
 

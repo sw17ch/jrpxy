@@ -80,6 +80,19 @@ impl<I> ChunkedBodyReader<I> {
         matches!(self.inner, None | Some(ChunkedBodyChunkStream::Done { .. }))
     }
 
+    /// Extract the initial [`ChunkHeadReader`] if the reader is still at its
+    /// starting position (no chunk bytes have been consumed).
+    ///
+    /// Returns `None` if any chunk data has already been read, or if the
+    /// reader has been fully drained.
+    pub fn into_head_reader(self) -> Option<ChunkHeadReader<I>> {
+        let Self { inner } = self;
+        match inner {
+            Some(ChunkedBodyChunkStream::BetweenChunk(head)) => Some(head),
+            _ => None,
+        }
+    }
+
     /// Finish the chunked body reader and return the inner parts.
     ///
     /// # Panics

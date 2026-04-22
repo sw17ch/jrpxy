@@ -23,6 +23,16 @@ use crate::backend::error::{BackendError, BackendResult};
 pub struct BackendWriter<I> {
     writer: I,
 }
+
+impl<I> BackendWriter<I> {
+    /// Reassemble a [`BackendWriter`] from its raw inner IO. Used by the
+    /// request body pump to hand a writer back to the caller once the request
+    /// body has been fully forwarded.
+    pub(crate) fn from_writer(writer: I) -> Self {
+        Self { writer }
+    }
+}
+
 impl<I: AsyncWriteExt + Unpin> BackendWriter<I> {
     pub fn new(writer: I) -> Self {
         Self { writer }
@@ -132,6 +142,13 @@ pub struct BackendBodylessBodyWriter<I> {
     inner: BodylessBodyWriter<I>,
 }
 
+impl<I> BackendBodylessBodyWriter<I> {
+    pub(crate) fn into_inner(self) -> BodylessBodyWriter<I> {
+        let Self { inner } = self;
+        inner
+    }
+}
+
 impl<I: AsyncWriteExt + Unpin> BackendBodylessBodyWriter<I> {
     pub fn finish(self) -> BackendResult<BackendWriter<I>> {
         let Self { inner } = self;
@@ -142,6 +159,13 @@ impl<I: AsyncWriteExt + Unpin> BackendBodylessBodyWriter<I> {
 /// Backend wrapper for [`ContentLengthBodyWriter`].
 pub struct BackendContentLengthBodyWriter<I> {
     inner: ContentLengthBodyWriter<I>,
+}
+
+impl<I> BackendContentLengthBodyWriter<I> {
+    pub(crate) fn into_inner(self) -> ContentLengthBodyWriter<I> {
+        let Self { inner } = self;
+        inner
+    }
 }
 
 impl<I: AsyncWriteExt + Unpin> BackendContentLengthBodyWriter<I> {
@@ -185,6 +209,11 @@ pub struct BackendIdleWriter<I> {
 }
 
 impl<I> BackendIdleWriter<I> {
+    pub(crate) fn into_inner(self) -> IdleWriter<I> {
+        let Self { inner } = self;
+        inner
+    }
+
     /// Begin a new chunk of the given length, returning a [`BackendHeadWriter`]
     /// that will write the chunk header.
     pub fn start(self, chunk_length: u64) -> BackendHeadWriter<I> {

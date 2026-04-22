@@ -14,6 +14,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 pub mod backend;
 pub mod error;
 pub mod frontend;
+pub mod request_body_forwarder;
 
 use crate::backend::{
     error::BackendError,
@@ -27,6 +28,7 @@ use crate::frontend::{
     reader::{FrontendBodyReader, FrontendReader, FrontendRequest},
     writer::{FrontendBodyWriter, FrontendWriter},
 };
+use crate::request_body_forwarder::ProxyRequestBodyForwarder;
 pub use error::{ProxyCopyError, ProxyError, ProxyResult};
 
 use crate::error::ProxyBackendError;
@@ -353,13 +355,13 @@ impl<FW> BackendResponseError<FW> {
 /// Retry is not offered: the backend has already acknowledged the request
 /// (evidenced by the 1xx it sent), so retrying risks duplicate processing.
 /// The frontend connection is still alive; an error can be sent to the client.
-pub struct BackendStreamError<FR, FW> {
-    frontend_body_reader: FrontendBodyReader<FR>,
+pub struct BackendStreamError<FR, FW, BW> {
+    forwarder: ProxyRequestBodyForwarder<FR, BW>,
     pending: PendingFrontendResponse<FW>,
     error: ProxyBackendError,
 }
 
-impl<FR, FW> std::fmt::Debug for BackendStreamError<FR, FW> {
+impl<FR, FW, BW> std::fmt::Debug for BackendStreamError<FR, FW, BW> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackendStreamError")
             .field("error", &self.error)
@@ -367,29 +369,35 @@ impl<FR, FW> std::fmt::Debug for BackendStreamError<FR, FW> {
     }
 }
 
-impl<FR, FW> From<BackendStreamError<FR, FW>> for ProxyError {
-    fn from(e: BackendStreamError<FR, FW>) -> Self {
+impl<FR, FW, BW> From<BackendStreamError<FR, FW, BW>> for ProxyError {
+    fn from(e: BackendStreamError<FR, FW, BW>) -> Self {
         ProxyError::ProxyBackend(e.error)
     }
 }
 
-impl<FR, FW> BackendStreamError<FR, FW> {
+impl<FR, FW, BW> BackendStreamError<FR, FW, BW> {
     /// Returns the backend error that caused this failure.
     pub fn error(&self) -> &ProxyBackendError {
         &self.error
     }
 
     /// Consumes the error and returns a [`PendingFrontendResponse`] and the
-    /// frontend body reader. The body reader is returned separately so the
-    /// caller can decide whether to drain it (for connection reuse) or drop it
-    /// (to close the read half of the socket immediately).
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, FrontendBodyReader<FR>) {
+    /// in-flight request body forwarder. The forwarder is returned separately
+    /// so the caller can decide whether to drive it to completion (for
+    /// connection reuse) or drop it (to close the read half of the socket
+    /// immediately).
+    pub fn into_pending_response(
+        self,
+    ) -> (
+        PendingFrontendResponse<FW>,
+        ProxyRequestBodyForwarder<FR, BW>,
+    ) {
         let Self {
-            frontend_body_reader,
+            forwarder,
             pending,
             error: _,
         } = self;
-        (pending, frontend_body_reader)
+        (pending, forwarder)
     }
 }
 
@@ -545,12 +553,12 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
 ///
 /// [`Frontend`]: InformationalForwardError::Frontend
 /// [`Backend`]: InformationalForwardError::Backend
-pub enum InformationalForwardError<FR, FW> {
+pub enum InformationalForwardError<FR, FW, BW> {
     Frontend(ProxyFrontendError),
-    Backend(BackendStreamError<FR, FW>),
+    Backend(BackendStreamError<FR, FW, BW>),
 }
 
-impl<FR, FW> std::fmt::Debug for InformationalForwardError<FR, FW> {
+impl<FR, FW, BW> std::fmt::Debug for InformationalForwardError<FR, FW, BW> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InformationalForwardError::Frontend(e) => f.debug_tuple("Frontend").field(e).finish(),
@@ -559,8 +567,8 @@ impl<FR, FW> std::fmt::Debug for InformationalForwardError<FR, FW> {
     }
 }
 
-impl<FR, FW> From<InformationalForwardError<FR, FW>> for ProxyError {
-    fn from(e: InformationalForwardError<FR, FW>) -> Self {
+impl<FR, FW, BW> From<InformationalForwardError<FR, FW, BW>> for ProxyError {
+    fn from(e: InformationalForwardError<FR, FW, BW>) -> Self {
         match e {
             InformationalForwardError::Frontend(e) => ProxyError::ProxyFrontend(e),
             InformationalForwardError::Backend(e) => ProxyError::ProxyBackend(e.error),
@@ -589,6 +597,7 @@ pub enum BackendResponseStream<FR, FW, BR, BW> {
 
 impl<FR, FW, BR, BW> ResponseReader<FR, FW, BR, BW>
 where
+    FR: AsyncReadExt + Unpin,
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
 {
@@ -604,35 +613,42 @@ where
 
         let allow_body = !pending.client_options.is_head;
         let max_backend_head_length = pending.options.max_backend_head_length;
-        let response_stream = match backend_reader
-            .read(allow_body, max_backend_head_length)
-            .await
-        {
-            Ok(r) => r,
-            Err(error) => {
-                // backend_reader and backend_body_writer are both discarded;
-                // the backend connection is broken.
-                drop(backend_body_writer);
-                return Err(BackendResponseError {
-                    pending,
-                    error: error.into(),
-                });
+
+        // Pump the frontend request body to the backend while we wait for the
+        // response head. Some origins will not begin responding until the full
+        // request body has been received.
+        let mut forwarder =
+            ProxyRequestBodyForwarder::build(frontend_body_reader, backend_body_writer);
+
+        let head_read = backend_reader.read(allow_body, max_backend_head_length);
+        tokio::pin!(head_read);
+
+        let mut forward_done = false;
+        let response_stream = loop {
+            tokio::select! {
+                biased;
+                res = &mut head_read => {
+                    match res {
+                        Ok(r) => break r,
+                        Err(error) => {
+                            return Err(BackendResponseError {
+                                pending,
+                                error: error.into(),
+                            });
+                        }
+                    }
+                }
+                res = std::future::poll_fn(|cx| forwarder.poll_forward(cx)), if !forward_done => {
+                    forward_done = true;
+                    if let Err(e) = res {
+                        return Err(BackendResponseError {
+                            pending,
+                            error: BackendError::BodyWriteError(e).into(),
+                        });
+                    }
+                }
             }
         };
-
-        // TODO: we need to drive the frontend request body to the origin at the
-        // same time as we're waiting for the response to come back in case the
-        // origin will not reply to us until its receives the fully body.
-        //
-        // This does also expose that, once we start trying to read the request
-        // from the origin, we cannot recover the client at this stage. If the
-        // backend read fails, we have to discard all connections. This implies
-        // that `BackendResponseError` will go away.
-        //
-        // Since we need to maintain the state, we should make a new type of
-        // forwarder that can be incrementally driven until the response comes
-        // back, and the remainder of the work can be passed around in the
-        // BackendResponseStream to be completed by the BodyExchanger.
 
         let response_stream = match ProxyResponseStream::new(response_stream) {
             Ok(s) => s,
@@ -643,10 +659,9 @@ where
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 BackendResponseStream::Response(BackendResponse {
-                    frontend_body_reader,
+                    forwarder,
                     pending,
                     proxy_response,
-                    backend_body_writer,
                 })
             }
             ProxyResponseStream::Informational(
@@ -654,10 +669,9 @@ where
                 proxy_stream_reader,
             ) => BackendResponseStream::Informational(BackendInformationalResponse {
                 proxy_informational_response,
-                frontend_body_reader,
+                forwarder,
                 pending,
                 proxy_stream_reader,
-                backend_body_writer,
             }),
         })
     }
@@ -679,10 +693,9 @@ impl<FR, FW, BR, BW> InformationalForwardResult<FR, FW, BR, BW> {
 
 pub struct BackendInformationalResponse<FR, FW, BR, BW> {
     proxy_informational_response: ProxyInformationalResponse,
-    frontend_body_reader: FrontendBodyReader<FR>,
+    forwarder: ProxyRequestBodyForwarder<FR, BW>,
     pending: PendingFrontendResponse<FW>,
     proxy_stream_reader: ProxyStreamReader<BR>,
-    backend_body_writer: BackendBodyWriter<BW>,
 }
 
 impl<FR, FW, BR, BW> BackendInformationalResponse<FR, FW, BR, BW>
@@ -701,13 +714,13 @@ where
 
     pub async fn forward_informational_response(
         self,
-    ) -> Result<InformationalForwardResult<FR, FW, BR, BW>, InformationalForwardError<FR, FW>> {
+    ) -> Result<InformationalForwardResult<FR, FW, BR, BW>, InformationalForwardError<FR, FW, BW>>
+    {
         let Self {
             proxy_informational_response,
-            frontend_body_reader,
+            forwarder,
             pending,
             proxy_stream_reader,
-            backend_body_writer,
         } = self;
 
         // RFC9110 section 15.2 states that a server MUST NOT send any 1xx
@@ -730,7 +743,7 @@ where
             Ok(r) => r,
             Err(error) => {
                 return Err(InformationalForwardError::Backend(BackendStreamError {
-                    frontend_body_reader,
+                    forwarder,
                     pending,
                     error,
                 }));
@@ -740,10 +753,9 @@ where
         let response_stream = match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 BackendResponseStream::Response(BackendResponse {
-                    frontend_body_reader,
+                    forwarder,
                     pending,
                     proxy_response,
-                    backend_body_writer,
                 })
             }
             ProxyResponseStream::Informational(
@@ -751,10 +763,9 @@ where
                 proxy_stream_reader,
             ) => BackendResponseStream::Informational(BackendInformationalResponse {
                 proxy_informational_response,
-                frontend_body_reader,
+                forwarder,
                 pending,
                 proxy_stream_reader,
-                backend_body_writer,
             }),
         };
 
@@ -767,10 +778,9 @@ where
 }
 
 pub struct BackendResponse<FR, FW, BR, BW> {
-    frontend_body_reader: FrontendBodyReader<FR>,
+    forwarder: ProxyRequestBodyForwarder<FR, BW>,
     pending: PendingFrontendResponse<FW>,
     proxy_response: ProxyResponse<BR>,
-    backend_body_writer: BackendBodyWriter<BW>,
 }
 
 impl<FR, FW, BR, BW> BackendResponse<FR, FW, BR, BW>
@@ -796,10 +806,9 @@ where
     /// and writers and drive the copy yourself.
     pub async fn forward_response_head(self) -> Result<BodyExchanger<FR, FW, BR, BW>, ProxyError> {
         let Self {
-            frontend_body_reader,
+            forwarder,
             pending,
             proxy_response,
-            backend_body_writer,
         } = self;
 
         let is_head = pending.client_options.is_head;
@@ -843,8 +852,7 @@ where
 
         Ok(BodyExchanger {
             options,
-            frontend_body_reader,
-            backend_body_writer,
+            forwarder,
             backend_body_reader,
             frontend_body_writer,
         })
@@ -857,8 +865,7 @@ where
 /// Produced by [`BackendResponse::forward_response_head`].
 pub struct BodyExchanger<FR, FW, BR, BW> {
     options: ProxyOptions,
-    frontend_body_reader: FrontendBodyReader<FR>,
-    backend_body_writer: BackendBodyWriter<BW>,
+    forwarder: ProxyRequestBodyForwarder<FR, BW>,
     backend_body_reader: BackendBodyReader<BR>,
     frontend_body_writer: FrontendBodyWriter<FW>,
 }
@@ -872,10 +879,8 @@ pub struct BodyExchanger<FR, FW, BR, BW> {
 pub struct BodyExchangerParts<FR, FW, BR, BW> {
     /// ProxyOptions governing behavior so far
     pub options: ProxyOptions,
-    /// Reads the request body from the frontend (f2b source).
-    pub frontend_body_reader: FrontendBodyReader<FR>,
-    /// Writes the request body to the backend (f2b sink).
-    pub backend_body_writer: BackendBodyWriter<BW>,
+    /// Pumps the request body from the frontend to the backend (f2b).
+    pub forwarder: ProxyRequestBodyForwarder<FR, BW>,
     /// Reads the response body from the backend (b2f source).
     pub backend_body_reader: BackendBodyReader<BR>,
     /// Writes the response body to the frontend (b2f sink).
@@ -894,15 +899,13 @@ where
     pub fn into_parts(self) -> BodyExchangerParts<FR, FW, BR, BW> {
         let Self {
             options,
-            frontend_body_reader,
-            backend_body_writer,
+            forwarder,
             backend_body_reader,
             frontend_body_writer,
         } = self;
         BodyExchangerParts {
             options,
-            frontend_body_reader,
-            backend_body_writer,
+            forwarder,
             backend_body_reader,
             frontend_body_writer,
         }
@@ -918,8 +921,7 @@ where
     )> {
         let Self {
             options,
-            mut frontend_body_reader,
-            mut backend_body_writer,
+            mut forwarder,
             mut backend_body_reader,
             mut frontend_body_writer,
         } = self;
@@ -927,50 +929,11 @@ where
         let body_chunk_size = options.body_chunk_size;
 
         let f2b_fut = async move {
-            let ret;
-            loop {
-                let buf = match frontend_body_reader.read(body_chunk_size).await {
-                    Ok(Some(buf)) => buf,
-                    Ok(None) => {
-                        ret = async {
-                            match (frontend_body_reader, backend_body_writer) {
-                                (FrontendBodyReader::TE(fr), BackendBodyWriter::TE(bw)) => {
-                                    let (next_reader, trailers) = fr.drain().await?;
-                                    let next_backend = bw
-                                        // TODO: same as FrontendWriterGone — goes away
-                                        // when we have a FrontendToBackendBodyCopier.
-                                        .ok_or(ProxyCopyError::BackendWriterGone)?
-                                        .into_finisher(&trailers)
-                                        .finish()
-                                        .await?;
-                                    Ok((next_reader, next_backend))
-                                }
-                                (fr, bw) => {
-                                    let next_reader = fr.drain().await?;
-                                    let next_backend = bw.finish().await?;
-                                    Ok((next_reader, next_backend))
-                                }
-                            }
-                        }
-                        .await;
-                        break;
-                    }
-                    Err(e) => {
-                        ret = Err(ProxyCopyError::from(e));
-                        break;
-                    }
-                };
-                match backend_body_writer.write(&buf).await {
-                    Ok(()) => {
-                        // successfuly wrote buffer; loop around for another one
-                    }
-                    Err(e) => {
-                        ret = Err(ProxyCopyError::from(e));
-                        break;
-                    }
-                }
-            }
-            ret
+            std::future::poll_fn(|cx| forwarder.poll_forward(cx))
+                .await
+                .map_err(BackendError::BodyWriteError)
+                .map_err(ProxyCopyError::from)?;
+            Ok::<_, ProxyCopyError>(forwarder.into_parts())
         };
 
         let b2f_fut = async move {
@@ -1066,12 +1029,15 @@ where
             None => return Err(ProxyError::FrontendCopyIncomplete),
         };
 
-        let backend_connection = backend_reader.map(move |br| (br, backend_writer));
-        let proxy_client = frontend_writer.map(move |frontend_writer| ProxyClient {
-            frontend_reader,
-            frontend_writer,
-            options,
-        });
+        let backend_connection = backend_reader.zip(backend_writer);
+        let proxy_client =
+            frontend_reader
+                .zip(frontend_writer)
+                .map(|(frontend_reader, frontend_writer)| ProxyClient {
+                    frontend_reader,
+                    frontend_writer,
+                    options,
+                });
 
         Ok((proxy_client, backend_connection))
     }

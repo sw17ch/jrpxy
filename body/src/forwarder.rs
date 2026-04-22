@@ -11,10 +11,11 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use crate::{
     error::{BodyError, BodyResult},
     reader::{
-        ChunkDataReader, ChunkHeadReader, ContentLengthBodyReader, EofBodyReader, FinalChunkReader,
-        NextChunk,
+        BodylessBodyReader, ChunkDataReader, ChunkHeadReader, ContentLengthBodyReader,
+        EofBodyReader, FinalChunkReader, NextChunk,
     },
     writer::{
+        bodyless::BodylessBodyWriter,
         chunked::{DataCompleter, DataWriter, FinalWriter, HeadWriter, IdleWriter},
         content_length::ContentLengthBodyWriter,
     },
@@ -87,6 +88,21 @@ impl<R, W> ChunkToChunkBodyForwarder<R, W> {
     pub fn new(reader: ChunkHeadReader<R>, writer: IdleWriter<W>) -> Self {
         Self {
             state: Some(C2CState::ReadChunk { reader, writer }),
+        }
+    }
+
+    /// Decompose a fully-completed forwarder into its raw reader and writer
+    /// parts. The reader tuple is `(bytes_reader, parse_slots, trailers)`.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_forward` has not returned `Poll::Ready(Ok(()))`.
+    pub fn into_parts(self) -> ((BytesReader<R>, ParseSlots, Headers), W) {
+        let Self { state } = self;
+        match state {
+            Some(C2CState::Done { reader, writer }) => (reader, writer),
+            // TODO: this should probably result in an error instead of panic
+            _ => panic!("ChunkToChunkBodyForwarder::into_parts called before completion"),
         }
     }
 }
@@ -186,7 +202,10 @@ where
                         self.state = Some(C2CState::ReadChunk { reader, writer })
                     }
                 },
-                C2CState::Done { .. } => return Poll::Ready(Ok(())),
+                done @ C2CState::Done { .. } => {
+                    self.state = Some(done);
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
@@ -194,13 +213,16 @@ where
 
 // i could build a ChunkForwarder. Would that be nuts?
 
-/// A writer for a body that is not chunk-encoded: either content-length
-/// framed, or EOF-framed (a raw `W`).
+/// A writer for a body that is not chunk-encoded: content-length framed,
+/// EOF-framed, or bodyless.
 pub enum OtherBodyWriter<W> {
     ContentLength(ContentLengthBodyWriter<W>),
     /// The inner writer is the body stream; callers signal end-of-body by
     /// finishing the forwarder rather than by writing any framing byte.
     Eof(W),
+    /// A writer that must not receive a body. Any non-empty write resolves
+    /// to [`BodyError::BodyOverflow`]; flush is a no-op.
+    Bodyless(BodylessBodyWriter<W>),
 }
 
 impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
@@ -212,6 +234,9 @@ impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
                 Poll::Ready(Ok(n)) => Poll::Ready(Ok(n)),
                 Poll::Ready(Err(e)) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
             },
+            OtherBodyWriter::Bodyless(_) => {
+                Poll::Ready(Err(BodyError::BodyOverflow(buf.len() as u64)))
+            }
         }
     }
 
@@ -223,6 +248,7 @@ impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
                 Poll::Ready(Ok(())) => Poll::Ready(Ok(())),
                 Poll::Ready(Err(e)) => Poll::Ready(Err(BodyError::BodyWriteError(e))),
             },
+            OtherBodyWriter::Bodyless(_) => Poll::Ready(Ok(())),
         }
     }
 
@@ -234,6 +260,7 @@ impl<W: AsyncWrite + Unpin> OtherBodyWriter<W> {
             // that something has gone wrong. Use non-EOF writers and readers if
             // you want to avoid this ambiguous error condition.
             OtherBodyWriter::Eof(_w) => Ok(None),
+            OtherBodyWriter::Bodyless(w) => Ok(Some(w.finish())),
         }
     }
 }
@@ -278,6 +305,23 @@ impl<R, W> ChunkToOtherBodyForwarder<R, W> {
     pub fn new(reader: ChunkHeadReader<R>, writer: OtherBodyWriter<W>) -> Self {
         Self {
             state: Some(C2OState::ReadChunk { reader, writer }),
+        }
+    }
+
+    /// Decompose a fully-completed forwarder into its raw reader and writer
+    /// parts. The reader tuple is `(bytes_reader, parse_slots, trailers)` and
+    /// the writer is `None` for EOF-framed sinks (the underlying IO is
+    /// consumed by the forwarder).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_forward` has not returned `Poll::Ready(Ok(()))`.
+    pub fn into_parts(self) -> ((BytesReader<R>, ParseSlots, Headers), Option<W>) {
+        let Self { state } = self;
+        match state {
+            Some(C2OState::Done { reader, writer }) => (reader, writer),
+            // TODO: this should probably result in an error instead of panic
+            _ => panic!("ChunkToOtherBodyForwarder::into_parts called before completion"),
         }
     }
 }
@@ -361,18 +405,24 @@ where
                         self.state = Some(C2OState::Done { reader, writer });
                     }
                 },
-                C2OState::Done { .. } => return Poll::Ready(Ok(())),
+                done @ C2OState::Done { .. } => {
+                    self.state = Some(done);
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
 }
 
-/// A reader for a body that is not chunk-encoded: either content-length
-/// framed, or EOF-framed.
+/// A reader for a body that is not chunk-encoded: content-length framed,
+/// EOF-framed, or bodyless (immediately at end-of-body).
 pub enum OtherBodyReader<R> {
     ContentLength(ContentLengthBodyReader<R>),
     /// The body ends when the underlying connection is closed.
     Eof(EofBodyReader<R>),
+    /// A reader that is already at end-of-body. Appropriate for requests that
+    /// carry no body.
+    Bodyless(BodylessBodyReader<R>),
 }
 
 impl<R: AsyncRead + Unpin> OtherBodyReader<R> {
@@ -384,13 +434,14 @@ impl<R: AsyncRead + Unpin> OtherBodyReader<R> {
         match self {
             OtherBodyReader::ContentLength(r) => r.poll_read(cx, max_len),
             OtherBodyReader::Eof(r) => r.poll_read(cx, max_len),
+            OtherBodyReader::Bodyless(_) => Poll::Ready(Ok(None)),
         }
     }
 
     /// Consume the reader after `poll_read` has returned `Ok(None)`.
-    /// Returns `(parse_slots, Some(reader))` for content-length (IO is still
-    /// viable for pipelining) and `(parse_slots, None)` for EOF (connection
-    /// is consumed).
+    /// Returns `(parse_slots, Some(reader))` for content-length and bodyless
+    /// (IO is still viable for pipelining) and `(parse_slots, None)` for EOF
+    /// (connection is consumed).
     fn into_done(self) -> (ParseSlots, Option<BytesReader<R>>) {
         match self {
             OtherBodyReader::ContentLength(r) => {
@@ -398,6 +449,10 @@ impl<R: AsyncRead + Unpin> OtherBodyReader<R> {
                 (parse_slots, Some(reader))
             }
             OtherBodyReader::Eof(r) => (r.drain(), None),
+            OtherBodyReader::Bodyless(r) => {
+                let (reader, parse_slots) = r.drain();
+                (parse_slots, Some(reader))
+            }
         }
     }
 }
@@ -449,6 +504,23 @@ impl<R, W> OtherToChunkedBodyForwarder<R, W> {
     pub fn new(reader: OtherBodyReader<R>, writer: IdleWriter<W>) -> Self {
         Self {
             state: Some(O2CState::ReadData { reader, writer }),
+        }
+    }
+
+    /// Decompose a fully-completed forwarder into its raw reader and writer
+    /// parts. The reader tuple is `(parse_slots, bytes_reader)` where the
+    /// bytes reader is `None` for EOF-framed sources (the connection is
+    /// consumed).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_forward` has not returned `Poll::Ready(Ok(()))`.
+    pub fn into_parts(self) -> ((ParseSlots, Option<BytesReader<R>>), W) {
+        let Self { state } = self;
+        match state {
+            Some(O2CState::Done { reader, writer }) => (reader, writer),
+            // TODO: this should probably result in an error instead of panic
+            _ => panic!("OtherToChunkedBodyForwarder::into_parts called before completion"),
         }
     }
 }
@@ -550,7 +622,10 @@ where
                         self.state = Some(O2CState::Done { reader, writer });
                     }
                 },
-                O2CState::Done { .. } => return Poll::Ready(Ok(())),
+                done @ O2CState::Done { .. } => {
+                    self.state = Some(done);
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
@@ -590,6 +665,22 @@ impl<R, W> OtherToOtherBodyForwarder<R, W> {
     pub fn new(reader: OtherBodyReader<R>, writer: OtherBodyWriter<W>) -> Self {
         Self {
             state: Some(O2OState::ReadData { reader, writer }),
+        }
+    }
+
+    /// Decompose a fully-completed forwarder into its raw reader and writer
+    /// parts. The reader tuple is `(parse_slots, bytes_reader)` and the
+    /// writer is `None` for EOF-framed endpoints (connection/IO consumed).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `poll_forward` has not returned `Poll::Ready(Ok(()))`.
+    pub fn into_parts(self) -> ((ParseSlots, Option<BytesReader<R>>), Option<W>) {
+        let Self { state } = self;
+        match state {
+            Some(O2OState::Done { reader, writer }) => (reader, writer),
+            // TODO: this should probably result in an error instead of panic
+            _ => panic!("OtherToOtherBodyForwarder::into_parts called before completion"),
         }
     }
 }
@@ -660,7 +751,10 @@ where
                         self.state = Some(O2OState::Done { reader, writer });
                     }
                 },
-                O2OState::Done { .. } => return Poll::Ready(Ok(())),
+                done @ O2OState::Done { .. } => {
+                    self.state = Some(done);
+                    return Poll::Ready(Ok(()));
+                }
             }
         }
     }
