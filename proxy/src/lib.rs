@@ -300,17 +300,15 @@ impl<FR, FW> BackendRequestError<FR, FW> {
 
 /// Returned when reading the response head from the backend fails.
 ///
-/// The broken backend connection is discarded. The request is preserved so
-/// the caller can retry with a different backend via
-/// [`into_backend_request`] or send an error response to the frontend.
-///
-/// [`into_backend_request`]: BackendResponseError::into_backend_request
-pub struct BackendResponseError<FR, FW> {
-    request: BackendProxyRequest<FR, FW>,
+/// The broken backend connection is discarded. A [`PendingFrontendResponse`] is
+/// preserved so that the caller can write back a response to the client before
+/// dropping the connection.
+pub struct BackendResponseError<FW> {
+    pending: PendingFrontendResponse<FW>,
     error: ProxyBackendError,
 }
 
-impl<FR, FW> std::fmt::Debug for BackendResponseError<FR, FW> {
+impl<FW> std::fmt::Debug for BackendResponseError<FW> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackendResponseError")
             .field("error", &self.error)
@@ -318,24 +316,23 @@ impl<FR, FW> std::fmt::Debug for BackendResponseError<FR, FW> {
     }
 }
 
-impl<FR, FW> From<BackendResponseError<FR, FW>> for ProxyError {
-    fn from(e: BackendResponseError<FR, FW>) -> Self {
+impl<FW> From<BackendResponseError<FW>> for ProxyError {
+    fn from(e: BackendResponseError<FW>) -> Self {
         ProxyError::ProxyBackend(e.error)
     }
 }
 
-impl<FR, FW> BackendResponseError<FR, FW> {
+impl<FW> BackendResponseError<FW> {
     /// Returns the backend error that caused this failure.
     pub fn error(&self) -> &ProxyBackendError {
         &self.error
     }
 
-    /// Consumes the error and returns the [`BackendProxyRequest`] so the caller
-    /// can retry with a different backend or send an error response to the
-    /// frontend via [`BackendProxyRequest::into_pending_response`].
-    pub fn into_backend_request(self) -> BackendProxyRequest<FR, FW> {
-        let Self { request, error: _ } = self;
-        request
+    /// Consumes the error and returns the [`PendingFrontendResponse`] so the
+    /// caller can send an error response to the frontend.
+    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
+        let Self { pending, error: _ } = self;
+        pending
     }
 }
 
@@ -586,15 +583,21 @@ where
 {
     pub async fn read_backend_response(
         self,
-    ) -> Result<BackendResponseStream<FR, FW, BR, BW>, BackendResponseError<FR, FW>> {
+    ) -> Result<BackendResponseStream<FR, FW, BR, BW>, BackendResponseError<FW>> {
         let Self {
             request,
             backend_reader,
             backend_body_writer,
         } = self;
 
-        let allow_body = !request.pending.client_options.is_head;
-        let max_backend_head_length = request.pending.options.max_backend_head_length;
+        let BackendProxyRequest {
+            request: _,
+            body_reader: frontend_body_reader,
+            pending,
+        } = request;
+
+        let allow_body = !pending.client_options.is_head;
+        let max_backend_head_length = pending.options.max_backend_head_length;
         let response_stream = match backend_reader
             .read(allow_body, max_backend_head_length)
             .await
@@ -605,7 +608,7 @@ where
                 // the backend connection is broken.
                 drop(backend_body_writer);
                 return Err(BackendResponseError {
-                    request,
+                    pending,
                     error: error.into(),
                 });
             }
@@ -628,10 +631,9 @@ where
         let response_stream = match ProxyResponseStream::new(response_stream) {
             Ok(s) => s,
             Err(e) => {
-                return Err(BackendResponseError { request, error: e });
+                return Err(BackendResponseError { pending, error: e });
             }
         };
-        let (_, frontend_body_reader, pending) = request.into_parts();
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 BackendResponseStream::Response(BackendResponse {
@@ -1314,12 +1316,6 @@ impl<FR, FW> BackendProxyRequest<FR, FW> {
             pending,
         } = self;
         (body_reader, pending)
-    }
-
-    /// Decompose into the prepared request, frontend body reader, and pending
-    /// frontend response.
-    fn into_parts(self) -> (Request, FrontendBodyReader<FR>, PendingFrontendResponse<FW>) {
-        (self.request, self.body_reader, self.pending)
     }
 
     /// Write this backend request to the given backend connection.
