@@ -798,6 +798,7 @@ where
 
         let is_head = pending.client_options.is_head;
         let client_cannot_chunk = pending.client_options.version == HttpVersion::Http10;
+        let chunk_size = pending.options.body_chunk_size;
         let (response, backend_body_reader) = proxy_response.into_frontend_response();
         let (options, frontend_body_writer) = match &backend_body_reader {
             BackendBodyReader::TE(_) => {
@@ -837,11 +838,167 @@ where
 
         Ok(BodyExchanger {
             options,
+            request_body_forwarder: RequestBodyForwarder::new(
+                chunk_size,
+                frontend_body_reader,
+                backend_body_writer,
+            ),
+            response_body_forwarder: ResponseBodyForwarder::new(
+                chunk_size,
+                backend_body_reader,
+                frontend_body_writer,
+            ),
+        })
+    }
+}
+
+pub struct RequestBodyForwarder<FR, BW> {
+    chunk_size: usize,
+    pending: Option<Bytes>,
+    done: bool,
+    frontend_body_reader: FrontendBodyReader<FR>,
+    backend_body_writer: BackendBodyWriter<BW>,
+}
+
+impl<FR, BW> RequestBodyForwarder<FR, BW>
+where
+    FR: AsyncReadExt + Unpin,
+    BW: AsyncWriteExt + Unpin,
+{
+    fn new(
+        chunk_size: usize,
+        frontend_body_reader: FrontendBodyReader<FR>,
+        backend_body_writer: BackendBodyWriter<BW>,
+    ) -> Self
+    where
+        FR: AsyncReadExt + Unpin,
+        BW: AsyncWriteExt + Unpin,
+    {
+        Self {
+            chunk_size,
+            pending: None,
+            done: false,
             frontend_body_reader,
             backend_body_writer,
+        }
+    }
+
+    /// Perform one forward operation. This is either a buffer read or a buffer
+    /// write if a read had already been completed. Returns `true` when the
+    /// forwarding is complete.
+    pub async fn forward(&mut self) -> Result<bool, ProxyCopyError> {
+        if self.done {
+            return Ok(true);
+        }
+        if let Some(pending) = self.pending.take() {
+            let () = self.backend_body_writer.write(&pending).await?;
+        }
+        if let Some(buf) = self.frontend_body_reader.read(self.chunk_size).await? {
+            self.pending = Some(buf);
+        } else {
+            self.done = true;
+        }
+        Ok(false)
+    }
+
+    pub async fn finish(
+        mut self,
+    ) -> Result<(FrontendReader<FR>, BackendWriter<BW>), ProxyCopyError> {
+        while !self.forward().await? {}
+        let Self {
+            chunk_size: _,
+            pending: _,
+            done: _,
+            frontend_body_reader,
+            backend_body_writer,
+        } = self;
+        match (frontend_body_reader, backend_body_writer) {
+            (FrontendBodyReader::TE(fr), BackendBodyWriter::TE(bw)) => {
+                let (next_reader, trailers) = fr.drain().await?;
+                let next_backend = bw.finish_with_trailers(&trailers).await?;
+                Ok((next_reader, next_backend))
+            }
+            (fr, bw) => {
+                let next_reader = fr.drain().await?;
+                let next_backend = bw.finish().await?;
+                Ok((next_reader, next_backend))
+            }
+        }
+    }
+}
+
+pub struct ResponseBodyForwarder<BR, FW> {
+    pending: Option<Bytes>,
+    done: bool,
+    chunk_size: usize,
+    backend_body_reader: BackendBodyReader<BR>,
+    frontend_body_writer: FrontendBodyWriter<FW>,
+}
+
+impl<BR, FW> ResponseBodyForwarder<BR, FW>
+where
+    BR: AsyncReadExt + Unpin,
+    FW: AsyncWriteExt + Unpin,
+{
+    fn new(
+        chunk_size: usize,
+        backend_body_reader: BackendBodyReader<BR>,
+        frontend_body_writer: FrontendBodyWriter<FW>,
+    ) -> Self
+    where
+        FW: AsyncWriteExt + Unpin,
+        BR: AsyncReadExt + Unpin,
+    {
+        Self {
+            chunk_size,
+            pending: None,
+            done: false,
             backend_body_reader,
             frontend_body_writer,
-        })
+        }
+    }
+
+    /// Perform one forward operation. This is either a buffer read or a buffer
+    /// write if a read had already been completed. Returns `true` when the
+    /// forwarding is complete.
+    pub async fn forward(&mut self) -> Result<bool, ProxyCopyError> {
+        if self.done {
+            return Ok(true);
+        }
+        if let Some(pending) = self.pending.take() {
+            let () = self.frontend_body_writer.write(&pending).await?;
+        }
+        if let Some(buf) = self.backend_body_reader.read(self.chunk_size).await? {
+            self.pending = Some(buf);
+        } else {
+            self.done = true;
+        }
+        Ok(false)
+    }
+
+    pub async fn finish(
+        mut self,
+    ) -> Result<(Option<BackendReader<BR>>, Option<FrontendWriter<FW>>), ProxyCopyError> {
+        while !self.forward().await? {}
+        let Self {
+            chunk_size: _,
+            pending: _,
+            done: _,
+            backend_body_reader,
+            frontend_body_writer,
+        } = self;
+        match (backend_body_reader, frontend_body_writer) {
+            (BackendBodyReader::TE(fr), FrontendBodyWriter::TE(bw)) => {
+                let (next_reader, trailers) = fr.drain().await?;
+                let next_backend = bw.finish_with_trailers(&trailers).await?;
+                Ok((Some(next_reader), Some(next_backend)))
+            }
+            (fr, bw) => {
+                let next_reader = fr.drain().await?;
+                let next_backend = bw.finish().await?;
+                Ok((next_reader, next_backend))
+            }
+        }
     }
 }
 
@@ -851,10 +1008,8 @@ where
 /// Produced by [`BackendResponse::forward_response_head`].
 pub struct BodyExchanger<FR, FW, BR, BW> {
     options: ProxyOptions,
-    frontend_body_reader: FrontendBodyReader<FR>,
-    backend_body_writer: BackendBodyWriter<BW>,
-    backend_body_reader: BackendBodyReader<BR>,
-    frontend_body_writer: FrontendBodyWriter<FW>,
+    request_body_forwarder: RequestBodyForwarder<FR, BW>,
+    response_body_forwarder: ResponseBodyForwarder<BR, FW>,
 }
 
 /// The individual body readers and writers that make up a [`BodyExchanger`].
@@ -866,14 +1021,8 @@ pub struct BodyExchanger<FR, FW, BR, BW> {
 pub struct BodyExchangerParts<FR, FW, BR, BW> {
     /// ProxyOptions governing behavior so far
     pub options: ProxyOptions,
-    /// Reads the request body from the frontend (f2b source).
-    pub frontend_body_reader: FrontendBodyReader<FR>,
-    /// Writes the request body to the backend (f2b sink).
-    pub backend_body_writer: BackendBodyWriter<BW>,
-    /// Reads the response body from the backend (b2f source).
-    pub backend_body_reader: BackendBodyReader<BR>,
-    /// Writes the response body to the frontend (b2f sink).
-    pub frontend_body_writer: FrontendBodyWriter<FW>,
+    pub request_body_forwarder: RequestBodyForwarder<FR, BW>,
+    pub response_body_forwarder: ResponseBodyForwarder<BR, FW>,
 }
 
 impl<FR, FW, BR, BW> BodyExchanger<FR, FW, BR, BW>
@@ -888,17 +1037,13 @@ where
     pub fn into_parts(self) -> BodyExchangerParts<FR, FW, BR, BW> {
         let Self {
             options,
-            frontend_body_reader,
-            backend_body_writer,
-            backend_body_reader,
-            frontend_body_writer,
+            request_body_forwarder,
+            response_body_forwarder,
         } = self;
         BodyExchangerParts {
             options,
-            frontend_body_reader,
-            backend_body_writer,
-            backend_body_reader,
-            frontend_body_writer,
+            request_body_forwarder,
+            response_body_forwarder,
         }
     }
 
@@ -912,93 +1057,12 @@ where
     )> {
         let Self {
             options,
-            mut frontend_body_reader,
-            mut backend_body_writer,
-            mut backend_body_reader,
-            mut frontend_body_writer,
+            request_body_forwarder,
+            response_body_forwarder,
         } = self;
 
-        let body_chunk_size = options.body_chunk_size;
-
-        let f2b_fut = async move {
-            let ret;
-            loop {
-                let buf = match frontend_body_reader.read(body_chunk_size).await {
-                    Ok(Some(buf)) => buf,
-                    Ok(None) => {
-                        ret = async {
-                            match (frontend_body_reader, backend_body_writer) {
-                                (FrontendBodyReader::TE(fr), BackendBodyWriter::TE(bw)) => {
-                                    let (next_reader, trailers) = fr.drain().await?;
-                                    let next_backend = bw.finish_with_trailers(&trailers).await?;
-                                    Ok((next_reader, next_backend))
-                                }
-                                (fr, bw) => {
-                                    let next_reader = fr.drain().await?;
-                                    let next_backend = bw.finish().await?;
-                                    Ok((next_reader, next_backend))
-                                }
-                            }
-                        }
-                        .await;
-                        break;
-                    }
-                    Err(e) => {
-                        ret = Err(ProxyCopyError::from(e));
-                        break;
-                    }
-                };
-                match backend_body_writer.write(&buf).await {
-                    Ok(()) => {
-                        // successfuly wrote buffer; loop around for another one
-                    }
-                    Err(e) => {
-                        ret = Err(ProxyCopyError::from(e));
-                        break;
-                    }
-                }
-            }
-            ret
-        };
-
-        let b2f_fut = async move {
-            let ret;
-            loop {
-                let buf = match backend_body_reader.read(body_chunk_size).await {
-                    Ok(Some(buf)) => buf,
-                    Ok(None) => {
-                        ret = async {
-                            match (backend_body_reader, frontend_body_writer) {
-                                (BackendBodyReader::TE(br), FrontendBodyWriter::TE(fw)) => {
-                                    let (next_backend, trailers) = br.drain().await?;
-                                    let next_frontend = fw.finish_with_trailers(&trailers).await?;
-                                    Ok((Some(next_backend), Some(next_frontend)))
-                                }
-                                (br, fw) => {
-                                    let next_backend = br.drain().await?;
-                                    let next_frontend = fw.finish().await?;
-                                    Ok((next_backend, next_frontend))
-                                }
-                            }
-                        }
-                        .await;
-                        break;
-                    }
-                    Err(e) => {
-                        ret = Err(ProxyCopyError::from(e));
-                        break;
-                    }
-                };
-                match frontend_body_writer.write(&buf).await {
-                    Ok(()) => {}
-                    Err(e) => {
-                        ret = Err(ProxyCopyError::from(e));
-                        break;
-                    }
-                }
-            }
-            ret
-        };
+        let f2b_fut = request_body_forwarder.finish();
+        let b2f_fut = response_body_forwarder.finish();
 
         let mut f2b_fut_pinned = std::pin::pin!(f2b_fut);
         let mut b2f_fut_pinned = std::pin::pin!(b2f_fut);
