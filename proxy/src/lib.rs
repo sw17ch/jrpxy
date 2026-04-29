@@ -342,13 +342,12 @@ impl<FW> BackendResponseError<FW> {
 /// Retry is not offered: the backend has already acknowledged the request
 /// (evidenced by the 1xx it sent), so retrying risks duplicate processing.
 /// The frontend connection is still alive; an error can be sent to the client.
-pub struct BackendStreamError<FR, FW> {
-    frontend_body_reader: FrontendBodyReader<FR>,
+pub struct BackendStreamError<FW> {
     pending: PendingFrontendResponse<FW>,
     error: ProxyBackendError,
 }
 
-impl<FR, FW> std::fmt::Debug for BackendStreamError<FR, FW> {
+impl<FW> std::fmt::Debug for BackendStreamError<FW> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("BackendStreamError")
             .field("error", &self.error)
@@ -356,13 +355,13 @@ impl<FR, FW> std::fmt::Debug for BackendStreamError<FR, FW> {
     }
 }
 
-impl<FR, FW> From<BackendStreamError<FR, FW>> for ProxyError {
-    fn from(e: BackendStreamError<FR, FW>) -> Self {
+impl<FW> From<BackendStreamError<FW>> for ProxyError {
+    fn from(e: BackendStreamError<FW>) -> Self {
         ProxyError::ProxyBackend(e.error)
     }
 }
 
-impl<FR, FW> BackendStreamError<FR, FW> {
+impl<FW> BackendStreamError<FW> {
     /// Returns the backend error that caused this failure.
     pub fn error(&self) -> &ProxyBackendError {
         &self.error
@@ -372,13 +371,9 @@ impl<FR, FW> BackendStreamError<FR, FW> {
     /// frontend body reader. The body reader is returned separately so the
     /// caller can decide whether to drain it (for connection reuse) or drop it
     /// (to close the read half of the socket immediately).
-    pub fn into_pending_response(self) -> (PendingFrontendResponse<FW>, FrontendBodyReader<FR>) {
-        let Self {
-            frontend_body_reader,
-            pending,
-            error: _,
-        } = self;
-        (pending, frontend_body_reader)
+    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
+        let Self { pending, error: _ } = self;
+        pending
     }
 }
 
@@ -534,12 +529,12 @@ impl<FW: AsyncWriteExt + Unpin> PendingFrontendResponse<FW> {
 ///
 /// [`Frontend`]: InformationalForwardError::Frontend
 /// [`Backend`]: InformationalForwardError::Backend
-pub enum InformationalForwardError<FR, FW> {
+pub enum InformationalForwardError<FW> {
     Frontend(ProxyFrontendError),
-    Backend(BackendStreamError<FR, FW>),
+    Backend(BackendStreamError<FW>),
 }
 
-impl<FR, FW> std::fmt::Debug for InformationalForwardError<FR, FW> {
+impl<FW> std::fmt::Debug for InformationalForwardError<FW> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             InformationalForwardError::Frontend(e) => f.debug_tuple("Frontend").field(e).finish(),
@@ -548,8 +543,8 @@ impl<FR, FW> std::fmt::Debug for InformationalForwardError<FR, FW> {
     }
 }
 
-impl<FR, FW> From<InformationalForwardError<FR, FW>> for ProxyError {
-    fn from(e: InformationalForwardError<FR, FW>) -> Self {
+impl<FW> From<InformationalForwardError<FW>> for ProxyError {
+    fn from(e: InformationalForwardError<FW>) -> Self {
         match e {
             InformationalForwardError::Frontend(e) => ProxyError::ProxyFrontend(e),
             InformationalForwardError::Backend(e) => ProxyError::ProxyBackend(e.error),
@@ -578,6 +573,7 @@ pub enum BackendResponseStream<FR, FW, BR, BW> {
 
 impl<FR, FW, BR, BW> ResponseReader<FR, FW, BR, BW>
 where
+    FR: AsyncReadExt + Unpin,
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
 {
@@ -596,6 +592,12 @@ where
             pending,
         } = request;
 
+        let request_body_forwarder = RequestBodyForwarder::new(
+            pending.options.body_chunk_size,
+            frontend_body_reader,
+            backend_body_writer,
+        );
+
         let allow_body = !pending.client_options.is_head;
         let max_backend_head_length = pending.options.max_backend_head_length;
         let response_stream = match backend_reader
@@ -606,7 +608,6 @@ where
             Err(error) => {
                 // backend_reader and backend_body_writer are both discarded;
                 // the backend connection is broken.
-                drop(backend_body_writer);
                 return Err(BackendResponseError {
                     pending,
                     error: error.into(),
@@ -637,10 +638,9 @@ where
         Ok(match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 BackendResponseStream::Response(BackendResponse {
-                    frontend_body_reader,
+                    request_body_forwarder,
                     pending,
                     proxy_response,
-                    backend_body_writer,
                 })
             }
             ProxyResponseStream::Informational(
@@ -648,10 +648,9 @@ where
                 proxy_stream_reader,
             ) => BackendResponseStream::Informational(BackendInformationalResponse {
                 proxy_informational_response,
-                frontend_body_reader,
+                request_body_forwarder,
                 pending,
                 proxy_stream_reader,
-                backend_body_writer,
             }),
         })
     }
@@ -673,14 +672,14 @@ impl<FR, FW, BR, BW> InformationalForwardResult<FR, FW, BR, BW> {
 
 pub struct BackendInformationalResponse<FR, FW, BR, BW> {
     proxy_informational_response: ProxyInformationalResponse,
-    frontend_body_reader: FrontendBodyReader<FR>,
+    request_body_forwarder: RequestBodyForwarder<FR, BW>,
     pending: PendingFrontendResponse<FW>,
     proxy_stream_reader: ProxyStreamReader<BR>,
-    backend_body_writer: BackendBodyWriter<BW>,
 }
 
 impl<FR, FW, BR, BW> BackendInformationalResponse<FR, FW, BR, BW>
 where
+    FR: AsyncReadExt + Unpin,
     FW: AsyncWriteExt + Unpin,
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
@@ -695,13 +694,12 @@ where
 
     pub async fn forward_informational_response(
         self,
-    ) -> Result<InformationalForwardResult<FR, FW, BR, BW>, InformationalForwardError<FR, FW>> {
+    ) -> Result<InformationalForwardResult<FR, FW, BR, BW>, InformationalForwardError<FW>> {
         let Self {
             proxy_informational_response,
-            frontend_body_reader,
+            request_body_forwarder,
             pending,
             proxy_stream_reader,
-            backend_body_writer,
         } = self;
 
         // RFC9110 section 15.2 states that a server MUST NOT send any 1xx
@@ -724,7 +722,6 @@ where
             Ok(r) => r,
             Err(error) => {
                 return Err(InformationalForwardError::Backend(BackendStreamError {
-                    frontend_body_reader,
                     pending,
                     error,
                 }));
@@ -734,10 +731,9 @@ where
         let response_stream = match response_stream {
             ProxyResponseStream::Response(proxy_response) => {
                 BackendResponseStream::Response(BackendResponse {
-                    frontend_body_reader,
+                    request_body_forwarder,
                     pending,
                     proxy_response,
-                    backend_body_writer,
                 })
             }
             ProxyResponseStream::Informational(
@@ -745,10 +741,9 @@ where
                 proxy_stream_reader,
             ) => BackendResponseStream::Informational(BackendInformationalResponse {
                 proxy_informational_response,
-                frontend_body_reader,
+                request_body_forwarder,
                 pending,
                 proxy_stream_reader,
-                backend_body_writer,
             }),
         };
 
@@ -761,10 +756,9 @@ where
 }
 
 pub struct BackendResponse<FR, FW, BR, BW> {
-    frontend_body_reader: FrontendBodyReader<FR>,
+    request_body_forwarder: RequestBodyForwarder<FR, BW>,
     pending: PendingFrontendResponse<FW>,
     proxy_response: ProxyResponse<BR>,
-    backend_body_writer: BackendBodyWriter<BW>,
 }
 
 impl<FR, FW, BR, BW> BackendResponse<FR, FW, BR, BW>
@@ -790,10 +784,9 @@ where
     /// and writers and drive the copy yourself.
     pub async fn forward_response_head(self) -> Result<BodyExchanger<FR, FW, BR, BW>, ProxyError> {
         let Self {
-            frontend_body_reader,
+            request_body_forwarder,
             pending,
             proxy_response,
-            backend_body_writer,
         } = self;
 
         let is_head = pending.client_options.is_head;
@@ -838,11 +831,7 @@ where
 
         Ok(BodyExchanger {
             options,
-            request_body_forwarder: RequestBodyForwarder::new(
-                chunk_size,
-                frontend_body_reader,
-                backend_body_writer,
-            ),
+            request_body_forwarder,
             response_body_forwarder: ResponseBodyForwarder::new(
                 chunk_size,
                 backend_body_reader,
