@@ -592,7 +592,7 @@ where
             pending,
         } = request;
 
-        let request_body_forwarder = RequestBodyForwarder::new(
+        let mut request_body_forwarder = RequestBodyForwarder::new(
             pending.options.body_chunk_size,
             frontend_body_reader,
             backend_body_writer,
@@ -600,10 +600,39 @@ where
 
         let allow_body = !pending.client_options.is_head;
         let max_backend_head_length = pending.options.max_backend_head_length;
-        let response_stream = match backend_reader
-            .read(allow_body, max_backend_head_length)
-            .await
-        {
+
+        // Drive the request body forwarder concurrently with the read of the
+        // response head: some origins (e.g. CGI) will not respond until they
+        // have received the full request body, which would otherwise deadlock.
+        //
+        // If the body forwarder errors or completes, we stop polling it and
+        // continue waiting for the response head. A body forwarder error is
+        // not fatal here — the backend may still produce a response, and any
+        // residual error state will surface when the caller drives the body
+        // to completion via the BodyExchanger.
+        let read_fut = backend_reader.read(allow_body, max_backend_head_length);
+        tokio::pin!(read_fut);
+        let read_result = {
+            let mut body_finished = false;
+            loop {
+                tokio::select! {
+                    res = &mut read_fut => break res,
+                    res = request_body_forwarder.forward(), if !body_finished => {
+                        match res {
+                            Ok(false) => {}
+                            Ok(true) => body_finished = true,
+                            Err(e) => {
+                                return Err(BackendResponseError {
+                                    pending,
+                                    error: e.into(),
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        let response_stream = match read_result {
             Ok(r) => r,
             Err(error) => {
                 // backend_reader and backend_body_writer are both discarded;
@@ -614,20 +643,6 @@ where
                 });
             }
         };
-
-        // TODO: we need to drive the frontend request body to the origin at the
-        // same time as we're waiting for the response to come back in case the
-        // origin will not reply to us until its receives the fully body.
-        //
-        // This does also expose that, once we start trying to read the request
-        // from the origin, we cannot recover the client at this stage. If the
-        // backend read fails, we have to discard all connections. This implies
-        // that `BackendResponseError` will go away.
-        //
-        // Since we need to maintain the state, we should make a new type of
-        // forwarder that can be incrementally driven until the response comes
-        // back, and the remainder of the work can be passed around in the
-        // BackendResponseStream to be completed by the BodyExchanger.
 
         let response_stream = match ProxyResponseStream::new(response_stream) {
             Ok(s) => s,
@@ -879,8 +894,11 @@ where
         if self.done {
             return Ok(true);
         }
-        if let Some(pending) = self.pending.take() {
-            let () = self.backend_body_writer.write(&pending).await?;
+        if let Some(pending) = self.pending.as_ref() {
+            let () = self.backend_body_writer.write(pending).await?;
+            // Clear pending only after a successful write in order to be cancel
+            // safe.
+            self.pending = None;
         }
         if let Some(buf) = self.frontend_body_reader.read(self.chunk_size).await? {
             self.pending = Some(buf);
@@ -954,8 +972,11 @@ where
         if self.done {
             return Ok(true);
         }
-        if let Some(pending) = self.pending.take() {
-            let () = self.frontend_body_writer.write(&pending).await?;
+        if let Some(pending) = self.pending.as_ref() {
+            let () = self.frontend_body_writer.write(pending).await?;
+            // Clear pending only after a successful write in order to be cancel
+            // safe.
+            self.pending = None;
         }
         if let Some(buf) = self.backend_body_reader.read(self.chunk_size).await? {
             self.pending = Some(buf);

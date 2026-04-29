@@ -38,6 +38,8 @@ pub enum ProxyBackendError {
     BackendError(#[from] BackendError),
     #[error("Invalid connection header")]
     InvalidConnectionHeader(#[from] ConnectionTokenParserError),
+    #[error("Proxy copy error: {0}")]
+    ProxyCopy(#[from] ProxyCopyError),
 }
 
 #[derive(thiserror::Error, Debug)]
