@@ -11,6 +11,7 @@ use crate::error::ProxyOptionsError;
 pub struct ProxyOptions {
     max_frontend_head_length: usize,
     max_backend_head_length: usize,
+    max_chunk_header_length: usize,
     body_chunk_size: usize,
     received_by: Cow<'static, str>,
 }
@@ -30,6 +31,12 @@ impl ProxyOptions {
     /// The maximum length, in bytes, that a backend response head can be.
     pub fn max_backend_head_length(&self) -> usize {
         self.max_backend_head_length
+    }
+
+    /// The maximum length, in bytes, that a single chunk's size line (the
+    /// chunk-size and any chunk extensions) can be when reading a chunked body.
+    pub fn max_chunk_header_length(&self) -> usize {
+        self.max_chunk_header_length
     }
 
     /// The read size to be attempted when copying body bytes.
@@ -58,6 +65,7 @@ impl Default for ProxyOptions {
 pub struct ProxyOptionsBuilder {
     max_frontend_head_length: usize,
     max_backend_head_length: usize,
+    max_chunk_header_length: usize,
     body_chunk_size: usize,
     received_by: Cow<'static, str>,
 }
@@ -67,6 +75,7 @@ impl Default for ProxyOptionsBuilder {
         Self {
             max_frontend_head_length: 8192,
             max_backend_head_length: 8192,
+            max_chunk_header_length: 8192,
             body_chunk_size: 8192,
             received_by: Cow::Borrowed("jrpxy"),
         }
@@ -83,6 +92,13 @@ impl ProxyOptionsBuilder {
     /// Set the maximum length, in bytes, that a backend response head can be.
     pub fn max_backend_head_length(mut self, max_backend_head_length: usize) -> Self {
         self.max_backend_head_length = max_backend_head_length;
+        self
+    }
+
+    /// Set the maximum length, in bytes, that a single chunk's size line can be
+    /// when reading a chunked body.
+    pub fn max_chunk_header_length(mut self, max_chunk_header_length: usize) -> Self {
+        self.max_chunk_header_length = max_chunk_header_length;
         self
     }
 
@@ -103,6 +119,7 @@ impl ProxyOptionsBuilder {
         let Self {
             max_frontend_head_length,
             max_backend_head_length,
+            max_chunk_header_length,
             body_chunk_size,
             received_by,
         } = self;
@@ -112,6 +129,7 @@ impl ProxyOptionsBuilder {
         Ok(ProxyOptions {
             max_frontend_head_length,
             max_backend_head_length,
+            max_chunk_header_length,
             body_chunk_size,
             received_by,
         })
@@ -144,12 +162,14 @@ mod tests {
             .received_by("proxy.example.com")
             .max_frontend_head_length(1024)
             .max_backend_head_length(2048)
+            .max_chunk_header_length(256)
             .body_chunk_size(4096)
             .build()
             .expect("all fields are valid");
         assert_eq!(options.received_by(), "proxy.example.com");
         assert_eq!(options.max_frontend_head_length(), 1024);
         assert_eq!(options.max_backend_head_length(), 2048);
+        assert_eq!(options.max_chunk_header_length(), 256);
         assert_eq!(options.body_chunk_size(), 4096);
     }
 

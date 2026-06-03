@@ -22,7 +22,7 @@
 //!
 //!     // Read the first request in the pipeline
 //!     let frontend_reader = FrontendReader::new(&buf[..], 256);
-//!     let frontend_request = frontend_reader.read(8192).await.expect("invalid request");
+//!     let frontend_request = frontend_reader.read(8192, 8192).await.expect("invalid request");
 //!     let (request, mut frontend_body_reader) = frontend_request.into_parts();
 //!
 //!     let body = frontend_body_reader.read(20).await.unwrap().unwrap();
@@ -30,7 +30,7 @@
 //!     let frontend_reader = frontend_body_reader.drain().await.unwrap().unwrap();
 //!
 //!     // Read the second request in the pipeline.
-//!     let frontend_request = frontend_reader.read(128).await.expect("invalid request");
+//!     let frontend_request = frontend_reader.read(128, 128).await.expect("invalid request");
 //!     let (request, mut frontend_body_reader) = frontend_request.into_parts();
 //!
 //!     let body = frontend_body_reader.read(20).await.unwrap().unwrap();
@@ -131,7 +131,11 @@ where
     }
 
     /// Read a request from the frontend.
-    pub async fn read(mut self, max_head_length: usize) -> FrontendResult<FrontendRequest<I>> {
+    pub async fn read(
+        mut self,
+        max_head_length: usize,
+        max_chunk_header_length: usize,
+    ) -> FrontendResult<FrontendRequest<I>> {
         let req = self.head(max_head_length).await?;
         let Self {
             reader,
@@ -146,7 +150,12 @@ where
                 recyclable,
             }),
             ParsedFraming::Chunked => FrontendBodyReader::TE(FrontendChunkedBodyReader {
-                inner: ChunkedBodyReader::new(reader, parse_slots),
+                inner: ChunkedBodyReader::new(
+                    reader,
+                    parse_slots,
+                    max_chunk_header_length,
+                    max_head_length,
+                ),
                 recyclable,
             }),
             ParsedFraming::NoFraming => FrontendBodyReader::Bodyless(FrontendBodylessBodyReader {
@@ -376,7 +385,7 @@ mod test {
 
         let reader = FrontendReader::new(buf.as_slice(), 256);
         let (req, mut body) = reader
-            .read(128)
+            .read(128, 128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -412,7 +421,7 @@ mod test {
 
         let reader = FrontendReader::new(buf.as_slice(), 256);
         let (req, mut body) = reader
-            .read(128)
+            .read(128, 128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -456,7 +465,7 @@ mod test {
 
         let reader = FrontendReader::new(buf.as_slice(), 256);
         let (req, body) = reader
-            .read(128)
+            .read(128, 128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -470,7 +479,7 @@ mod test {
             .unwrap()
             .expect("frontend should be recyclable");
         let (req, mut body) = reader
-            .read(128)
+            .read(128, 128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -490,7 +499,7 @@ mod test {
 
         let reader = FrontendReader::new(buf.as_slice(), 256);
         assert!(matches!(
-            reader.read(128).await,
+            reader.read(128, 128).await,
             Err(FrontendError::UnexpectedEOF)
         ));
     }
@@ -507,7 +516,7 @@ mod test {
 
         let reader = FrontendReader::new(buf.as_slice(), 256);
         let (req, mut body) = reader
-            .read(128)
+            .read(128, 128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -537,7 +546,7 @@ mod test {
 
         let reader = FrontendReader::new(buf.as_slice(), 256);
         let (_req, mut body) = reader
-            .read(128)
+            .read(128, 128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -558,7 +567,7 @@ mod test {
 
         let reader = FrontendReader::new(buf.as_slice(), 256);
         let (_req, body) = reader
-            .read(128)
+            .read(128, 128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -585,7 +594,7 @@ mod test {
 
         let reader = FrontendReader::new(buf.as_slice(), 256);
         let (req, body) = reader
-            .read(128)
+            .read(128, 128)
             .await
             .expect("can't break into parts")
             .into_parts();
@@ -633,7 +642,7 @@ mod test {
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
             let reader = FrontendReader::new(right, 256);
             let (req, body) = reader
-                .read(128)
+                .read(128, 128)
                 .await
                 .expect("can't break into parts")
                 .into_parts();
@@ -686,7 +695,7 @@ mod test {
         let r = tokio::spawn(tokio::time::timeout(Duration::from_secs(10), async move {
             let reader = FrontendReader::new(right, 256);
             let (req, body) = reader
-                .read(128)
+                .read(128, 128)
                 .await
                 .expect("can't break into parts")
                 .into_parts();

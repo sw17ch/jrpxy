@@ -6,6 +6,8 @@ pub enum TrailerError {
     InvalidField(httparse::Error),
     #[error("Too many trailer fields")]
     TooManyFields,
+    #[error("Trailer section exceeds maximum of {max} bytes")]
+    MaxLengthExceeded { max: usize },
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -20,6 +22,8 @@ pub enum BodyError {
     IncompleteBody { expected: u64, actual: u64 },
     #[error("Invalid chunk header: {0}")]
     InvalidChunkHeader(httparse::InvalidChunkSize),
+    #[error("Chunk header exceeds maximum of {max} bytes")]
+    ChunkHeaderTooLong { max: usize },
     #[error("Chunk header expected {expected} bytes, but only wrote {actual} bytes")]
     IncompleteChunkHeader { expected: u64, actual: u64 },
     #[error("Chunk footer expected {expected} bytes, but only wrote {actual} bytes")]

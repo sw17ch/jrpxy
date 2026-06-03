@@ -71,11 +71,18 @@ impl<I> From<FinalChunkReader<I>> for ChunkedBodyChunkStream<I> {
 }
 
 impl<I> ChunkedBodyReader<I> {
-    pub fn new(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
+    pub fn new(
+        reader: BytesReader<I>,
+        parse_slots: ParseSlots,
+        max_chunk_header_length: usize,
+        max_trailer_length: usize,
+    ) -> Self {
         Self {
             inner: Some(ChunkedBodyChunkStream::BetweenChunk(ChunkHeadReader::new(
                 reader,
                 parse_slots,
+                max_chunk_header_length,
+                max_trailer_length,
             ))),
         }
     }
@@ -192,6 +199,8 @@ enum ChunkBodyState {
 pub struct ChunkDataReader<I> {
     reader: BytesReader<I>,
     parse_slots: ParseSlots,
+    max_chunk_header_length: usize,
+    max_trailer_length: usize,
     size: u64,
     extensions: ChunkExtensions,
     remaining: u64,
@@ -312,6 +321,8 @@ where
         let Self {
             reader,
             parse_slots,
+            max_chunk_header_length,
+            max_trailer_length,
             size: _,
             extensions: _,
             remaining: _,
@@ -321,7 +332,12 @@ where
             matches!(state, ChunkBodyState::Done),
             "attempted to finish the chunk reader before it was fully drained"
         );
-        ChunkHeadReader::new(reader, parse_slots)
+        ChunkHeadReader::new(
+            reader,
+            parse_slots,
+            max_chunk_header_length,
+            max_trailer_length,
+        )
     }
 }
 
@@ -353,14 +369,23 @@ enum PollNextChunk {
 pub struct ChunkHeadReader<I> {
     reader: BytesReader<I>,
     parse_slots: ParseSlots,
+    max_chunk_header_length: usize,
+    max_trailer_length: usize,
     state: ChunkHeadReaderState,
 }
 
 impl<I> ChunkHeadReader<I> {
-    fn new(reader: BytesReader<I>, parse_slots: ParseSlots) -> Self {
+    fn new(
+        reader: BytesReader<I>,
+        parse_slots: ParseSlots,
+        max_chunk_header_length: usize,
+        max_trailer_length: usize,
+    ) -> Self {
         Self {
             reader,
             parse_slots,
+            max_chunk_header_length,
+            max_trailer_length,
             state: ChunkHeadReaderState::ReadingSize,
         }
     }
@@ -389,6 +414,11 @@ where
                         .map_err(BodyError::InvalidChunkHeader)?
                     {
                         httparse::Status::Partial => {
+                            if self.reader.len() >= self.max_chunk_header_length {
+                                return Poll::Ready(Err(BodyError::ChunkHeaderTooLong {
+                                    max: self.max_chunk_header_length,
+                                }));
+                            }
                             if let Err(e) = ready!(super::poll_extend(cx, &mut self.reader)) {
                                 return Poll::Ready(Err(e));
                             }
@@ -420,6 +450,13 @@ where
                             .map_err(map_trailer_error)?
                         {
                             None => {
+                                if self.reader.len() >= self.max_trailer_length {
+                                    return Poll::Ready(Err(BodyError::TrailerError(
+                                        TrailerError::MaxLengthExceeded {
+                                            max: self.max_trailer_length,
+                                        },
+                                    )));
+                                }
                                 if let Err(e) = ready!(super::poll_extend(cx, &mut self.reader)) {
                                     return Poll::Ready(Err(e));
                                 }
@@ -449,6 +486,8 @@ where
         let Self {
             reader,
             parse_slots,
+            max_chunk_header_length,
+            max_trailer_length,
             state,
         } = self;
 
@@ -461,6 +500,8 @@ where
                 PollNextChunk::Data { size, chunk_header } => NextChunk::Data(ChunkDataReader {
                     reader,
                     parse_slots,
+                    max_chunk_header_length,
+                    max_trailer_length,
                     size,
                     extensions: ChunkExtensions::new(chunk_header),
                     remaining: size,
@@ -513,7 +554,7 @@ mod test {
     use jrpxy_http_message::message::ParseSlots;
     use jrpxy_util::io_buffer::BytesReader;
 
-    use crate::error::BodyError;
+    use crate::error::{BodyError, TrailerError};
 
     use super::ChunkedBodyReader;
 
@@ -531,7 +572,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = ChunkedBodyReader::new(BytesReader::new(&input[..]), ParseSlots::default());
+        let mut br = ChunkedBodyReader::new(
+            BytesReader::new(&input[..]),
+            ParseSlots::default(),
+            8192,
+            8192,
+        );
         let chunk = br.read(10).await.expect("read works").unwrap();
         assert_eq!(b"0123", chunk.as_ref());
         let chunk = br.read(10).await.expect("read works").unwrap();
@@ -549,7 +595,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = ChunkedBodyReader::new(BytesReader::new(&input[..]), ParseSlots::default());
+        let mut br = ChunkedBodyReader::new(
+            BytesReader::new(&input[..]),
+            ParseSlots::default(),
+            8192,
+            8192,
+        );
 
         // The body bytes themselves are valid and should be readable.
         let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
@@ -569,7 +620,12 @@ mod test {
             \r\n\
             ";
 
-        let mut br = ChunkedBodyReader::new(BytesReader::new(&input[..]), ParseSlots::default());
+        let mut br = ChunkedBodyReader::new(
+            BytesReader::new(&input[..]),
+            ParseSlots::default(),
+            8192,
+            8192,
+        );
 
         // The body bytes themselves are valid and should be readable.
         let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
@@ -579,6 +635,54 @@ mod test {
         assert!(matches!(
             br.read(1).await.unwrap_err(),
             BodyError::InvalidChunkFooter(b'\n', b'X'),
+        ));
+    }
+
+    #[tokio::test]
+    async fn chunked_reject_oversized_trailers() {
+        // The terminal chunk's trailer section never sends the terminating
+        // blank line, so a peer could otherwise force us to buffer it without
+        // bound. The trailer bytes exceed the configured limit.
+        let input = b"\
+            4\r\n\
+            0123\r\n\
+            0\r\n\
+            X-Trailer: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let mut br = ChunkedBodyReader::new(
+            BytesReader::new(&input[..]),
+            ParseSlots::default(),
+            8192,
+            16,
+        );
+
+        let chunk = br.read(4).await.expect("reading body bytes works").unwrap();
+        assert_eq!(b"0123", chunk.as_ref());
+
+        assert!(matches!(
+            br.read(1).await.unwrap_err(),
+            BodyError::TrailerError(TrailerError::MaxLengthExceeded { max: 16 }),
+        ));
+    }
+
+    #[tokio::test]
+    async fn chunked_reject_oversized_chunk_header() {
+        // A peer can stream chunk-extension bytes without ever terminating the
+        // size line; the size line here grows past the configured limit before
+        // any CRLF arrives.
+        let input = b"\
+            1;ext=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+        let mut br = ChunkedBodyReader::new(
+            BytesReader::new(&input[..]),
+            ParseSlots::default(),
+            16,
+            8192,
+        );
+
+        assert!(matches!(
+            br.read(1).await.unwrap_err(),
+            BodyError::ChunkHeaderTooLong { max: 16 },
         ));
     }
 }

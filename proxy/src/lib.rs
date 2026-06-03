@@ -93,7 +93,10 @@ where
         } = self;
 
         let req = match frontend_reader
-            .read(options.max_frontend_head_length())
+            .read(
+                options.max_frontend_head_length(),
+                options.max_chunk_header_length(),
+            )
             .await
         {
             Ok(req) => req,
@@ -591,12 +594,17 @@ where
 
         let allow_body = !pending.client_options.is_head;
         let max_backend_head_length = pending.options.max_backend_head_length();
+        let max_chunk_header_length = pending.options.max_chunk_header_length();
 
         // Drive the request body forwarder concurrently with the read of the
         // response head: some origins will not respond until they have received
         // the full request body, which would otherwise deadlock.
         let read_result = match request_body_forwarder
-            .forward_while(backend_reader.read(allow_body, max_backend_head_length))
+            .forward_while(backend_reader.read(
+                allow_body,
+                max_backend_head_length,
+                max_chunk_header_length,
+            ))
             .await
         {
             Ok(r) => r,
@@ -1528,7 +1536,7 @@ mod test {
         raw: &[u8],
     ) -> FrontendProxyRequest<&[u8], tokio::io::Sink> {
         let reader = FrontendReader::new(raw, 256);
-        let req = reader.read(8192).await.expect("valid request");
+        let req = reader.read(8192, 8192).await.expect("valid request");
         let is_head = req.req().method() == b"HEAD".as_slice();
         let version = req.req().version();
         let pending = PendingFrontendResponse {
@@ -1549,7 +1557,7 @@ mod test {
 
     async fn make_proxy_response(raw: &[u8]) -> ProxyResponseStream<&[u8]> {
         let reader = BackendReader::new(raw, 256);
-        let stream = reader.read(true, 8192).await.expect("valid response");
+        let stream = reader.read(true, 8192, 8192).await.expect("valid response");
         ProxyResponseStream::new(stream).expect("failed to build response stream")
     }
 
@@ -3052,7 +3060,7 @@ mod test {
             \r\n";
 
         let reader = BackendReader::new(raw.as_slice(), 256);
-        let stream = reader.read(true, 8192).await.expect("valid response");
+        let stream = reader.read(true, 8192, 8192).await.expect("valid response");
         let proxy_stream = ProxyResponseStream::new(stream).expect("failed to build proxy stream");
 
         let (info, next_reader) = into_informational(proxy_stream);
@@ -3307,7 +3315,7 @@ mod test {
             \r\n";
 
         let reader = BackendReader::new(raw.as_slice(), 256);
-        let stream = reader.read(true, 8192).await.expect("valid response");
+        let stream = reader.read(true, 8192, 8192).await.expect("valid response");
         let proxy_stream = ProxyResponseStream::new(stream).expect("failed to build proxy stream");
 
         let (info1, r1) = into_informational(proxy_stream);
@@ -3360,7 +3368,7 @@ mod test {
             let (backend_server_r, mut backend_server_w) = tokio::io::split(backend_server);
 
             let req = FrontendReader::new(backend_server_r, 256)
-                .read(8192)
+                .read(8192, 8192)
                 .await
                 .expect("backend: failed to read request head");
             let (_, mut body_reader) = req.into_parts();
@@ -3488,7 +3496,7 @@ mod test {
             let (backend_server_r, mut backend_server_w) = tokio::io::split(backend_server);
 
             let req = FrontendReader::new(backend_server_r, 256)
-                .read(8192)
+                .read(8192, 8192)
                 .await
                 .expect("backend: failed to read request head");
 

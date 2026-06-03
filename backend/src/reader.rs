@@ -78,6 +78,7 @@ where
         mut self,
         allow_body: bool,
         max_head_length: usize,
+        max_chunk_header_length: usize,
     ) -> BackendResult<ResponseStream<I>> {
         let res = self.head(max_head_length).await?;
         let Self {
@@ -147,6 +148,7 @@ where
                     BackendStreamReader {
                         allow_body,
                         max_head_length,
+                        max_chunk_header_length,
                         reader: Self {
                             reader,
                             parse_slots,
@@ -183,7 +185,12 @@ where
                     })
                 }
                 ParsedFraming::Chunked => BackendBodyReader::TE(BackendChunkedBodyReader {
-                    inner: ChunkedBodyReader::new(reader, parse_slots),
+                    inner: ChunkedBodyReader::new(
+                        reader,
+                        parse_slots,
+                        max_chunk_header_length,
+                        max_head_length,
+                    ),
                     recyclable,
                 }),
                 ParsedFraming::NoFraming => {
@@ -246,6 +253,7 @@ where
 pub struct BackendStreamReader<I> {
     allow_body: bool,
     max_head_length: usize,
+    max_chunk_header_length: usize,
     reader: BackendReader<I>,
 }
 
@@ -257,11 +265,14 @@ where
         let Self {
             allow_body,
             max_head_length,
+            max_chunk_header_length,
             reader,
         } = self;
         // TODO: move max_head_length into the BackendReader in the same way
         // it's on the FrontendReader.
-        reader.read(allow_body, max_head_length).await
+        reader
+            .read(allow_body, max_head_length, max_chunk_header_length)
+            .await
     }
 }
 
@@ -490,7 +501,7 @@ mod test {
 
         let reader = BackendReader::new(buf.as_slice(), 256);
         let (res, mut br) = reader
-            .read(true, 128)
+            .read(true, 128, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -531,7 +542,7 @@ mod test {
 
         let reader = BackendReader::new(buf.as_slice(), 256);
         let (res, mut br) = reader
-            .read(true, 128)
+            .read(true, 128, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -565,7 +576,7 @@ mod test {
 
         let reader = BackendReader::new(buf.as_slice(), 256);
         let (res, mut br) = reader
-            .read(false, 128)
+            .read(false, 128, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -595,7 +606,7 @@ mod test {
 
         let reader = BackendReader::new(buf.as_slice(), 256);
         let (res, mut br) = reader
-            .read(false, 128)
+            .read(false, 128, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -624,7 +635,7 @@ mod test {
 
         let reader = BackendReader::new(buf.as_slice(), 256);
         let (_res, mut br) = reader
-            .read(true, 128)
+            .read(true, 128, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -646,7 +657,7 @@ mod test {
 
         let reader = BackendReader::new(buf.as_slice(), 256);
         let (_res, mut br) = reader
-            .read(true, 128)
+            .read(true, 128, 128)
             .await
             .expect("can split into parts")
             .try_into_response()
@@ -676,7 +687,7 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice(), 256);
-        let result = reader.read(true, 128).await;
+        let result = reader.read(true, 128, 128).await;
 
         assert!(result.is_err());
 
@@ -687,7 +698,7 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice(), 256);
-        let result = reader.read(true, 128).await;
+        let result = reader.read(true, 128, 128).await;
 
         assert!(result.is_err(),);
     }
@@ -708,7 +719,7 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice(), 256);
-        let result = reader.read(true, 128).await;
+        let result = reader.read(true, 128, 128).await;
 
         assert!(result.is_err());
 
@@ -719,7 +730,7 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice(), 256);
-        let result = reader.read(true, 128).await;
+        let result = reader.read(true, 128, 128).await;
 
         assert!(result.is_err(),);
     }
@@ -740,7 +751,7 @@ mod test {
             ";
 
         let reader = BackendReader::new(buf.as_slice(), 256);
-        let result = reader.read(true, 128).await.expect("failed to read");
+        let result = reader.read(true, 128, 128).await.expect("failed to read");
 
         let (res, reader) = result.try_into_informational().expect("not informational");
         let xres = res
@@ -786,7 +797,7 @@ mod test {
             \r\n";
 
         let reader = BackendReader::new(buf.as_slice(), 256);
-        let result = reader.read(true, 128).await.expect("failed to read");
+        let result = reader.read(true, 128, 128).await.expect("failed to read");
 
         let (res, reader) = result
             .try_into_informational()
@@ -807,7 +818,7 @@ mod test {
             dangling-ignored-data\
             ";
         let reader = BackendReader::new(buf.as_slice(), 256);
-        let result = reader.read(true, 128).await.expect("failed to read");
+        let result = reader.read(true, 128, 128).await.expect("failed to read");
         let response = result.try_into_response().expect("not a response");
         let (_response, mut body_reader) = response.into_parts();
         let body = body_reader.read(200).await.expect("failed to read body");
