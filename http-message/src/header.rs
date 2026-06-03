@@ -177,6 +177,11 @@ impl Headers {
                 // rejected.
                 for raw in value.split(|&b| b == b',') {
                     let trimmed = raw.trim_ascii();
+                    if !trimmed.iter().all(|b| b.is_ascii_digit()) {
+                        return Err(HeaderError::InvalidContentLength(
+                            String::from_utf8_lossy(trimmed).to_string(),
+                        ));
+                    }
                     let cl_str = std::str::from_utf8(trimmed).map_err(|_| {
                         HeaderError::InvalidContentLength(
                             String::from_utf8_lossy(value).to_string(),
@@ -509,6 +514,23 @@ mod test {
         assert!(
             headers.framing().is_err(),
             "Requests with multiple Content-Length headers must be rejected"
+        );
+    }
+
+    #[test]
+    fn reject_cl_with_non_digit_in_length() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"content-length".as_slice(), b"+6".as_slice());
+        assert!(
+            headers.framing().is_err(),
+            "Content-Length header values may only contain ascii digits"
+        );
+
+        let mut headers = Headers::with_capacity(1);
+        headers.push(b"content-length".as_slice(), b"-6".as_slice());
+        assert!(
+            headers.framing().is_err(),
+            "Content-Length header values may only contain ascii digits"
         );
     }
 
