@@ -27,6 +27,11 @@ pub enum ProxyFrontendError {
     /// The frontend attempted to TRACE.
     #[error("TRACE method is not supported")]
     TraceNotSupported,
+    /// The frontend attempted an OPTIONS request. OPTIONS targets the gateway
+    /// itself (Max-Forwards, origin-wide `*`), so it cannot be blindly
+    /// forwarded; the caller must handle it before the proxy decision.
+    #[error("OPTIONS method is not supported")]
+    OptionsNotSupported,
     /// A frontend error occurred.
     #[error("Frontend error: {0}")]
     FrontendError(#[from] FrontendError),

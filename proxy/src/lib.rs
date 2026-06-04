@@ -1168,10 +1168,10 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
         };
         let mut frontend_request = Self::new(request, pending, &connection_tokens);
 
-        // Method rejections run first. CONNECT in particular uses
-        // authority-form as its request-target, which the target-form
-        // classifier below would otherwise flag - we want it surfaced as
-        // ConnectNotSupported, not AuthorityFormNotAllowed.
+        // Method rejections run first, ahead of request-target classification.
+        // CONNECT must be handled independently. OPTIONS and TRACE may target
+        // the gateway/proxy itself, so they cannot be blindly forwarded. The
+        // caller must intercept all three before the proxy decision.
         let method = frontend_request.req().method();
         if method == b"CONNECT".as_slice() {
             return Err(FrontendRequestError::new_request(
@@ -1183,6 +1183,12 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
             return Err(FrontendRequestError::new_request(
                 frontend_request,
                 ProxyFrontendError::TraceNotSupported,
+            ));
+        }
+        if method == b"OPTIONS".as_slice() {
+            return Err(FrontendRequestError::new_request(
+                frontend_request,
+                ProxyFrontendError::OptionsNotSupported,
             ));
         }
 

@@ -6,7 +6,9 @@
 
 use jrpxy_backend::{reader::BackendReader, writer::BackendWriter};
 use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
-use jrpxy_proxy::{BackendResponseStream, ProxyClient, ProxyOptions};
+use jrpxy_proxy::{
+    BackendResponseStream, FrontendRequestError, ProxyClient, ProxyFrontendError, ProxyOptions,
+};
 
 /// RFC 9112 section 3.2.2: "A server MUST respond with a 400 (Bad
 /// Request) status code to any HTTP/1.1 request message that
@@ -278,10 +280,11 @@ async fn absolute_form_with_userinfo_is_rejected() {
     }
 }
 
-/// RFC 9112 section 3.2.4: the asterisk-form (`*`) request-target is only
-/// valid for a server-wide OPTIONS request.
+/// OPTIONS targets the gateway itself (Max-Forwards, the origin-wide `*`
+/// request-target), so it cannot be blindly forwarded. The proxy rejects every
+/// OPTIONS request and leaves handling to the caller.
 #[tokio::test]
-async fn options_asterisk_passes_through() {
+async fn options_is_rejected() {
     let frontend_reader = b"\
         OPTIONS * HTTP/1.1\r\n\
         Host: example.com\r\n\
@@ -294,11 +297,15 @@ async fn options_asterisk_passes_through() {
         ProxyOptions::default(),
     );
 
-    let req = proxy_client
-        .start()
-        .await
-        .expect("OPTIONS * must be accepted");
-    assert_eq!(req.req().path().as_ref(), b"*");
+    let req_err = match proxy_client.start().await {
+        Ok(_) => panic!("expected error for OPTIONS, got Ok"),
+        Err(FrontendRequestError::Request(e)) => e,
+        Err(e) => panic!("unexpected error variant: {e:?}"),
+    };
+    assert!(matches!(
+        req_err.error(),
+        ProxyFrontendError::OptionsNotSupported
+    ));
 }
 
 /// Even though absolute-form requests are normalized to origin-form for
