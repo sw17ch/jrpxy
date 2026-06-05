@@ -1,14 +1,35 @@
 //! Configuration governing proxy behavior.
 
-use std::borrow::Cow;
+use std::{borrow::Cow, fmt::Debug, sync::Arc};
 
 use jrpxy_util::parse::is_valid_tchar;
 
 use crate::error::ProxyOptionsError;
 
 /// Options used to govern the behavior of the proxy.
-#[derive(Debug)]
+#[derive(Clone)]
 pub struct ProxyOptions {
+    inner: Arc<Inner>,
+}
+
+impl Debug for ProxyOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyOptions")
+            .field(
+                "max_backend_head_length",
+                &self.inner.max_backend_head_length,
+            )
+            .field(
+                "max_chunk_header_length",
+                &self.inner.max_chunk_header_length,
+            )
+            .field("body_chunk_size", &self.inner.body_chunk_size)
+            .field("received_by", &self.inner.received_by)
+            .finish()
+    }
+}
+
+struct Inner {
     max_backend_head_length: usize,
     max_chunk_header_length: usize,
     body_chunk_size: usize,
@@ -24,23 +45,23 @@ impl ProxyOptions {
 
     /// The maximum length, in bytes, that a backend response head can be.
     pub fn max_backend_head_length(&self) -> usize {
-        self.max_backend_head_length
+        self.inner.max_backend_head_length
     }
 
     /// The maximum length, in bytes, that a single chunk's size line (the
     /// chunk-size and any chunk extensions) can be when reading a chunked body.
     pub fn max_chunk_header_length(&self) -> usize {
-        self.max_chunk_header_length
+        self.inner.max_chunk_header_length
     }
 
     /// The read size to be attempted when copying body bytes.
     pub fn body_chunk_size(&self) -> usize {
-        self.body_chunk_size
+        self.inner.body_chunk_size
     }
 
     /// The name of the proxy used in the `Via` header.
     pub fn received_by(&self) -> &str {
-        &self.received_by
+        &self.inner.received_by
     }
 }
 
@@ -112,10 +133,12 @@ impl ProxyOptionsBuilder {
         validate_received_by(&received_by)?;
 
         Ok(ProxyOptions {
-            max_backend_head_length,
-            max_chunk_header_length,
-            body_chunk_size,
-            received_by,
+            inner: Arc::new(Inner {
+                max_backend_head_length,
+                max_chunk_header_length,
+                body_chunk_size,
+                received_by,
+            }),
         })
     }
 }
