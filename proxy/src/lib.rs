@@ -991,14 +991,15 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
         let is_head = request.req().method() == b"HEAD".as_slice();
         let version = request.req().version();
 
+        let pending = PendingFrontendResponse {
+            frontend_writer: writer,
+            options,
+            client_options: ClientOptions { is_head, version },
+        };
+
         let connection_tokens = match get_connection_tokens(request.req().headers()) {
             Ok(c) => c,
             Err(e) => {
-                let pending = PendingFrontendResponse {
-                    frontend_writer: writer,
-                    options,
-                    client_options: ClientOptions { is_head, version },
-                };
                 return Err(FrontendRequestError {
                     request,
                     pending,
@@ -1007,36 +1008,34 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
             }
         };
 
-        let pending = PendingFrontendResponse {
-            frontend_writer: writer,
-            options,
-            client_options: ClientOptions { is_head, version },
-        };
-        let mut frontend_request = Self::new(request, pending, &connection_tokens);
-
         // Method rejections run first, ahead of request-target classification.
         // CONNECT must be handled independently. OPTIONS and TRACE may target
         // the gateway/proxy itself, so they cannot be blindly forwarded. The
         // caller must intercept all three before the proxy decision.
-        let method = frontend_request.req().method();
+        let method = request.req().method();
         if method == b"CONNECT".as_slice() {
-            return Err(FrontendRequestError::from_proxy_request(
-                frontend_request,
-                ProxyFrontendError::ConnectNotSupported,
-            ));
+            return Err(FrontendRequestError {
+                request,
+                pending,
+                error: ProxyFrontendError::ConnectNotSupported,
+            });
         }
         if method == b"TRACE".as_slice() {
-            return Err(FrontendRequestError::from_proxy_request(
-                frontend_request,
-                ProxyFrontendError::TraceNotSupported,
-            ));
+            return Err(FrontendRequestError {
+                request,
+                pending,
+                error: ProxyFrontendError::TraceNotSupported,
+            });
         }
         if method == b"OPTIONS".as_slice() {
-            return Err(FrontendRequestError::from_proxy_request(
-                frontend_request,
-                ProxyFrontendError::OptionsNotSupported,
-            ));
+            return Err(FrontendRequestError {
+                request,
+                pending,
+                error: ProxyFrontendError::OptionsNotSupported,
+            });
         }
+
+        let mut frontend_request = Self::new(request, pending, &connection_tokens);
 
         if let Err(e) = request_target::normalize(frontend_request.req_mut()) {
             return Err(FrontendRequestError::from_proxy_request(
