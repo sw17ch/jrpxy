@@ -34,196 +34,76 @@ pub use options::{ProxyOptions, ProxyOptionsBuilder};
 use crate::error::ProxyBackendError;
 pub use crate::error::ProxyFrontendError;
 
-/// Initial state of a proxied request. It transitions to either
-/// [`FrontendProxyRequest`] or [`FrontendRequestError`] by calling the
-/// [`ProxyClient::start()`] method.
+/// Returned when [`FrontendProxyRequest::from_request`] rejects a request.
 ///
-/// The contained frontend writer is fully flushed, and the frontend reader is
-/// expected to be fully drained. Assuming a well behaved client and server, it
-/// is safe to extract the reader and writer using
-/// [`ProxyClient::into_parts()`].
-pub struct ProxyClient<FR, FW> {
-    frontend_reader: FrontendReader<FR>,
-    frontend_writer: FrontendWriter<FW>,
-    options: ProxyOptions,
-}
-
-impl<FR, FW> ProxyClient<FR, FW> {
-    /// Convert the [`ProxyClient`] back into the reader and writer from which
-    /// it was built. Assuming the [`ProxyClient`] was constructed with a fully
-    /// drained reader and a fully flushed writer, this can never give the user
-    /// back reader or writer mid-frame.
-    pub fn into_parts(self) -> (FrontendReader<FR>, FrontendWriter<FW>) {
-        let Self {
-            frontend_reader,
-            frontend_writer,
-            options: _,
-        } = self;
-        (frontend_reader, frontend_writer)
-    }
-}
-
-impl<FR, FW> ProxyClient<FR, FW>
-where
-    FR: AsyncReadExt + Unpin,
-    FW: AsyncWriteExt + Unpin,
-{
-    /// Create a new [`ProxyClient`] from a frontend reader that is aligned to
-    /// the start of a new request, and a frontend writer that is fully flushed.
-    pub fn new(
-        frontend_reader: FrontendReader<FR>,
-        frontend_writer: FrontendWriter<FW>,
-        options: ProxyOptions,
-    ) -> Self {
-        Self {
-            frontend_reader,
-            frontend_writer,
-            options,
-        }
-    }
-
-    /// Start the proxy transaction by attempting to read and verify a request
-    /// from the frontend reader. Returns a [`FrontendProxyRequest`] on success,
-    /// or [`FrontendRequestError`] on failure.
-    pub async fn start(self) -> Result<FrontendProxyRequest<FR, FW>, FrontendRequestError<FR, FW>> {
-        let Self {
-            frontend_reader,
-            frontend_writer,
-            options,
-        } = self;
-
-        let req = match frontend_reader
-            .read(
-                options.max_frontend_head_length(),
-                options.max_chunk_header_length(),
-            )
-            .await
-        {
-            Ok(req) => req,
-            Err(error) => {
-                return Err(FrontendRequestError::new_frontend(
-                    frontend_writer,
-                    options,
-                    HttpVersion::Http11,
-                    error.into(),
-                ));
-            }
-        };
-
-        FrontendProxyRequest::from_request(req, frontend_writer, options)
-    }
-}
-
-/// A valid request has been received from the frontend. We can forward this
-/// Returned when [`ProxyClient::start`] fails.
-///
-/// The `Request` variant is larger than the `Frontend` variant because it
-/// owns the full [`FrontendProxyRequest`] - by design, so the caller can
-/// recover the body reader and send a custom error response. Boxing the
-/// variant to silence `clippy::large_enum_variant` would be a public-API
-/// break for a cold path; the size disparity does not matter here.
-#[allow(clippy::large_enum_variant)]
-pub enum FrontendRequestError<FR, FW> {
-    /// The frontend sent a request that could not be parsed.
-    Frontend(FrontendRequestErrorKindRead<FW>),
-    /// The frontend sent a valid request that the proxy refuses to handle.
-    Request(FrontendRequestErrorKindRequest<FR, FW>),
+/// Carries the parsed [`FrontendRequest`] and a [`PendingFrontendResponse`] so
+/// the caller can send an error response and, if it chooses, drain the request
+/// body to reuse the connection. It deliberately exposes no way to forward the
+/// request: a request that `from_request` rejected must not reach a backend.
+pub struct FrontendRequestError<FR, FW> {
+    request: FrontendRequest<FR>,
+    pending: PendingFrontendResponse<FW>,
+    error: ProxyFrontendError,
 }
 
 impl<FR, FW> FrontendRequestError<FR, FW> {
-    /// Convenience method to construct a new request error.
-    fn new_request(
+    fn from_proxy_request(
         frontend_request: FrontendProxyRequest<FR, FW>,
         error: ProxyFrontendError,
     ) -> Self {
-        Self::Request(FrontendRequestErrorKindRequest {
-            reader: frontend_request,
+        let FrontendProxyRequest {
+            frontend,
+            original: _,
+            pending,
+        } = frontend_request;
+        Self {
+            request: frontend,
+            pending,
             error,
-        })
+        }
     }
 
-    fn new_frontend(
-        frontend_writer: FrontendWriter<FW>,
-        options: ProxyOptions,
-        version: HttpVersion,
-        error: ProxyFrontendError,
-    ) -> Self {
-        Self::Frontend(FrontendRequestErrorKindRead {
-            pending: PendingFrontendResponse {
-                frontend_writer,
-                options,
-                client_options: ClientOptions {
-                    is_head: false,
-                    version,
-                },
-            },
-            error,
-        })
+    /// A reference to the inner error associated with the request error.
+    pub fn error(&self) -> &ProxyFrontendError {
+        &self.error
+    }
+
+    /// Consumes the error and returns the parsed request and the pending
+    /// response, so the caller can send an error response and optionally drain
+    /// the request body for connection reuse.
+    pub fn into_parts(self) -> (FrontendRequest<FR>, PendingFrontendResponse<FW>) {
+        let Self {
+            request,
+            pending,
+            error: _,
+        } = self;
+        (request, pending)
+    }
+
+    /// Consumes the error and returns just the [`PendingFrontendResponse`], for
+    /// callers that only need to respond. The request body is dropped, so the
+    /// connection cannot be reused afterward.
+    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
+        let Self {
+            request: _,
+            pending,
+            error: _,
+        } = self;
+        pending
     }
 }
 
 impl<FR, FW> std::fmt::Debug for FrontendRequestError<FR, FW> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Frontend(arg0) => f.debug_tuple("Frontend").field(&arg0.error).finish(),
-            Self::Request(arg0) => f.debug_tuple("Request").field(&arg0.error).finish(),
-        }
+        f.debug_struct("FrontendRequestError")
+            .field("error", &self.error)
+            .finish()
     }
 }
 
 impl<FR, FW> From<FrontendRequestError<FR, FW>> for ProxyError {
     fn from(value: FrontendRequestError<FR, FW>) -> Self {
-        match value {
-            FrontendRequestError::Frontend(read) => Self::CopyError(read.error.into()),
-            FrontendRequestError::Request(request) => Self::CopyError(request.error.into()),
-        }
-    }
-}
-
-// TODO: consider some better names for FrontendRequestErrorKindRead and
-// FrontendRequestErrorKindRequest.
-
-/// An error occurred while reading the request from the frontend. We cannot
-/// recover the reader, but we can write something back.
-pub struct FrontendRequestErrorKindRead<FW> {
-    pending: PendingFrontendResponse<FW>,
-    error: ProxyFrontendError,
-}
-
-impl<FW> FrontendRequestErrorKindRead<FW> {
-    /// A reference to the inner error associated with the request error.
-    pub fn error(&self) -> &ProxyFrontendError {
-        &self.error
-    }
-
-    /// Consumes the error and returns a [`PendingFrontendResponse`] so the
-    /// caller can send an error response to the frontend client.
-    pub fn into_pending_response(self) -> PendingFrontendResponse<FW> {
-        let Self { pending, error: _ } = self;
-        pending
-    }
-}
-
-/// A valid request was received from the frontend, but there is a semantic
-/// problem with that request. We can still send back an error message,
-/// and optionally drain the body so that we can keep the connection open.
-pub struct FrontendRequestErrorKindRequest<FR, FW> {
-    reader: FrontendProxyRequest<FR, FW>,
-    error: ProxyFrontendError,
-}
-
-impl<FR, FW> FrontendRequestErrorKindRequest<FR, FW> {
-    /// A reference to the inner error associated with the request error.
-    pub fn error(&self) -> &ProxyFrontendError {
-        &self.error
-    }
-
-    /// Consumes the error and returns the [`FrontendProxyRequest`] so the
-    /// caller can inspect the request, send an error response, or drain the
-    /// body for connection reuse.
-    pub fn into_frontend_request(self) -> FrontendProxyRequest<FR, FW> {
-        let Self { reader, error: _ } = self;
-        reader
+        Self::CopyError(value.error.into())
     }
 }
 
@@ -925,16 +805,16 @@ where
         }
     }
 
-    /// Drive the body copy in both directions concurrently and return a
-    /// [`ProxyClient`] ready for the next request.
+    /// Drive the body copy in both directions concurrently. On completion,
+    /// returns frontend and backend readers and writers that can be reused.
     pub async fn finish(
         self,
     ) -> ProxyResult<(
-        Option<ProxyClient<FR, FW>>,
-        Option<BackendConnection<BR, BW>>,
+        Option<(FrontendReader<FR>, FrontendWriter<FW>)>,
+        Option<(BackendReader<BR>, BackendWriter<BW>)>,
     )> {
         let Self {
-            options,
+            options: _,
             request_body_forwarder,
             response_body_forwarder,
         } = self;
@@ -991,16 +871,9 @@ where
         };
 
         let backend_connection = backend_reader.map(move |br| (br, backend_writer));
-        let proxy_client =
-            frontend_reader
-                .zip(frontend_writer)
-                .map(move |(frontend_reader, frontend_writer)| ProxyClient {
-                    frontend_reader,
-                    frontend_writer,
-                    options,
-                });
+        let frontend_connection = frontend_reader.zip(frontend_writer);
 
-        Ok((proxy_client, backend_connection))
+        Ok((frontend_connection, backend_connection))
     }
 }
 
@@ -1104,20 +977,11 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
     }
 
     /// Build a [`FrontendProxyRequest`] from an already-parsed
-    /// [`FrontendRequest`]. Runs the same validation, hop-by-hop stripping, and
-    /// request-target normalization as [`ProxyClient::start`], but skips the
-    /// I/O step - useful when the request head was obtained from a source other
-    /// than a [`FrontendReader`] (e.g. an alternate protocol front-end, a test
-    /// fixture, or a higher-level dispatcher), or when the user wants to
-    /// pre-filter requests before sending them into the proxy.
-    ///
-    /// The caller is responsible for any size limits on the request head;
-    /// the `max_frontend_head_length` field of [`ProxyOptions`] is not
-    /// consulted on this path.
-    // The `Err` variant is intentionally large - it carries the recoverable
-    // state so the caller can send a custom error response. Boxing it would
-    // be a cold-path-only ergonomics tax and a public-API break, matching the
-    // existing `large_enum_variant` allowance on FrontendRequestError above.
+    /// [`FrontendRequest`]. Runs validation, hop-by-hop stripping, and
+    /// request-target normalization.
+    // The `Err` variant carries the recoverable state (body reader + pending
+    // response) so the caller can send a custom error response, which makes it
+    // large; boxing it would be a cold-path-only ergonomics tax.
     #[allow(clippy::result_large_err)]
     pub fn from_request(
         request: FrontendRequest<FR>,
@@ -1126,40 +990,22 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
     ) -> Result<Self, FrontendRequestError<FR, FW>> {
         let is_head = request.req().method() == b"HEAD".as_slice();
         let version = request.req().version();
+
         let connection_tokens = match get_connection_tokens(request.req().headers()) {
             Ok(c) => c,
             Err(e) => {
-                return Err(FrontendRequestError::new_frontend(
-                    writer,
+                let pending = PendingFrontendResponse {
+                    frontend_writer: writer,
                     options,
-                    version,
-                    e.into(),
-                ));
+                    client_options: ClientOptions { is_head, version },
+                };
+                return Err(FrontendRequestError {
+                    request,
+                    pending,
+                    error: e.into(),
+                });
             }
         };
-
-        // RFC 9112 section 6.1: A server or client that receives an HTTP/1.0
-        // message containing a Transfer-Encoding header field MUST treat the
-        // message as if the framing is faulty, even if a Content-Length is
-        // present, and close the connection after processing the message. The
-        // message sender might have retained a portion of the message, in
-        // buffer, that could be misinterpreted by further use of the
-        // connection.
-        if version == HttpVersion::Http10
-            && request
-                .req()
-                .headers()
-                .get_header("transfer-encoding")
-                .next()
-                .is_some()
-        {
-            return Err(FrontendRequestError::new_frontend(
-                writer,
-                options,
-                version,
-                ProxyFrontendError::TransferEncodingOnHttp10Client,
-            ));
-        }
 
         let pending = PendingFrontendResponse {
             frontend_writer: writer,
@@ -1174,26 +1020,29 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
         // caller must intercept all three before the proxy decision.
         let method = frontend_request.req().method();
         if method == b"CONNECT".as_slice() {
-            return Err(FrontendRequestError::new_request(
+            return Err(FrontendRequestError::from_proxy_request(
                 frontend_request,
                 ProxyFrontendError::ConnectNotSupported,
             ));
         }
         if method == b"TRACE".as_slice() {
-            return Err(FrontendRequestError::new_request(
+            return Err(FrontendRequestError::from_proxy_request(
                 frontend_request,
                 ProxyFrontendError::TraceNotSupported,
             ));
         }
         if method == b"OPTIONS".as_slice() {
-            return Err(FrontendRequestError::new_request(
+            return Err(FrontendRequestError::from_proxy_request(
                 frontend_request,
                 ProxyFrontendError::OptionsNotSupported,
             ));
         }
 
         if let Err(e) = request_target::normalize(frontend_request.req_mut()) {
-            return Err(FrontendRequestError::new_request(frontend_request, e));
+            return Err(FrontendRequestError::from_proxy_request(
+                frontend_request,
+                e,
+            ));
         }
 
         // RFC 9110 section 7.2: a server MUST respond 400 to any request with
@@ -1207,13 +1056,13 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
         // asterisk-form).
         let host_count = frontend_request.req().headers().get_header("host").count();
         if host_count > 1 {
-            return Err(FrontendRequestError::new_request(
+            return Err(FrontendRequestError::from_proxy_request(
                 frontend_request,
                 ProxyFrontendError::MultipleHosts,
             ));
         }
         if version == HttpVersion::Http11 && host_count == 0 {
-            return Err(FrontendRequestError::new_request(
+            return Err(FrontendRequestError::from_proxy_request(
                 frontend_request,
                 ProxyFrontendError::MissingHost,
             ));
@@ -1512,9 +1361,8 @@ mod test {
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 
     use crate::{
-        BackendResponseStream, ClientOptions, FrontendRequestError, InformationalForwardResult,
-        PendingFrontendResponse, ProxyClient, ProxyFrontendError, ProxyOptions,
-        get_connection_tokens,
+        BackendResponseStream, ClientOptions, InformationalForwardResult, PendingFrontendResponse,
+        ProxyFrontendError, ProxyOptions, get_connection_tokens,
     };
 
     use super::{
@@ -1592,13 +1440,15 @@ mod test {
 
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
 
-        let did_fe_read = proxy_client.start().await.expect("client start failed");
+        let did_fe_read = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+            .expect("client start failed");
 
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
@@ -1751,7 +1601,7 @@ mod test {
         let client = client.expect("failed to recycle client");
         let (_backend_reader, backend_writer) = backend_connection.unwrap();
 
-        let (_frontend_reader, frontend_writer) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client;
         let frontend_writer = frontend_writer.into_inner();
         let backend_writer = backend_writer.into_inner();
 
@@ -1803,13 +1653,15 @@ mod test {
 
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
 
-        let did_fe_read = proxy_client.start().await.expect("client start failed");
+        let did_fe_read = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+            .expect("client start failed");
 
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
@@ -1890,18 +1742,17 @@ mod test {
             hello";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -1925,7 +1776,7 @@ mod test {
             .expect("failed to forward response");
         let client = client.expect("failed to recycle client");
 
-        let (_frontend_reader, frontend_writer) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client;
         let frontend_writer = frontend_writer.into_inner();
 
         let expected_frontend_writer = b"\
@@ -1958,19 +1809,18 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
 
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2034,19 +1884,18 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
 
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2104,18 +1953,17 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2176,18 +2024,17 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2251,18 +2098,17 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2286,7 +2132,7 @@ mod test {
             .expect("failed to forward response");
         let client = client.expect("failed to recycle client");
 
-        let (_frontend_reader, frontend_writer) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client;
         let frontend_writer = frontend_writer.into_inner();
 
         let expected_frontend_writer = b"\
@@ -2336,15 +2182,14 @@ mod test {
         let backend_writer = BackendWriter::new(&mut backend_writer);
         let backend_connection = (backend_reader, backend_writer);
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
-
-        let be_res_stat = proxy_client
-            .start()
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
             .await
+            .expect("frontend read failed");
+
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2407,15 +2252,14 @@ mod test {
         let backend_writer = BackendWriter::new(&mut backend_writer);
         let backend_connection = (backend_reader, backend_writer);
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
-
-        let be_res_stat = proxy_client
-            .start()
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
             .await
+            .expect("frontend read failed");
+
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2477,18 +2321,17 @@ mod test {
             \r\n";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2512,7 +2355,7 @@ mod test {
             .expect("failed to forward response");
         let client = client.expect("failed to recycle client");
 
-        let (_frontend_reader, frontend_writer) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client;
         let frontend_writer = frontend_writer.into_inner();
 
         // The trailer field must appear between the terminal chunk and the
@@ -2566,18 +2409,17 @@ mod test {
             hello";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2603,7 +2445,7 @@ mod test {
         let client = client.expect("failed to recycle client");
 
         // Release the mutable borrow on frontend_writer before asserting.
-        let (frontend_reader, _) = client.into_parts();
+        let (frontend_reader, _) = client;
 
         // content-length must be forwarded (RFC 9110 section 15.4.5).
         let expected = b"\
@@ -2621,15 +2463,14 @@ mod test {
         // The backend connection must be positioned right at the start of the
         // next response - no body bytes were consumed from the 304.
         let mut frontend_writer = Vec::new();
-        let proxy_client = ProxyClient::new(
-            frontend_reader,
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
-
-        let be_res_stat = proxy_client
-            .start()
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = frontend_reader
+            .read(8192, fe_options.max_chunk_header_length())
             .await
+            .expect("frontend read failed");
+
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("second start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2653,7 +2494,7 @@ mod test {
             .expect("second forward failed");
         let client = client.expect("failed to recycle client");
 
-        let (_, fw) = client.into_parts();
+        let (_, fw) = client;
         let fw = fw.into_inner();
 
         // For a normal response with a body the proxy rewrites the framing
@@ -2702,18 +2543,17 @@ mod test {
             01234";
         let mut backend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
         let backend_connection = (
             BackendReader::new(backend_reader.as_ref(), 256),
             BackendWriter::new(&mut backend_writer),
         );
-        let be_res_stat = proxy_client
-            .start()
-            .await
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2738,7 +2578,7 @@ mod test {
         let backend_connection = backend_connection.unwrap();
         let client = client.expect("failed to recycle client");
 
-        let (frontend_reader, frontend_writer) = client.into_parts();
+        let (frontend_reader, frontend_writer) = client;
         let frontend_writer = frontend_writer.into_inner();
 
         // The content-length header must be preserved (the client needs to
@@ -2754,20 +2594,19 @@ mod test {
             jrpxy_util::debug::AsciiDebug(frontend_writer)
         );
 
-        // now run another ProxyClient; this time we expect a response body. We
+        // now run another request; this time we expect a response body. We
         // make a new frontend writer so we can distinguish the previous
         // response from the next response. The backend connection is reused
         // directly from the first cycle's return value.
         let mut frontend_writer = Vec::new();
-        let proxy_client = ProxyClient::new(
-            frontend_reader,
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
-
-        let be_res_stat = proxy_client
-            .start()
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = frontend_reader
+            .read(8192, fe_options.max_chunk_header_length())
             .await
+            .expect("frontend read failed");
+
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
             .expect("client start failed")
             .into_backend_request()
             .forward(backend_connection)
@@ -2791,7 +2630,7 @@ mod test {
             .expect("failed to forward response");
         let client = client.expect("failed to recycle client");
 
-        let (_frontend_reader, frontend_writer) = client.into_parts();
+        let (_frontend_reader, frontend_writer) = client;
         let frontend_writer = frontend_writer.into_inner();
 
         // The content-length header must be preserved (the client needs to
@@ -3144,16 +2983,16 @@ mod test {
             \r\n";
         let mut frontend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
 
-        let req_err = match proxy_client.start().await {
+        let req_err = match FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options) {
             Ok(_) => panic!("expected error for CONNECT, got Ok"),
-            Err(FrontendRequestError::Request(e)) => e,
-            Err(e) => panic!("unexpected error variant: {e:?}"),
+            Err(e) => e,
         };
 
         assert!(matches!(
@@ -3161,7 +3000,7 @@ mod test {
             ProxyFrontendError::ConnectNotSupported
         ));
 
-        let pending = req_err.into_frontend_request().into_pending_response();
+        let pending = req_err.into_pending_response();
 
         let response = ResponseBuilder::new(4)
             .with_version(HttpVersion::Http11)
@@ -3203,16 +3042,16 @@ mod test {
             \r\n";
         let mut frontend_writer = Vec::new();
 
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
 
-        let req_err = match proxy_client.start().await {
+        let req_err = match FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options) {
             Ok(_) => panic!("expected error for TRACE, got Ok"),
-            Err(FrontendRequestError::Request(e)) => e,
-            Err(e) => panic!("unexpected error variant: {e:?}"),
+            Err(e) => e,
         };
 
         assert!(matches!(
@@ -3220,7 +3059,7 @@ mod test {
             ProxyFrontendError::TraceNotSupported
         ));
 
-        let pending = req_err.into_frontend_request().into_pending_response();
+        let pending = req_err.into_pending_response();
 
         let response = ResponseBuilder::new(4)
             .with_version(HttpVersion::Http11)
@@ -3243,59 +3082,6 @@ mod test {
 
         let expected = b"\
             HTTP/1.1 405 Method Not Allowed\r\n\
-            Date: Mon, 01 Jan 2026 00:00:00 GMT\r\n\
-            Via: 1.1 jrpxy\r\n\
-            content-length: 0\r\n\
-            \r\n";
-        assert_eq!(
-            jrpxy_util::debug::AsciiDebug(expected.as_slice()),
-            jrpxy_util::debug::AsciiDebug(&frontend_writer)
-        );
-    }
-
-    /// When the frontend sends a malformed request, start() returns a
-    /// FrontendRequestError::Frontend that still carries a PendingFrontendResponse,
-    /// so the proxy can write a 400 Bad Request back to the client.
-    #[tokio::test]
-    async fn malformed_request_can_send_error_response() {
-        let frontend_reader = b"GET\r\n\r\n";
-        let mut frontend_writer = Vec::new();
-
-        let proxy_client = ProxyClient::new(
-            FrontendReader::new(frontend_reader.as_ref(), 256),
-            FrontendWriter::new(&mut frontend_writer),
-            ProxyOptions::default(),
-        );
-
-        let read_err = match proxy_client.start().await {
-            Ok(_) => panic!("expected parse error, got Ok"),
-            Err(FrontendRequestError::Frontend(e)) => e,
-            Err(e) => panic!("unexpected error variant: {e:?}"),
-        };
-
-        let pending = read_err.into_pending_response();
-
-        let response = ResponseBuilder::new(4)
-            .with_version(HttpVersion::Http11)
-            .with_code(400)
-            .with_reason("Bad Request")
-            .with_header("Date", &b"Mon, 01 Jan 2026 00:00:00 GMT"[..])
-            .build()
-            .expect("failed to build 400 response");
-
-        let (_, body_writer) = pending
-            .send_as_content_length(response, 0)
-            .await
-            .expect("failed to send error response");
-        body_writer
-            .finish()
-            .expect("failed to finish")
-            .finish()
-            .await
-            .expect("failed to flush finish");
-
-        let expected = b"\
-            HTTP/1.1 400 Bad Request\r\n\
             Date: Mon, 01 Jan 2026 00:00:00 GMT\r\n\
             Via: 1.1 jrpxy\r\n\
             content-length: 0\r\n\
@@ -3396,19 +3182,18 @@ mod test {
             let (frontend_server_r, frontend_server_w) = tokio::io::split(frontend_server);
             let (backend_client_r, backend_client_w) = tokio::io::split(backend_client);
 
-            let proxy_client = ProxyClient::new(
-                FrontendReader::new(frontend_server_r, 256),
-                FrontendWriter::new(frontend_server_w),
-                ProxyOptions::default(),
-            );
+            let fe_writer = FrontendWriter::new(frontend_server_w);
+            let fe_options = ProxyOptions::default();
+            let fe_request = FrontendReader::new(frontend_server_r, 256)
+                .read(8192, fe_options.max_chunk_header_length())
+                .await
+                .expect("frontend read failed");
             let backend_connection = (
                 BackendReader::new(backend_client_r, 256),
                 BackendWriter::new(backend_client_w),
             );
 
-            let be_res_stat = proxy_client
-                .start()
-                .await
+            let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
                 .expect("client start failed")
                 .into_backend_request()
                 .forward(backend_connection)
@@ -3530,19 +3315,18 @@ mod test {
             let (frontend_server_r, frontend_server_w) = tokio::io::split(frontend_server);
             let (backend_client_r, backend_client_w) = tokio::io::split(backend_client);
 
-            let proxy_client = ProxyClient::new(
-                FrontendReader::new(frontend_server_r, 256),
-                FrontendWriter::new(frontend_server_w),
-                ProxyOptions::default(),
-            );
+            let fe_writer = FrontendWriter::new(frontend_server_w);
+            let fe_options = ProxyOptions::default();
+            let fe_request = FrontendReader::new(frontend_server_r, 256)
+                .read(8192, fe_options.max_chunk_header_length())
+                .await
+                .expect("frontend read failed");
             let backend_connection = (
                 BackendReader::new(backend_client_r, 256),
                 BackendWriter::new(backend_client_w),
             );
 
-            let stream = proxy_client
-                .start()
-                .await
+            let stream = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
                 .expect("client start failed")
                 .into_backend_request()
                 .forward(backend_connection)

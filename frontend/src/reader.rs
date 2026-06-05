@@ -44,6 +44,7 @@ use jrpxy_http_message::{
     framing::ParsedFraming,
     header::Headers,
     message::{ParseSlots, Request},
+    version::HttpVersion,
 };
 use jrpxy_util::io_buffer::BytesReader;
 use tokio::io::AsyncReadExt;
@@ -137,6 +138,24 @@ where
         max_chunk_header_length: usize,
     ) -> FrontendResult<FrontendRequest<I>> {
         let req = self.head(max_head_length).await?;
+
+        // RFC 9112 section 6.1: A server or client that receives an HTTP/1.0
+        // message containing a Transfer-Encoding header field MUST treat the
+        // message as if the framing is faulty, even if a Content-Length is
+        // present, and close the connection after processing the message. The
+        // message sender might have retained a portion of the message, in
+        // buffer, that could be misinterpreted by further use of the
+        // connection.
+        if req.version() == HttpVersion::Http10
+            && req
+                .headers()
+                .get_header("transfer-encoding")
+                .next()
+                .is_some()
+        {
+            return Err(FrontendError::TransferEncodingOnHttp10);
+        }
+
         let Self {
             reader,
             parse_slots,

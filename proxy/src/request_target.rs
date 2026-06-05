@@ -1,7 +1,7 @@
 //! Request-target classification and normalization per RFC 9112 section 3.2.
 //!
-//! [`normalize`] is the entry point used by [`crate::ProxyClient::start`]: it
-//! inspects the request-target on the incoming [`Request`], decides which of
+//! [`normalize`] is invoked by [`crate::FrontendProxyRequest::from_request`]:
+//! it inspects the request-target on the incoming [`Request`], decides which of
 //! the four forms it is in, and either passes it through (origin-form,
 //! asterisk-form) or rewrites it (absolute-form -> origin-form with Host
 //! substitution per RFC 9112 section 3.2.2). Anything outside the four forms,

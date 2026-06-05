@@ -57,10 +57,6 @@ pub enum ProxyFrontendError {
     /// The request had more than one Host header (RFC 9110 section 7.2).
     #[error("request has multiple Host headers")]
     MultipleHosts,
-    /// The request is from an http/1.0 client, and contained a
-    /// transfer-encoding header (RFC 9112 section 6.1)
-    #[error("http/1.0 client sent a transfer-encoding header")]
-    TransferEncodingOnHttp10Client,
 }
 
 /// An error occurred while interacting with the backend.

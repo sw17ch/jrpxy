@@ -29,6 +29,8 @@ pub enum FrontendError {
     InvalidConnectionHeader(#[from] ConnectionTokenParserError),
     #[error("Request head exceeded size limit: {0} >= {1}")]
     MaxHeadLenExceeded(usize, usize),
+    #[error("HTTP/1.0 request carried a Transfer-Encoding header")]
+    TransferEncodingOnHttp10,
 }
 
 /// A result type where the error is [`FrontendError`].

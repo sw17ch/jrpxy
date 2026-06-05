@@ -6,9 +6,7 @@
 
 use jrpxy_backend::{reader::BackendReader, writer::BackendWriter};
 use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
-use jrpxy_proxy::{
-    BackendResponseStream, FrontendRequestError, ProxyClient, ProxyFrontendError, ProxyOptions,
-};
+use jrpxy_proxy::{BackendResponseStream, FrontendProxyRequest, ProxyFrontendError, ProxyOptions};
 
 /// RFC 9112 section 3.2.2: "A server MUST respond with a 400 (Bad
 /// Request) status code to any HTTP/1.1 request message that
@@ -21,15 +19,16 @@ async fn rfc9112_request_with_multiple_host_headers_is_rejected() {
         Host: example.com\r\n\
         Host: evil.example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    if proxy_client.start().await.is_ok() {
+    if FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options).is_ok() {
         panic!(
             "RFC 9112 section 3.2.2: an HTTP/1.1 request with more than one \
              Host header field MUST be rejected."
@@ -45,15 +44,16 @@ async fn rfc9112_http11_request_without_host_is_rejected() {
     let frontend_reader = b"\
         GET / HTTP/1.1\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    if proxy_client.start().await.is_ok() {
+    if FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options).is_ok() {
         panic!(
             "RFC 9112 section 3.2.2: an HTTP/1.1 request without a Host \
              header field MUST be rejected."
@@ -75,19 +75,15 @@ async fn rfc9112_http10_request_with_transfer_encoding_is_rejected() {
         \r\n\
         0\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
-
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
-
-    if proxy_client.start().await.is_ok() {
+    if FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, 8192)
+        .await
+        .is_ok()
+    {
         panic!(
             "RFC 9112 section 6.1: Transfer-Encoding is HTTP/1.1-only; an \
              HTTP/1.0 request bearing Transfer-Encoding must be \
-             rejected."
+             rejected at read."
         );
     }
 }
@@ -104,7 +100,7 @@ async fn rfc9112_http10_response_with_transfer_encoding_is_rejected() {
         GET / HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     let backend_reader = b"\
         HTTP/1.0 200 Ok\r\n\
@@ -114,13 +110,15 @@ async fn rfc9112_http10_response_with_transfer_encoding_is_rejected() {
         \r\n";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -162,15 +160,16 @@ async fn rfc9112_absolute_form_uri_authority_replaces_host() {
         GET http://origin.example.com/path HTTP/1.1\r\n\
         Host: spoofed.example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = match proxy_client.start().await {
+    let req = match FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options) {
         Ok(r) => r,
         Err(_) => panic!(
             "RFC 9112 section 3.2.1: a proxy MUST accept absolute-form \
@@ -209,17 +208,16 @@ async fn rfc9112_absolute_form_path_rewritten_to_origin_form() {
         GET http://origin.example.com/path?q=1 HTTP/1.1\r\n\
         Host: spoofed.example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
-
-    let req = proxy_client
-        .start()
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
         .await
+        .expect("frontend read failed");
+
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
         .expect("must accept absolute-form");
     let backend_req = req.into_backend_request();
     assert_eq!(
@@ -236,17 +234,16 @@ async fn rfc9112_absolute_form_empty_path_becomes_slash() {
     let frontend_reader = b"\
         GET http://example.com HTTP/1.1\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
-
-    let req = proxy_client
-        .start()
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
         .await
+        .expect("frontend read failed");
+
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
         .expect("absolute-form with empty path must be accepted");
     let backend_req = req.into_backend_request();
     assert_eq!(
@@ -264,15 +261,16 @@ async fn absolute_form_with_userinfo_is_rejected() {
     let frontend_reader = b"\
         GET http://user:pass@example.com/x HTTP/1.1\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    if proxy_client.start().await.is_ok() {
+    if FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options).is_ok() {
         panic!(
             "RFC 9110 section 4.2.4: absolute-form with userinfo@host must be \
              rejected to avoid silently forwarding embedded credentials."
@@ -289,18 +287,18 @@ async fn options_is_rejected() {
         OPTIONS * HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req_err = match proxy_client.start().await {
+    let req_err = match FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options) {
         Ok(_) => panic!("expected error for OPTIONS, got Ok"),
-        Err(FrontendRequestError::Request(e)) => e,
-        Err(e) => panic!("unexpected error variant: {e:?}"),
+        Err(e) => e,
     };
     assert!(matches!(
         req_err.error(),
@@ -319,17 +317,16 @@ async fn absolute_form_preserves_un_normalized_values() {
         GET http://origin.example.com/path HTTP/1.1\r\n\
         Host: spoofed.example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
-
-    let req = proxy_client
-        .start()
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
         .await
+        .expect("frontend read failed");
+
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
         .expect("absolute-form must be accepted");
 
     // The request-target bytes the client sent are preserved on the original.
@@ -366,17 +363,16 @@ async fn origin_form_original_matches_forwarded() {
         GET /foo HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
-
-    let req = proxy_client
-        .start()
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
         .await
+        .expect("frontend read failed");
+
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
         .expect("origin-form must be accepted");
 
     assert_eq!(req.original().path().as_ref(), b"/foo");
@@ -392,17 +388,16 @@ async fn origin_form_original_exposes_client_host() {
         GET /foo HTTP/1.1\r\n\
         Host: client.example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
-
-    let req = proxy_client
-        .start()
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
         .await
+        .expect("frontend read failed");
+
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
         .expect("origin-form must be accepted");
 
     let original_host = req
@@ -423,17 +418,16 @@ async fn absolute_form_original_exposes_client_host_pre_substitution() {
         GET http://origin.example.com/x HTTP/1.1\r\n\
         Host: spoofed.example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
-
-    let req = proxy_client
-        .start()
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
         .await
+        .expect("frontend read failed");
+
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
         .expect("absolute-form must be accepted");
 
     let original_host = req
@@ -464,7 +458,7 @@ async fn absolute_form_original_exposes_client_host_pre_substitution() {
 /// response." A proxy that receives `Connection: close` from the client MUST
 /// NOT reuse the frontend connection for another request - `BodyExchanger::
 /// finish` is the choke point that decides whether to hand the caller back a
-/// reusable [`ProxyClient`]; an honored close must surface as `None` there.
+/// reusable frontend connection; an honored close must surface as `None` there.
 #[tokio::test]
 async fn rfc9112_request_connection_close_discards_frontend() {
     let frontend_reader = b"\
@@ -472,7 +466,7 @@ async fn rfc9112_request_connection_close_discards_frontend() {
         Host: example.com\r\n\
         Connection: close\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     let backend_reader = b"\
         HTTP/1.1 200 Ok\r\n\
@@ -481,13 +475,15 @@ async fn rfc9112_request_connection_close_discards_frontend() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -522,7 +518,7 @@ async fn rfc9112_request_connection_close_discards_frontend() {
         panic!(
             "RFC 9112 section 9.6: a frontend that sent `Connection: close` must \
              not be reused; finish() must return None for the frontend \
-             ProxyClient."
+             connection."
         );
     }
 }
@@ -539,7 +535,7 @@ async fn rfc9112_response_connection_close_discards_backend() {
         GET / HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     // Content-Length framing (rather than EOF) is used deliberately: an EOF-
     // framed response would force the backend connection closed regardless of
@@ -552,13 +548,15 @@ async fn rfc9112_response_connection_close_discards_backend() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -611,7 +609,7 @@ async fn rfc9112_http10_frontend_without_keep_alive_discards_frontend() {
         GET / HTTP/1.0\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     // Content-Length framing keeps the close decision from being forced by
     // body delimitation; the only reason to close here is the HTTP/1.0
@@ -623,13 +621,15 @@ async fn rfc9112_http10_frontend_without_keep_alive_discards_frontend() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -664,7 +664,7 @@ async fn rfc9112_http10_frontend_without_keep_alive_discards_frontend() {
         panic!(
             "RFC 9112 section 9.3: an HTTP/1.0 frontend without `Connection: \
              keep-alive` must not be reused; finish() must return None for \
-             the frontend ProxyClient."
+             the frontend connection."
         );
     }
 }
@@ -681,7 +681,7 @@ async fn rfc9112_http10_backend_without_keep_alive_discards_backend() {
         GET / HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     let backend_reader = b"\
         HTTP/1.0 200 Ok\r\n\
@@ -690,13 +690,15 @@ async fn rfc9112_http10_backend_without_keep_alive_discards_backend() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -743,15 +745,16 @@ async fn asterisk_form_rejected_for_non_options() {
         GET * HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    if proxy_client.start().await.is_ok() {
+    if FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options).is_ok() {
         panic!(
             "RFC 9112 section 3.2.4: asterisk-form request-target is only \
              valid for OPTIONS."
@@ -771,15 +774,16 @@ async fn rfc9112_absolute_form_empty_path_with_query_becomes_slash_query() {
     let frontend_reader = b"\
         GET http://example.com?q=1 HTTP/1.1\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = match proxy_client.start().await {
+    let req = match FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options) {
         Ok(r) => r,
         Err(_) => panic!(
             "RFC 9112 section 3.2.1: absolute-form with empty path and a \
@@ -812,7 +816,7 @@ async fn rfc9110_unknown_1xx_from_backend_does_not_hard_error() {
         GET / HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     // Backend sends a hypothetical 199 informational response followed by
     // the final 200.
@@ -826,13 +830,15 @@ async fn rfc9110_unknown_1xx_from_backend_does_not_hard_error() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -886,7 +892,7 @@ async fn rfc9110_identical_duplicate_content_length_accepted() {
         GET / HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     // Backend sends two Content-Length headers with the same value.
     let backend_reader = b"\
@@ -897,13 +903,15 @@ async fn rfc9110_identical_duplicate_content_length_accepted() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -939,7 +947,7 @@ async fn rfc9110_comma_separated_identical_content_length_accepted() {
         GET / HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     // Backend sends a single Content-Length header with comma-separated
     // identical values.
@@ -950,13 +958,15 @@ async fn rfc9110_comma_separated_identical_content_length_accepted() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -993,7 +1003,7 @@ async fn rfc9110_date_header_injected_when_backend_omits_it() {
         GET / HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     // Backend deliberately omits the Date header.
     let backend_reader = b"\
@@ -1003,13 +1013,15 @@ async fn rfc9110_date_header_injected_when_backend_omits_it() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
@@ -1061,7 +1073,7 @@ async fn rfc9110_date_header_from_backend_is_preserved_unchanged() {
         GET / HTTP/1.1\r\n\
         Host: example.com\r\n\
         \r\n";
-    let mut frontend_writer = Vec::new();
+    let mut frontend_writer: Vec<u8> = Vec::new();
 
     let backend_reader = b"\
         HTTP/1.1 200 Ok\r\n\
@@ -1071,13 +1083,15 @@ async fn rfc9110_date_header_from_backend_is_preserved_unchanged() {
         hello";
     let mut backend_writer = Vec::new();
 
-    let proxy_client = ProxyClient::new(
-        FrontendReader::new(frontend_reader.as_ref(), 256),
-        FrontendWriter::new(&mut frontend_writer),
-        ProxyOptions::default(),
-    );
+    let fe_writer = FrontendWriter::new(&mut frontend_writer);
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
 
-    let req = proxy_client.start().await.expect("client start failed");
+    let req = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+        .expect("client start failed");
 
     let backend_connection = (
         BackendReader::new(backend_reader.as_ref(), 256),
