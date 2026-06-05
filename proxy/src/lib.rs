@@ -2288,6 +2288,88 @@ mod test {
     }
 
     #[tokio::test]
+    async fn eof_from_backend_reframed_as_chunked_for_http11_client() {
+        // An HTTP/1.0 backend delimits its body by closing the connection (no
+        // content-length, no transfer-encoding). For an HTTP/1.1 client the
+        // proxy must re-frame that EOF body as chunked so the frontend
+        // connection can stay open and be reused. The recycling shape proves
+        // the asymmetry: the chunked-reframed frontend is reusable (Some) while
+        // the EOF-delimited backend connection is consumed by close (None).
+        let frontend_reader = b"\
+            GET / HTTP/1.1\r\n\
+            Host: example.com\r\n\
+            \r\n";
+        let mut frontend_writer = Vec::new();
+
+        let backend_reader = b"\
+            HTTP/1.0 200 Ok\r\n\
+            Date: Mon, 01 Jan 2026 00:00:00 GMT\r\n\
+            \r\n\
+            hello";
+        let mut backend_writer = Vec::new();
+
+        let backend_reader = BackendReader::new(backend_reader.as_ref(), 128);
+        let backend_writer = BackendWriter::new(&mut backend_writer);
+        let backend_connection = (backend_reader, backend_writer);
+
+        let fe_writer = FrontendWriter::new(&mut frontend_writer);
+        let fe_options = ProxyOptions::default();
+        let fe_request = FrontendReader::new(frontend_reader.as_ref(), 256)
+            .read(8192, fe_options.max_chunk_header_length())
+            .await
+            .expect("frontend read failed");
+
+        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
+            .expect("client start failed")
+            .into_backend_request()
+            .forward(backend_connection)
+            .await
+            .expect("backend write failed")
+            .read_backend_response()
+            .await
+            .expect("failed to read backend response");
+
+        let rbr = match be_res_stat {
+            BackendResponseStream::Final(rbr) => rbr,
+            BackendResponseStream::Informational(_) => panic!("unexpected informational"),
+        };
+
+        let (client, backend_connection) = rbr
+            .forward_response_head()
+            .await
+            .expect("forward_response_head failed")
+            .finish()
+            .await
+            .expect("failed to forward response");
+
+        // The frontend connection survives because the body was re-framed as
+        // chunked; the EOF-delimited backend connection cannot be reused.
+        let client = client.expect("expected frontend client to be recyclable");
+        assert!(
+            backend_connection.is_none(),
+            "expected backend to be None for EOF-framed response"
+        );
+
+        let (_frontend_reader, frontend_writer) = client;
+        let frontend_writer = frontend_writer.into_inner();
+
+        let expected_frontend_writer = b"\
+            HTTP/1.1 200 Ok\r\n\
+            Date: Mon, 01 Jan 2026 00:00:00 GMT\r\n\
+            Via: 1.0 jrpxy\r\n\
+            transfer-encoding: chunked\r\n\
+            \r\n\
+            5\r\n\
+            hello\r\n\
+            0\r\n\
+            \r\n";
+        assert_eq!(
+            jrpxy_util::debug::AsciiDebug(expected_frontend_writer.as_slice()),
+            jrpxy_util::debug::AsciiDebug(frontend_writer)
+        );
+    }
+
+    #[tokio::test]
     async fn chunked_backend_response_trailers_forwarded() {
         let frontend_reader = b"\
             GET / HTTP/1.1\r\n\
