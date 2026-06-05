@@ -47,22 +47,6 @@ pub struct FrontendRequestError<FR, FW> {
 }
 
 impl<FR, FW> FrontendRequestError<FR, FW> {
-    fn from_proxy_request(
-        frontend_request: FrontendProxyRequest<FR, FW>,
-        error: ProxyFrontendError,
-    ) -> Self {
-        let FrontendProxyRequest {
-            frontend,
-            original: _,
-            pending,
-        } = frontend_request;
-        Self {
-            request: frontend,
-            pending,
-            error,
-        }
-    }
-
     /// A reference to the inner error associated with the request error.
     pub fn error(&self) -> &ProxyFrontendError {
         &self.error
@@ -962,18 +946,27 @@ pub struct FrontendProxyRequest<FR, FW> {
 }
 
 impl<FR, FW> FrontendProxyRequest<FR, FW> {
+    // See from_request: Err carries recoverable state, hence large.
+    #[allow(clippy::result_large_err)]
     fn new(
         mut frontend: FrontendRequest<FR>,
         pending: PendingFrontendResponse<FW>,
         connection_tokens: &[Bytes],
-    ) -> Self {
+    ) -> Result<Self, FrontendRequestError<FR, FW>> {
         let original = frontend.req().clone();
+        if let Err(e) = request_target::normalize(frontend.req_mut()) {
+            return Err(FrontendRequestError {
+                request: frontend,
+                pending,
+                error: e,
+            });
+        }
         strip_hop_by_hop_headers(frontend.req_mut().headers_mut(), connection_tokens);
-        Self {
+        Ok(Self {
             frontend,
             original,
             pending,
-        }
+        })
     }
 
     /// Build a [`FrontendProxyRequest`] from an already-parsed
@@ -1035,39 +1028,33 @@ impl<FR, FW> FrontendProxyRequest<FR, FW> {
             });
         }
 
-        let mut frontend_request = Self::new(request, pending, &connection_tokens);
-
-        if let Err(e) = request_target::normalize(frontend_request.req_mut()) {
-            return Err(FrontendRequestError::from_proxy_request(
-                frontend_request,
-                e,
-            ));
-        }
-
         // RFC 9110 section 7.2: a server MUST respond 400 to any request with
         // more than one Host field, regardless of version. Multiple Hosts let
         // the proxy and origin disagree on routing/authorization, so reject
         // unconditionally. The presence requirement is HTTP/1.1-only per RFC
-        // 9112 section 3.2.2; HTTP/1.0 may omit Host. After absolute-form
-        // normalization above, every forward-eligible request reaches this
-        // check with the Host derived from the request-target authority
-        // (absolute-form) or from the client's own Host header (origin-form /
-        // asterisk-form).
-        let host_count = frontend_request.req().headers().get_header("host").count();
+        // 9112 section 3.2.2; HTTP/1.0 may omit Host. These checks run against
+        // the request as received, before normalization: RFC 9112 section 3.2.2
+        // requires a client to send Host in every HTTP/1.1 request even in
+        // absolute-form, so a missing Host is a client fault even though
+        // normalization could otherwise synthesize one from the request-target
+        // authority.
+        let host_count = request.req().headers().get_header("host").count();
         if host_count > 1 {
-            return Err(FrontendRequestError::from_proxy_request(
-                frontend_request,
-                ProxyFrontendError::MultipleHosts,
-            ));
+            return Err(FrontendRequestError {
+                request,
+                pending,
+                error: ProxyFrontendError::MultipleHosts,
+            });
         }
         if version == HttpVersion::Http11 && host_count == 0 {
-            return Err(FrontendRequestError::from_proxy_request(
-                frontend_request,
-                ProxyFrontendError::MissingHost,
-            ));
+            return Err(FrontendRequestError {
+                request,
+                pending,
+                error: ProxyFrontendError::MissingHost,
+            });
         }
 
-        Ok(frontend_request)
+        Self::new(request, pending, &connection_tokens)
     }
 
     /// The rewritten request that will be forwarded upstream.
@@ -1400,6 +1387,7 @@ mod test {
         let connection_tokens =
             get_connection_tokens(req.req().headers()).expect("failed to get connection tokens");
         FrontendProxyRequest::new(req, pending, &connection_tokens)
+            .expect("can build proxy request")
     }
 
     async fn make_backend_proxy_request(raw: &[u8]) -> BackendProxyRequest<&[u8], tokio::io::Sink> {

@@ -233,6 +233,7 @@ async fn rfc9112_absolute_form_path_rewritten_to_origin_form() {
 async fn rfc9112_absolute_form_empty_path_becomes_slash() {
     let frontend_reader = b"\
         GET http://example.com HTTP/1.1\r\n\
+        Host: example.com\r\n\
         \r\n";
     let mut frontend_writer: Vec<u8> = Vec::new();
 
@@ -773,6 +774,7 @@ async fn asterisk_form_rejected_for_non_options() {
 async fn rfc9112_absolute_form_empty_path_with_query_becomes_slash_query() {
     let frontend_reader = b"\
         GET http://example.com?q=1 HTTP/1.1\r\n\
+        Host: example.com\r\n\
         \r\n";
     let mut frontend_writer: Vec<u8> = Vec::new();
 
