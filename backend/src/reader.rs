@@ -202,7 +202,7 @@ where
             }
         };
 
-        Ok(ResponseStream::Response(BackendResponse { res, reader }))
+        Ok(ResponseStream::Final(BackendResponse { res, reader }))
     }
 
     pub fn into_parts(self) -> BytesReader<I> {
@@ -217,7 +217,7 @@ where
 pub enum ResponseStream<I> {
     /// We got a regular response. We will not read another until we've drained
     /// out the body, if any.
-    Response(BackendResponse<I>),
+    Final(BackendResponse<I>),
     /// We got an informational response.
     Informational(Response, BackendStreamReader<I>),
 }
@@ -225,14 +225,14 @@ pub enum ResponseStream<I> {
 impl<I> ResponseStream<I> {
     pub fn try_into_response(self) -> Result<BackendResponse<I>, Box<Self>> {
         match self {
-            ResponseStream::Response(r) => Ok(r),
+            ResponseStream::Final(r) => Ok(r),
             s @ ResponseStream::Informational(_, _) => Err(Box::new(s)),
         }
     }
 
     pub fn try_into_informational(self) -> Result<(Response, BackendStreamReader<I>), Box<Self>> {
         match self {
-            r @ ResponseStream::Response(_) => Err(Box::new(r)),
+            r @ ResponseStream::Final(_) => Err(Box::new(r)),
             ResponseStream::Informational(res, reader) => Ok((res, reader)),
         }
     }
@@ -244,7 +244,7 @@ where
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Response(_) => write!(f, "Response"),
+            Self::Final(_) => write!(f, "Final"),
             Self::Informational(_, _) => write!(f, "Informational"),
         }
     }

@@ -6,7 +6,9 @@
 
 use jrpxy_backend::{reader::BackendReader, writer::BackendWriter};
 use jrpxy_frontend::{reader::FrontendReader, writer::FrontendWriter};
-use jrpxy_proxy::{BackendResponseStream, FrontendProxyRequest, ProxyFrontendError, ProxyOptions};
+use jrpxy_proxy::{
+    BackendProxyResponseStream, FrontendProxyRequest, ProxyFrontendError, ProxyOptions,
+};
 
 /// RFC 9112 section 3.2.2: "A server MUST respond with a 400 (Bad
 /// Request) status code to any HTTP/1.1 request message that
@@ -457,7 +459,7 @@ async fn absolute_form_original_exposes_client_host_pre_substitution() {
 /// RFC 9112 section 9.6: "The 'close' connection option is defined as a
 /// signal that the sender will close this connection after completion of the
 /// response." A proxy that receives `Connection: close` from the client MUST
-/// NOT reuse the frontend connection for another request - `BodyExchanger::
+/// NOT reuse the frontend connection for another request - `ProxyBodyExchanger::
 /// finish` is the choke point that decides whether to hand the caller back a
 /// reusable frontend connection; an honored close must surface as `None` there.
 #[tokio::test]
@@ -501,8 +503,8 @@ async fn rfc9112_request_connection_close_discards_frontend() {
         .await
         .expect("failed to read backend response")
     {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(_) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(_) => {
             panic!("unexpected informational response from fixed backend")
         }
     };
@@ -527,7 +529,7 @@ async fn rfc9112_request_connection_close_discards_frontend() {
 /// RFC 9112 section 9.6, backend direction: an origin that returns
 /// `Connection: close` is announcing it will close the connection after the
 /// response, so the proxy MUST NOT reuse that backend connection for a
-/// subsequent request. `BodyExchanger::finish` reports reusability via the
+/// subsequent request. `ProxyBodyExchanger::finish` reports reusability via the
 /// `Option<BackendConnection>` it returns; an honored backend close must
 /// surface as `None` there.
 #[tokio::test]
@@ -574,8 +576,8 @@ async fn rfc9112_response_connection_close_discards_backend() {
         .await
         .expect("failed to read backend response")
     {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(_) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(_) => {
             panic!("unexpected informational response from fixed backend")
         }
     };
@@ -647,8 +649,8 @@ async fn rfc9112_http10_frontend_without_keep_alive_discards_frontend() {
         .await
         .expect("failed to read backend response")
     {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(_) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(_) => {
             panic!("unexpected informational response from fixed backend")
         }
     };
@@ -716,8 +718,8 @@ async fn rfc9112_http10_backend_without_keep_alive_discards_backend() {
         .await
         .expect("failed to read backend response")
     {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(_) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(_) => {
             panic!("unexpected informational response from fixed backend")
         }
     };
@@ -863,8 +865,8 @@ async fn rfc9110_unknown_1xx_from_backend_does_not_hard_error() {
 
     // Verify we can reach the final 200 response.
     let final_response = match stream {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(info) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(info) => {
             // The unknown 1xx was surfaced as informational -- that's fine,
             // as long as we can continue to the final response.
             let next = info
@@ -872,8 +874,8 @@ async fn rfc9110_unknown_1xx_from_backend_does_not_hard_error() {
                 .await
                 .expect("forwarding unknown 1xx must not fail");
             match next.into_inner() {
-                BackendResponseStream::Final(r) => r,
-                BackendResponseStream::Informational(_) => {
+                BackendProxyResponseStream::Final(r) => r,
+                BackendProxyResponseStream::Informational(_) => {
                     panic!("expected final response after unknown 1xx")
                 }
             }
@@ -931,8 +933,8 @@ async fn rfc9110_identical_duplicate_content_length_accepted() {
     );
 
     let final_response = match stream {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(_) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(_) => {
             panic!("unexpected informational response")
         }
     };
@@ -987,8 +989,8 @@ async fn rfc9110_comma_separated_identical_content_length_accepted() {
     );
 
     let final_response = match stream {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(_) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(_) => {
             panic!("unexpected informational response")
         }
     };
@@ -1040,8 +1042,8 @@ async fn rfc9110_date_header_injected_when_backend_omits_it() {
         .await
         .expect("failed to read backend response")
     {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(_) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(_) => {
             panic!("unexpected informational response")
         }
     };
@@ -1110,8 +1112,8 @@ async fn rfc9110_date_header_from_backend_is_preserved_unchanged() {
         .await
         .expect("failed to read backend response")
     {
-        BackendResponseStream::Final(r) => r,
-        BackendResponseStream::Informational(_) => {
+        BackendProxyResponseStream::Final(r) => r,
+        BackendProxyResponseStream::Informational(_) => {
             panic!("unexpected informational response")
         }
     };
