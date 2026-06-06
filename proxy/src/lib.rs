@@ -497,24 +497,11 @@ where
                 });
             }
         };
-        Ok(match response_stream {
-            ProxyResponseStream::Final(proxy_response) => {
-                BackendResponseStream::Final(BackendFinalResponse {
-                    request_body_forwarder,
-                    pending,
-                    proxy_response,
-                })
-            }
-            ProxyResponseStream::Informational(
-                proxy_informational_response,
-                proxy_stream_reader,
-            ) => BackendResponseStream::Informational(BackendInformationalResponse {
-                proxy_informational_response,
-                request_body_forwarder,
-                pending,
-                proxy_stream_reader,
-            }),
-        })
+        Ok(attach_frontend_state(
+            response_stream,
+            request_body_forwarder,
+            pending,
+        ))
     }
 }
 
@@ -546,13 +533,7 @@ pub struct BackendInformationalResponse<FR, FW, BR, BW> {
     proxy_stream_reader: ProxyStreamReader<BR>,
 }
 
-impl<FR, FW, BR, BW> BackendInformationalResponse<FR, FW, BR, BW>
-where
-    FR: AsyncReadExt + Unpin,
-    FW: AsyncWriteExt + Unpin,
-    BR: AsyncReadExt + Unpin,
-    BW: AsyncWriteExt + Unpin,
-{
+impl<FR, FW, BR, BW> BackendInformationalResponse<FR, FW, BR, BW> {
     /// A reference to the internal [`BackendInformationalProxyResponse`].
     pub fn as_response(&self) -> &BackendInformationalProxyResponse {
         &self.proxy_informational_response
@@ -562,7 +543,15 @@ where
     pub fn as_response_mut(&mut self) -> &mut BackendInformationalProxyResponse {
         &mut self.proxy_informational_response
     }
+}
 
+impl<FR, FW, BR, BW> BackendInformationalResponse<FR, FW, BR, BW>
+where
+    FR: AsyncReadExt + Unpin,
+    FW: AsyncWriteExt + Unpin,
+    BR: AsyncReadExt + Unpin,
+    BW: AsyncWriteExt + Unpin,
+{
     /// Forward the informational response to the frontend. See
     /// [`InformationalForwardResult`] for possible successful outcomes.
     pub async fn forward_informational_response(
@@ -619,24 +608,8 @@ where
             }
         };
 
-        let response_stream = match response_stream {
-            ProxyResponseStream::Final(proxy_response) => {
-                BackendResponseStream::Final(BackendFinalResponse {
-                    request_body_forwarder,
-                    pending,
-                    proxy_response,
-                })
-            }
-            ProxyResponseStream::Informational(
-                proxy_informational_response,
-                proxy_stream_reader,
-            ) => BackendResponseStream::Informational(Self {
-                proxy_informational_response,
-                request_body_forwarder,
-                pending,
-                proxy_stream_reader,
-            }),
-        };
+        let response_stream =
+            attach_frontend_state(response_stream, request_body_forwarder, pending);
 
         Ok(if client_supports_informational_response {
             InformationalForwardResult::Forwarded(response_stream)
@@ -653,13 +626,7 @@ pub struct BackendFinalResponse<FR, FW, BR, BW> {
     proxy_response: BackendFinalProxyResponse<BR>,
 }
 
-impl<FR, FW, BR, BW> BackendFinalResponse<FR, FW, BR, BW>
-where
-    FR: AsyncReadExt + Unpin,
-    FW: AsyncWriteExt + Unpin,
-    BR: AsyncReadExt + Unpin,
-    BW: AsyncWriteExt + Unpin,
-{
+impl<FR, FW, BR, BW> BackendFinalResponse<FR, FW, BR, BW> {
     /// The [`BackendFinalProxyResponse`] associated with this backend response.
     pub fn as_response(&self) -> &BackendFinalProxyResponse<BR> {
         &self.proxy_response
@@ -670,7 +637,15 @@ where
     pub fn as_response_mut(&mut self) -> &mut BackendFinalProxyResponse<BR> {
         &mut self.proxy_response
     }
+}
 
+impl<FR, FW, BR, BW> BackendFinalResponse<FR, FW, BR, BW>
+where
+    FR: AsyncReadExt + Unpin,
+    FW: AsyncWriteExt + Unpin,
+    BR: AsyncReadExt + Unpin,
+    BW: AsyncWriteExt + Unpin,
+{
     /// Send the response head to the frontend and return a [`BodyExchanger`]
     /// ready to drive the body copy in both directions.
     ///
@@ -767,13 +742,7 @@ pub struct BodyExchangerParts<FR, FW, BR, BW> {
     pub response_body_forwarder: ResponseBodyForwarder<BR, FW>,
 }
 
-impl<FR, FW, BR, BW> BodyExchanger<FR, FW, BR, BW>
-where
-    FR: AsyncReadExt + Unpin,
-    FW: AsyncWriteExt + Unpin,
-    BR: AsyncReadExt + Unpin,
-    BW: AsyncWriteExt + Unpin,
-{
+impl<FR, FW, BR, BW> BodyExchanger<FR, FW, BR, BW> {
     /// Decompose into the individual body readers and writers. The caller is
     /// responsible for driving the f2b and b2f copies concurrently.
     pub fn into_parts(self) -> BodyExchangerParts<FR, FW, BR, BW> {
@@ -788,7 +757,15 @@ where
             response_body_forwarder,
         }
     }
+}
 
+impl<FR, FW, BR, BW> BodyExchanger<FR, FW, BR, BW>
+where
+    FR: AsyncReadExt + Unpin,
+    FW: AsyncWriteExt + Unpin,
+    BR: AsyncReadExt + Unpin,
+    BW: AsyncWriteExt + Unpin,
+{
     /// Drive the body copy in both directions concurrently. On completion,
     /// returns frontend and backend readers and writers that can be reused.
     pub async fn finish(
@@ -1279,7 +1256,7 @@ impl BackendInformationalProxyResponse {
 ///
 /// Wraps [`BackendStreamReader`] and applies hop-by-hop removal to each
 /// response it yields.
-pub struct ProxyStreamReader<I> {
+struct ProxyStreamReader<I> {
     reader: BackendStreamReader<I>,
 }
 
@@ -1288,7 +1265,7 @@ where
     I: AsyncReadExt + Unpin,
 {
     /// Read the next response in the stream.
-    pub async fn read(self) -> Result<ProxyResponseStream<I>, ProxyBackendError> {
+    async fn read(self) -> Result<ProxyResponseStream<I>, ProxyBackendError> {
         let stream = self.reader.read().await?;
         let stream = ProxyResponseStream::new(stream)?;
         Ok(stream)
@@ -1298,7 +1275,7 @@ where
 /// The proxy-processed form of [`ResponseStream`].
 ///
 /// Each variant has had its hop-by-hop headers stripped.
-pub enum ProxyResponseStream<I> {
+enum ProxyResponseStream<I> {
     /// A regular (non-1xx) response.
     Final(BackendFinalProxyResponse<I>),
     /// A 1xx informational response. More responses can be read from the
@@ -1324,6 +1301,35 @@ impl<I> ProxyResponseStream<I> {
                     ProxyStreamReader { reader },
                 ))
             }
+        }
+    }
+}
+
+/// Fold the per-transaction frontend state - the pending response and the
+/// in-flight request-body forwarder - onto a normalized backend response,
+/// yielding the next [`BackendResponseStream`]. The initial response read and
+/// the post-1xx continuation both reach this same point, so the variant-by-
+/// variant rewrap lives here rather than being reproduced at each call site.
+fn attach_frontend_state<FR, FW, BR, BW>(
+    stream: ProxyResponseStream<BR>,
+    request_body_forwarder: RequestBodyForwarder<FR, BW>,
+    pending: PendingFrontendResponse<FW>,
+) -> BackendResponseStream<FR, FW, BR, BW> {
+    match stream {
+        ProxyResponseStream::Final(proxy_response) => {
+            BackendResponseStream::Final(BackendFinalResponse {
+                request_body_forwarder,
+                pending,
+                proxy_response,
+            })
+        }
+        ProxyResponseStream::Informational(proxy_informational_response, proxy_stream_reader) => {
+            BackendResponseStream::Informational(BackendInformationalResponse {
+                proxy_informational_response,
+                request_body_forwarder,
+                pending,
+                proxy_stream_reader,
+            })
         }
     }
 }
@@ -2963,7 +2969,7 @@ mod test {
 
     #[tokio::test]
     async fn informational_response_hop_by_hop() {
-        let raw = b"\
+        let raw_backend = b"\
             HTTP/1.1 100 Continue\r\n\
             Connection: x-interim-hop\r\n\
             X-Interim-Hop: val\r\n\
@@ -2973,7 +2979,7 @@ mod test {
             Content-Length: 0\r\n\
             \r\n";
 
-        let reader = BackendReader::new(raw.as_slice(), 256);
+        let reader = BackendReader::new(raw_backend.as_slice(), 256);
         let stream = reader.read(true, 8192, 8192).await.expect("valid response");
         let proxy_stream = ProxyResponseStream::new(stream).expect("failed to build proxy stream");
 
