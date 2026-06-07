@@ -387,6 +387,20 @@ pub struct Request {
 }
 
 impl Request {
+    /// Assemble a [`Request`] directly from owned parts.
+    ///
+    /// Does not perform validation on components.
+    pub fn from_parts(method: Bytes, path: Bytes, version: HttpVersion, headers: Headers) -> Self {
+        Self {
+            inner: Box::new(RequestInner {
+                method,
+                path,
+                version,
+                headers,
+            }),
+        }
+    }
+
     /// The method of the request.
     pub fn method(&self) -> &Bytes {
         &self.inner.method
@@ -467,6 +481,20 @@ pub struct Response {
 }
 
 impl Response {
+    /// Assemble a [`Response`] directly from owned parts.
+    ///
+    /// Does not perform validation on components.
+    pub fn from_parts(version: HttpVersion, code: u16, reason: Bytes, headers: Headers) -> Self {
+        Self {
+            inner: Box::new(ResponseInner {
+                version,
+                code,
+                reason,
+                headers,
+            }),
+        }
+    }
+
     /// The response version.
     pub fn version(&self) -> HttpVersion {
         self.inner.version
