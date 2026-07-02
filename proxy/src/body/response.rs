@@ -242,7 +242,10 @@ where
         let frontend_body_writer = frontend_body_writer_state.into_ready()?;
         match (backend_body_reader, frontend_body_writer) {
             (BackendBodyReader::TE(fr), frontend_body::Ready::Chunked(bw)) => {
-                let (next_reader, trailers) = fr.drain().await?;
+                let (next_reader, mut trailers) = fr.drain().await?;
+                // RFC 9110 6.5.1: a client that folds trailers into headers
+                // must not be handed framing/routing/auth fields this way.
+                crate::sanitize_trailers(&mut trailers);
                 let finisher = bw.finish_with_trailers(&trailers);
                 let next_frontend = finisher.finish().await.map_err(FrontendError::from)?;
                 Ok((next_reader, Some(next_frontend)))

@@ -890,6 +890,94 @@ fn strip_hop_by_hop_headers(headers: &mut Headers, connection_tokens: &[Bytes]) 
     headers.retain(|(name, _)| !is_hop_by_hop(name, connection_tokens));
 }
 
+/// Trailer-section fields the proxy strips before forwarding, on top of the
+/// connection-management set already removed by [`is_standard_hop_by_hop`].
+///
+/// RFC 9110 section 6.5.1 forbids sending these as trailers: a recipient that
+/// folds them into the header section has framing, routing, auth, caching, or
+/// content decisions changed after that section was acted on (response
+/// splitting / request smuggling / cache poisoning). The gateway cannot know
+/// whether a downstream folds trailers, so it strips them.
+///
+/// Section 6.5.1 lists fields by category and example, not as a closed set.
+/// Entries are grouped by category: the RFC-named examples verbatim, plus
+/// unnamed siblings in the same categories that pose the same hazard - the
+/// request conditionals, the cookie / challenge side of auth, and fields whose
+/// specific danger is a shared cache replaying a folded trailer to every client
+/// (see the per-field notes). Framing's `transfer-encoding` / `te` are omitted
+/// here as [`is_standard_hop_by_hop`] already covers them.
+const FORBIDDEN_TRAILER_HEADERS: &[&[u8]] = &[
+    // Framing (6.5.1: "Content-Length").
+    b"content-length",
+    // Routing (6.5.1: "Host").
+    b"host",
+    // Request modifiers (6.5.1: "Cache-Control, Expect, Max-Forwards, TE"; TE
+    // is hop-by-hop), that category's conditionals (section 13), and range
+    // (section 14): a folded range desyncs a range-aware cache's key from the
+    // bytes actually served, or turns a stored 200 into a 206.
+    b"cache-control",
+    b"expect",
+    b"max-forwards",
+    b"if-match",
+    b"if-none-match",
+    b"if-modified-since",
+    b"if-unmodified-since",
+    b"if-range",
+    b"range",
+    // Authentication (6.5.1: "Authorization"; Proxy-Auth* are hop-by-hop) and
+    // its cookie / challenge siblings (section 11, RFC 6265).
+    b"authorization",
+    b"www-authenticate",
+    b"set-cookie",
+    b"cookie",
+    // Response control data (6.5.1: "Age, Cache-Control, Expires, Date"), plus
+    // two siblings a shared cache would replay to every client: vary (section
+    // 12.5.5) redefines the secondary cache key (RFC 9111 4.1); location
+    // (section 10.2.2) on a cacheable 301/308 becomes a persistent redirect.
+    b"age",
+    b"expires",
+    b"date",
+    b"vary",
+    b"location",
+    // Payload processing (6.5.1: "Content-Encoding, Content-Type,
+    // Content-Range") and content-location (section 8.7), which can bind the
+    // stored response to a different URI than the one requested.
+    b"content-encoding",
+    b"content-type",
+    b"content-range",
+    b"content-location",
+    // Trailer belongs in the header section announcing the trailers (6.5.1),
+    // never among them.
+    b"trailer",
+];
+
+// Deliberately absent, though a deployment may want them: forwarding metadata
+// (X-Forwarded-For / -Host / -Proto, Forwarded) and security response headers
+// (Content-Security-Policy, Strict-Transport-Security, X-Frame-Options,
+// Access-Control-Allow-*). A folded X-Forwarded-Host reflected into a cached
+// redirect or link is a potent cache-poisoning vector, and a folded
+// X-Forwarded-For can spoof a client address for downstream authz and logging.
+// They are left out because they are non-standard (no RFC 9110 6.5.1 lineage)
+// and their trust model is deployment-specific; the intended home is an
+// operator-supplied extension to this filter, not a baked-in default. Not
+// wired up yet.
+
+/// True when `name` must not be forwarded in a trailer section: the standard
+/// hop-by-hop set (see [`HOP_BY_HOP_HEADERS`]) plus the RFC 9110 section 6.5.1
+/// categories in [`FORBIDDEN_TRAILER_HEADERS`].
+fn is_forbidden_trailer_field(name: &[u8]) -> bool {
+    is_standard_hop_by_hop(name)
+        || FORBIDDEN_TRAILER_HEADERS
+            .iter()
+            .any(|h| h.eq_ignore_ascii_case(name))
+}
+
+/// Remove every field that [`is_forbidden_trailer_field`] rejects from
+/// `trailers`, in place, before the trailer section is forwarded to a peer.
+fn sanitize_trailers(trailers: &mut Headers) {
+    trailers.retain(|(name, _)| !is_forbidden_trailer_field(name));
+}
+
 /// Inject a `Via` header (RFC 9110 sec 7.6.3) into `headers`.
 fn insert_proxy_headers(headers: &mut Headers, version: HttpVersion, received_by: &str) {
     let via_version = match version {
@@ -1360,7 +1448,100 @@ mod test {
     use jrpxy_frontend::writer::FrontendWriter;
     use jrpxy_http_message::{message::ResponseBuilder, version::HttpVersion};
 
-    use crate::{ClientOptions, PendingFrontendResponse, ProxyOptions};
+    use bytes::Bytes;
+    use jrpxy_http_message::header::Headers;
+
+    use crate::{
+        ClientOptions, PendingFrontendResponse, ProxyOptions, is_forbidden_trailer_field,
+        sanitize_trailers,
+    };
+
+    #[test]
+    fn forbidden_trailer_fields_cover_each_rfc_9110_6_5_1_category() {
+        // One representative per RFC 9110 6.5.1 category, plus the connection-
+        // management fields that is_standard_hop_by_hop already denies.
+        for name in [
+            b"content-length".as_slice(), // framing
+            b"transfer-encoding",         // framing (hop-by-hop)
+            b"host",                      // routing
+            b"max-forwards",              // request modifier
+            b"if-none-match",             // request conditional
+            b"authorization",             // authentication
+            b"set-cookie",                // authentication (sibling)
+            b"date",                      // response control data
+            b"content-type",              // payload processing
+            b"trailer",                   // trailer announcement
+            b"connection",                // hop-by-hop
+        ] {
+            assert!(
+                is_forbidden_trailer_field(name),
+                "{} must be forbidden in a trailer section",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    #[test]
+    fn caching_motivated_trailer_fields_are_forbidden() {
+        // Siblings added because a shared cache would replay a folded trailer
+        // to every client (cache-key desync or poisoned stored response).
+        for name in [
+            b"vary".as_slice(),
+            b"location",
+            b"content-location",
+            b"range",
+        ] {
+            assert!(
+                is_forbidden_trailer_field(name),
+                "{} must be forbidden in a trailer section",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    #[test]
+    fn benign_trailer_fields_are_preserved() {
+        // Case-insensitive matching must not clobber unrelated fields, and the
+        // validators that are the whole point of trailers stay allowed.
+        for name in [
+            b"x-checksum".as_slice(),
+            b"etag",
+            b"last-modified",
+            b"expires-soon",
+        ] {
+            assert!(
+                !is_forbidden_trailer_field(name),
+                "{} should be allowed in a trailer section",
+                String::from_utf8_lossy(name)
+            );
+        }
+    }
+
+    #[test]
+    fn sanitize_trailers_strips_forbidden_preserves_benign() {
+        let mut trailers = Headers::with_capacity(4);
+        // Mixed case to prove the filter is case-insensitive.
+        trailers.push(
+            Bytes::from_static(b"Set-Cookie"),
+            Bytes::from_static(b"s=1"),
+        );
+        trailers.push(
+            Bytes::from_static(b"Transfer-Encoding"),
+            Bytes::from_static(b"chunked"),
+        );
+        trailers.push(
+            Bytes::from_static(b"X-Checksum"),
+            Bytes::from_static(b"abc"),
+        );
+
+        sanitize_trailers(&mut trailers);
+
+        let remaining: Vec<_> = trailers
+            .iter()
+            .map(|(n, _)| String::from_utf8_lossy(n).to_string())
+            .collect();
+        assert_eq!(remaining, vec!["X-Checksum".to_string()]);
+    }
 
     #[tokio::test]
     async fn adds_via_header_to_response() {
