@@ -5,8 +5,8 @@ use httparse::{Request as HttparseRequest, Response as HttparseResponse};
 use jrpxy_util::{
     io_buffer::BytesReader,
     parse::{
-        OriginFormError, is_valid_field_name, is_valid_field_value, is_valid_request_target,
-        is_valid_tchar, validate_origin_form,
+        OriginFormError, is_valid_field_value, is_valid_request_target, is_valid_tchar,
+        validate_origin_form,
     },
 };
 
@@ -14,7 +14,7 @@ pub use httparse::Error as HttpParseError;
 
 use crate::{
     framing::ParsedFraming,
-    header::{HeaderError, Headers},
+    header::{FieldError, HeaderError, Headers},
     version::HttpVersion,
 };
 
@@ -57,20 +57,15 @@ pub enum BuildError {
     InvalidFieldValue(String),
 }
 
-/// Validate builder-supplied header pairs, rejecting a name or value whose
-/// bytes could split the header block (RFC 9110 sections 5.1, 5.5).
-fn validate_built_headers(headers: &[(&str, &[u8])]) -> Result<(), BuildError> {
-    for (name, value) in headers {
-        if !is_valid_field_name(name.as_bytes()) {
-            return Err(BuildError::InvalidFieldName(name.to_string()));
-        }
-        if !is_valid_field_value(value) {
-            return Err(BuildError::InvalidFieldValue(
-                String::from_utf8_lossy(value).into_owned(),
-            ));
+/// Translate a [`FieldError`] surfaced by [`Headers::push`] into the builder's
+/// error type, recording the offending name or value for diagnostics.
+fn build_error_for_field(error: FieldError, name: &str, value: &[u8]) -> BuildError {
+    match error {
+        FieldError::InvalidName => BuildError::InvalidFieldName(name.to_string()),
+        FieldError::InvalidValue => {
+            BuildError::InvalidFieldValue(String::from_utf8_lossy(value).into_owned())
         }
     }
-    Ok(())
 }
 
 /// A buffer type that carries no type or lifetime information that has the same
@@ -657,8 +652,6 @@ impl<'s> RequestBuilder<'s> {
         if !is_valid_request_target(path.as_bytes()) {
             return Err(BuildError::InvalidPath(path.to_string()));
         }
-        validate_built_headers(built_headers)?;
-
         let mut buf = BytesMut::with_capacity(128);
 
         buf.extend_from_slice(method.as_bytes());
@@ -666,13 +659,18 @@ impl<'s> RequestBuilder<'s> {
         buf.extend_from_slice(path.as_bytes());
         let path = buf.split().freeze();
 
+        // The checked push is the single validation point for header field
+        // bytes, rejecting a name or value that could split the header block
+        // (RFC 9110 sections 5.1, 5.5).
         let mut headers = Headers::with_capacity(built_headers.len());
         for (name, value) in built_headers {
             buf.extend_from_slice(name.as_bytes());
-            let name = buf.split().freeze();
+            let name_bytes = buf.split().freeze();
             buf.extend_from_slice(value.as_ref());
-            let value = buf.split().freeze();
-            headers.push_raw(name, value);
+            let value_bytes = buf.split().freeze();
+            headers
+                .push(name_bytes, value_bytes)
+                .map_err(|e| build_error_for_field(e, name, value))?;
         }
 
         Ok(Request {
@@ -755,7 +753,6 @@ impl<'s> ResponseBuilder<'s> {
         if !is_valid_field_value(reason.as_bytes()) {
             return Err(BuildError::InvalidReason(reason.to_string()));
         }
-        validate_built_headers(built_headers)?;
         // TODO: verify that a 1xx response follows content-length and transfer-encoding rules
 
         let mut buf = BytesMut::with_capacity(128);
@@ -764,13 +761,18 @@ impl<'s> ResponseBuilder<'s> {
         buf.extend_from_slice(reason.as_bytes());
         let reason = buf.split().freeze();
 
+        // The checked push is the single validation point for header field
+        // bytes, rejecting a name or value that could split the header block
+        // (RFC 9110 sections 5.1, 5.5).
         let mut headers = Headers::with_capacity(built_headers.len());
         for (name, value) in built_headers {
             buf.extend_from_slice(name.as_bytes());
-            let name = buf.split().freeze();
+            let name_bytes = buf.split().freeze();
             buf.extend_from_slice(value.as_ref());
-            let value = buf.split().freeze();
-            headers.push_raw(name, value);
+            let value_bytes = buf.split().freeze();
+            headers
+                .push(name_bytes, value_bytes)
+                .map_err(|e| build_error_for_field(e, name, value))?;
         }
 
         Ok(Response {
