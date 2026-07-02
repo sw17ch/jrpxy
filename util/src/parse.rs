@@ -111,6 +111,21 @@ pub fn is_valid_request_target(target: &[u8]) -> bool {
     !target.is_empty() && target.iter().all(|&b| is_valid_field_vchar(b))
 }
 
+/// Trim leading and trailing `OWS` from `value`, where `OWS = *( SP / HTAB )`
+/// (RFC 9112 section 5.6.3). Unlike [`slice::trim_ascii`], this leaves CR, LF,
+/// form-feed, and every other control byte in place: they are not whitespace in
+/// the field grammar, so stripping them would silently reshape a malformed value
+/// into one that looks well-formed instead of letting the caller reject it.
+pub fn trim_ows(value: &[u8]) -> &[u8] {
+    let is_ows = |b: u8| b == b' ' || b == b'\t';
+    let Some(start) = value.iter().position(|&b| !is_ows(b)) else {
+        return &[];
+    };
+    // position found a non-OWS byte, so rposition finds one too.
+    let end = value.iter().rposition(|&b| !is_ows(b)).unwrap_or(start);
+    &value[start..=end]
+}
+
 /// Lookup table for bytes valid unencoded in an origin-form request-target's
 /// `absolute-path [ "?" query ]`: `pchar / "/" / "?"` (RFC 9112 section 3.2.1,
 /// RFC 3986 section 3.3). `%` is intentionally excluded since pct-encoded
@@ -202,7 +217,8 @@ pub fn validate_origin_form(path: &[u8]) -> Result<(), OriginFormError> {
 mod test {
     use super::{
         OriginFormError, is_valid_field_name, is_valid_field_value, is_valid_field_vchar,
-        is_valid_path_query_char, is_valid_request_target, is_valid_tchar, validate_origin_form,
+        is_valid_path_query_char, is_valid_request_target, is_valid_tchar, trim_ows,
+        validate_origin_form,
     };
 
     #[test]
@@ -389,6 +405,22 @@ mod test {
             "CRLF must be rejected"
         );
         assert!(!is_valid_field_value(b"nul\0byte"), "NUL must be rejected");
+    }
+
+    #[test]
+    fn trim_ows_strips_only_sp_and_htab() {
+        assert_eq!(trim_ows(b"  value \t"), b"value".as_slice());
+        assert_eq!(trim_ows(b"\t\t x \t "), b"x".as_slice());
+        assert_eq!(trim_ows(b"value"), b"value".as_slice());
+        assert_eq!(trim_ows(b"   "), b"".as_slice());
+        assert_eq!(trim_ows(b""), b"".as_slice());
+        // CR, LF, FF (0x0C), and VT (0x0B) are not OWS: they must survive so a
+        // malformed value is not silently normalized into a valid-looking one.
+        assert_eq!(trim_ows(b"\r\nvalue"), b"\r\nvalue".as_slice());
+        assert_eq!(trim_ows(b"value\x0c"), b"value\x0c".as_slice());
+        assert_eq!(trim_ows(b"\x0bvalue"), b"\x0bvalue".as_slice());
+        // Interior whitespace is preserved.
+        assert_eq!(trim_ows(b"  a b  "), b"a b".as_slice());
     }
 
     #[test]

@@ -1,5 +1,5 @@
 use bytes::{Buf, Bytes};
-use jrpxy_util::parse::{is_valid_field_name, is_valid_field_value, is_valid_tchar};
+use jrpxy_util::parse::{is_valid_field_name, is_valid_field_value, is_valid_tchar, trim_ows};
 
 use crate::{framing::ParsedFraming, version::HttpVersion};
 
@@ -211,7 +211,7 @@ impl Headers {
 
         for (name, value) in self.iter() {
             if name.eq_ignore_ascii_case(b"content-length") {
-                let value = value.trim_ascii();
+                let value = trim_ows(value);
                 // RFC 9110 section 8.6: a Content-Length field may carry a
                 // single decimal value or a list of identical decimal values
                 // produced by an upstream that combined duplicate fields
@@ -220,7 +220,7 @@ impl Headers {
                 // disagreement leaves the framing ambiguous and must be
                 // rejected.
                 for raw in value.split(|&b| b == b',') {
-                    let trimmed = raw.trim_ascii();
+                    let trimmed = trim_ows(raw);
                     if !trimmed.iter().all(|b| b.is_ascii_digit()) {
                         return Err(HeaderError::InvalidContentLength(
                             String::from_utf8_lossy(trimmed).to_string(),
@@ -244,7 +244,7 @@ impl Headers {
                     cl = Some(cl_val);
                 }
             } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-                let te_value = value.trim_ascii();
+                let te_value = trim_ows(value);
                 if !te_value.eq_ignore_ascii_case(b"chunked") {
                     return Err(HeaderError::UnsupportedTransferEncoding(
                         String::from_utf8_lossy(te_value).to_string(),
