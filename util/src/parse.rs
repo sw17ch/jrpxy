@@ -82,6 +82,35 @@ pub const fn is_valid_field_vchar(byte: u8) -> bool {
     FIELD_VCHAR_LOOKUP[byte as usize] == 1
 }
 
+/// True when `name` is a valid header field name: a non-empty token
+/// (`1*tchar`, RFC 9110 sections 5.1 and 5.6.2). Rejecting the empty string
+/// and any non-`tchar` byte keeps a constructed name from carrying the `:`,
+/// SP, or CR/LF that would split it into a separate field or line.
+pub fn is_valid_field_name(name: &[u8]) -> bool {
+    !name.is_empty() && name.iter().all(|&b| is_valid_tchar(b))
+}
+
+/// True when `value` is a valid header field value: every byte is a
+/// `field-vchar` (VCHAR / obs-text) or `SP` / `HTAB` (RFC 9110 section 5.5).
+/// The empty value is permitted, and surrounding whitespace is tolerated. The
+/// safety-critical effect is excluding CR, LF, and NUL, which a downstream
+/// could otherwise read as a header or line boundary. A reason-phrase draws
+/// from the same byte set (RFC 9112 section 4), so this doubles as its check.
+pub fn is_valid_field_value(value: &[u8]) -> bool {
+    value
+        .iter()
+        .all(|&b| is_valid_field_vchar(b) || b == b' ' || b == b'\t')
+}
+
+/// True when `target` is safe to place in a request line as a request-target:
+/// non-empty and free of SP, CTL, CR, LF, and DEL (every byte is a
+/// `field-vchar`). This is only the message-splitting guard; it does not check
+/// that the bytes form one of the four request-target forms - use
+/// [`validate_origin_form`] or the proxy's request-target classifier for that.
+pub fn is_valid_request_target(target: &[u8]) -> bool {
+    !target.is_empty() && target.iter().all(|&b| is_valid_field_vchar(b))
+}
+
 /// Lookup table for bytes valid unencoded in an origin-form request-target's
 /// `absolute-path [ "?" query ]`: `pchar / "/" / "?"` (RFC 9112 section 3.2.1,
 /// RFC 3986 section 3.3). `%` is intentionally excluded since pct-encoded
@@ -172,8 +201,8 @@ pub fn validate_origin_form(path: &[u8]) -> Result<(), OriginFormError> {
 #[cfg(test)]
 mod test {
     use super::{
-        OriginFormError, is_valid_field_vchar, is_valid_path_query_char, is_valid_tchar,
-        validate_origin_form,
+        OriginFormError, is_valid_field_name, is_valid_field_value, is_valid_field_vchar,
+        is_valid_path_query_char, is_valid_request_target, is_valid_tchar, validate_origin_form,
     };
 
     #[test]
@@ -337,5 +366,44 @@ mod test {
             validate_origin_form(b"/%"),
             Err(OriginFormError::InvalidPercentEncoding { offset: 1 })
         ));
+    }
+
+    #[test]
+    fn field_name_validation() {
+        assert!(is_valid_field_name(b"X-Forwarded-For"));
+        assert!(!is_valid_field_name(b""), "empty name is not a token");
+        assert!(!is_valid_field_name(b"bad name"), "SP is not a tchar");
+        assert!(!is_valid_field_name(b"colon:name"), "':' is not a tchar");
+        assert!(
+            !is_valid_field_name(b"a\r\nInjected"),
+            "CRLF must be rejected"
+        );
+    }
+
+    #[test]
+    fn field_value_validation() {
+        assert!(is_valid_field_value(b"text/html; charset=utf-8"));
+        assert!(is_valid_field_value(b""), "empty value is permitted");
+        assert!(
+            !is_valid_field_value(b"a\r\nInjected: 1"),
+            "CRLF must be rejected"
+        );
+        assert!(!is_valid_field_value(b"nul\0byte"), "NUL must be rejected");
+    }
+
+    #[test]
+    fn request_target_validation() {
+        assert!(is_valid_request_target(b"/foo?bar=baz"));
+        assert!(is_valid_request_target(b"*"));
+        assert!(is_valid_request_target(b"http://example.com/x"));
+        assert!(!is_valid_request_target(b""), "empty target is invalid");
+        assert!(
+            !is_valid_request_target(b"/foo bar"),
+            "SP would break the line"
+        );
+        assert!(
+            !is_valid_request_target(b"/foo\r\nHost: evil"),
+            "CRLF must be rejected"
+        );
     }
 }

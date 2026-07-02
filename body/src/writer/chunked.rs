@@ -525,7 +525,7 @@ mod test {
             let ready = Ready::new(&mut buf);
             let ready = drive_chunk(ready, b"hi").await;
             let mut trailers = Headers::default();
-            trailers.push("x-foo", &b"bar"[..]);
+            trailers.push_raw("x-foo", &b"bar"[..]);
             ready
                 .finish_with_trailers(&trailers)
                 .finish()

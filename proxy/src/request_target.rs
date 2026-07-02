@@ -170,7 +170,7 @@ pub(crate) fn normalize(req: &mut Request) -> Result<(), ProxyFrontendError> {
             req.headers_mut()
                 .remove(|(name, _)| name.eq_ignore_ascii_case(b"host"));
             req.headers_mut()
-                .push(Bytes::from_static(b"host"), authority);
+                .push_raw(Bytes::from_static(b"host"), authority);
             Ok(())
         }
         RequestTargetForm::MaybeAuthority => Err(ProxyFrontendError::AuthorityFormNotAllowed),

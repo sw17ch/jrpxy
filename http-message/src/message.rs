@@ -4,7 +4,10 @@ use bytes::{Bytes, BytesMut};
 use httparse::{Request as HttparseRequest, Response as HttparseResponse};
 use jrpxy_util::{
     io_buffer::BytesReader,
-    parse::{OriginFormError, is_valid_tchar, validate_origin_form},
+    parse::{
+        OriginFormError, is_valid_field_name, is_valid_field_value, is_valid_request_target,
+        is_valid_tchar, validate_origin_form,
+    },
 };
 
 pub use httparse::Error as HttpParseError;
@@ -44,6 +47,30 @@ pub enum BuildError {
     MissingResult,
     #[error("Method contains invalid characters (RFC9110, 9.1)")]
     InvalidMethod(String),
+    #[error("Request-target contains invalid characters (RFC 9112, 3.2)")]
+    InvalidPath(String),
+    #[error("Reason phrase contains invalid characters (RFC 9112, 4)")]
+    InvalidReason(String),
+    #[error("Header name contains invalid characters (RFC 9110, 5.1)")]
+    InvalidFieldName(String),
+    #[error("Header value contains invalid characters (RFC 9110, 5.5)")]
+    InvalidFieldValue(String),
+}
+
+/// Validate builder-supplied header pairs, rejecting a name or value whose
+/// bytes could split the header block (RFC 9110 sections 5.1, 5.5).
+fn validate_built_headers(headers: &[(&str, &[u8])]) -> Result<(), BuildError> {
+    for (name, value) in headers {
+        if !is_valid_field_name(name.as_bytes()) {
+            return Err(BuildError::InvalidFieldName(name.to_string()));
+        }
+        if !is_valid_field_value(value) {
+            return Err(BuildError::InvalidFieldValue(
+                String::from_utf8_lossy(value).into_owned(),
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// A buffer type that carries no type or lifetime information that has the same
@@ -555,7 +582,7 @@ fn populate_headers(header_offsets: &[HeaderOffset], head_buf: &Bytes) -> Header
     for h in header_offsets.iter() {
         let name = h.name.slice_from(head_buf);
         let value = h.value.slice_from(head_buf);
-        headers.push(name, value);
+        headers.push_raw(name, value);
     }
     headers
 }
@@ -627,8 +654,10 @@ impl<'s> RequestBuilder<'s> {
         if !method.bytes().all(is_valid_tchar) {
             return Err(BuildError::InvalidMethod(method.to_string()));
         }
-
-        // TODO: validate path, and headers
+        if !is_valid_request_target(path.as_bytes()) {
+            return Err(BuildError::InvalidPath(path.to_string()));
+        }
+        validate_built_headers(built_headers)?;
 
         let mut buf = BytesMut::with_capacity(128);
 
@@ -643,7 +672,7 @@ impl<'s> RequestBuilder<'s> {
             let name = buf.split().freeze();
             buf.extend_from_slice(value.as_ref());
             let value = buf.split().freeze();
-            headers.push(name, value);
+            headers.push_raw(name, value);
         }
 
         Ok(Request {
@@ -721,7 +750,12 @@ impl<'s> ResponseBuilder<'s> {
             return Err(BuildError::MissingResult);
         };
 
-        // TODO: validate code, reason, and headers
+        // A reason-phrase draws from the same byte set as a field value
+        // (RFC 9112 section 4), so the field-value check covers it.
+        if !is_valid_field_value(reason.as_bytes()) {
+            return Err(BuildError::InvalidReason(reason.to_string()));
+        }
+        validate_built_headers(built_headers)?;
         // TODO: verify that a 1xx response follows content-length and transfer-encoding rules
 
         let mut buf = BytesMut::with_capacity(128);
@@ -736,7 +770,7 @@ impl<'s> ResponseBuilder<'s> {
             let name = buf.split().freeze();
             buf.extend_from_slice(value.as_ref());
             let value = buf.split().freeze();
-            headers.push(name, value);
+            headers.push_raw(name, value);
         }
 
         Ok(Response {
@@ -757,7 +791,7 @@ mod test {
 
     use crate::{message::BuildError, version::HttpVersion};
 
-    use super::RequestBuilder;
+    use super::{RequestBuilder, ResponseBuilder};
 
     #[test]
     fn build_with_invalid_method() {
@@ -800,5 +834,43 @@ mod test {
             .set_origin_form_path(Bytes::from_static(b"http://example.com/"))
             .unwrap_err();
         assert!(matches!(err, OriginFormError::NotAbsolutePath));
+    }
+
+    #[test]
+    fn request_build_rejects_crlf_in_path() {
+        let mut b = RequestBuilder::new(0);
+        b.with_method("GET")
+            .with_path("/foo\r\nHost: evil")
+            .with_version(HttpVersion::Http11);
+        assert!(matches!(b.build(), Err(BuildError::InvalidPath(_))));
+    }
+
+    #[test]
+    fn request_build_rejects_crlf_in_header_value() {
+        let mut b = RequestBuilder::new(1);
+        b.with_method("GET")
+            .with_path("/")
+            .with_version(HttpVersion::Http11)
+            .with_header("X-Trace", b"a\r\nInjected: 1");
+        assert!(matches!(b.build(), Err(BuildError::InvalidFieldValue(_))));
+    }
+
+    #[test]
+    fn response_build_rejects_crlf_in_reason() {
+        let mut b = ResponseBuilder::new(0);
+        b.with_version(HttpVersion::Http11)
+            .with_code(200)
+            .with_reason("OK\r\nInjected: 1");
+        assert!(matches!(b.build(), Err(BuildError::InvalidReason(_))));
+    }
+
+    #[test]
+    fn response_build_rejects_crlf_in_header_name() {
+        let mut b = ResponseBuilder::new(1);
+        b.with_version(HttpVersion::Http11)
+            .with_code(200)
+            .with_reason("OK")
+            .with_header("bad\r\nname", b"v");
+        assert!(matches!(b.build(), Err(BuildError::InvalidFieldName(_))));
     }
 }

@@ -984,7 +984,7 @@ fn insert_proxy_headers(headers: &mut Headers, version: HttpVersion, received_by
         HttpVersion::Http10 => "1.0",
         HttpVersion::Http11 => "1.1",
     };
-    headers.push(
+    headers.push_raw(
         Bytes::from_static(b"Via"),
         Bytes::from(format!("{via_version} {received_by}")),
     );
@@ -1000,7 +1000,7 @@ fn insert_date_header_if_absent(headers: &mut Headers) {
         return;
     }
     let now = httpdate::fmt_http_date(std::time::SystemTime::now());
-    headers.push(Bytes::from_static(b"Date"), Bytes::from(now));
+    headers.push_raw(Bytes::from_static(b"Date"), Bytes::from(now));
 }
 
 /// A proxy request received from the frontend.
@@ -1521,15 +1521,15 @@ mod test {
     fn sanitize_trailers_strips_forbidden_preserves_benign() {
         let mut trailers = Headers::with_capacity(4);
         // Mixed case to prove the filter is case-insensitive.
-        trailers.push(
+        trailers.push_raw(
             Bytes::from_static(b"Set-Cookie"),
             Bytes::from_static(b"s=1"),
         );
-        trailers.push(
+        trailers.push_raw(
             Bytes::from_static(b"Transfer-Encoding"),
             Bytes::from_static(b"chunked"),
         );
-        trailers.push(
+        trailers.push_raw(
             Bytes::from_static(b"X-Checksum"),
             Bytes::from_static(b"abc"),
         );
