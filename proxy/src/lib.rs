@@ -1,7 +1,5 @@
 //! Tools for implementing an HTTP proxy.
 
-use std::task::Poll;
-
 use bytes::Bytes;
 use jrpxy_backend::{
     error::BackendError,
@@ -772,8 +770,15 @@ where
     BR: AsyncReadExt + Unpin,
     BW: AsyncWriteExt + Unpin,
 {
-    /// Drive the body copy in both directions concurrently. On completion,
-    /// returns frontend and backend readers and writers that can be reused.
+    /// Drive the body copy in both directions to completion concurrently. On
+    /// completion, returns whichever frontend and backend reader/writer pairs
+    /// remain reusable; each is `None` when its connection must be closed.
+    ///
+    /// Both directions are drained: the request-body (frontend-to-backend) copy
+    /// is not abandoned when the response finishes. Finishing it lets the
+    /// connections close with a clean shutdown rather than a reset that could
+    /// discard the already-delivered response, and lets the backend decide
+    /// whether the connection stays reusable.
     pub async fn finish(
         self,
     ) -> ProxyResult<(
@@ -786,56 +791,13 @@ where
             response_body_forwarder,
         } = self;
 
-        let f2b_fut = request_body_forwarder.finish();
-        let b2f_fut = response_body_forwarder.finish();
-
-        let mut f2b_fut_pinned = std::pin::pin!(f2b_fut);
-        let mut b2f_fut_pinned = std::pin::pin!(b2f_fut);
-
-        let mut f2b_res = None;
-        let b2f_res = loop {
-            tokio::select! {
-                f2b = &mut f2b_fut_pinned, if f2b_res.is_none() => f2b_res = Some(f2b),
-                b2f = &mut b2f_fut_pinned => break b2f,
-            }
-        };
-
-        // If polling both didn't result in the frontend-to-backend copy
-        // completing, let's poll it once more to make sure it wasn't just about
-        // to be finished (this can happen for short requests where we've sent
-        // the write, but haven't yet allowed the future to resolve).
-        if f2b_res.is_none() {
-            match std::future::poll_fn(|cx| match f2b_fut_pinned.as_mut().poll(cx) {
-                // TODO: there's also an argument that we should drive the
-                // frontend-to-backend body to completion and rely on the origin
-                // to hang up on us if it wants to terminate early.
-                Poll::Ready(r) => Poll::Ready(Some(r)),
-                Poll::Pending => Poll::Ready(None),
-            })
-            .await
-            {
-                Some(r) => {
-                    // polling once was enough to complete the copy. update the
-                    // frontend-to-backend result.
-                    f2b_res = Some(r)
-                }
-                None => {
-                    // polling once still didn't complete, so we'll leave it
-                    // incomplete.
-                }
-            }
-        }
+        let (f2b_res, b2f_res) = tokio::join!(
+            request_body_forwarder.finish(),
+            response_body_forwarder.finish(),
+        );
 
         let (backend_reader, frontend_writer) = b2f_res?;
-        let (frontend_reader, backend_writer) = match f2b_res {
-            Some(Ok(r)) => r,
-            Some(Err(e)) => return Err(ProxyError::CopyError(e)),
-            None => {
-                return Err(ProxyError::CopyError(
-                    ProxyCopyError::FrontendCopyIncomplete,
-                ));
-            }
-        };
+        let (frontend_reader, backend_writer) = f2b_res?;
 
         let backend_connection = backend_reader.map(move |br| (br, backend_writer));
         let frontend_connection = frontend_reader.zip(frontend_writer);

@@ -24,6 +24,58 @@ async fn make_backend_proxy_request(raw: &[u8]) -> BackendProxyRequest<&[u8], to
         .into_backend_request()
 }
 
+/// Drive one full proxy transaction over a pair of duplex pipes: read the
+/// frontend request, forward it to the backend, relay the final response, and
+/// drain both body directions to completion. Panics on any proxy-layer error.
+///
+/// The streaming tests below care about *when* bytes move between a mock client
+/// and a mock origin, not about this bookkeeping; hoisting it here lets each of
+/// them read as just its client and origin behavior.
+async fn run_proxy_transaction(
+    frontend_server: tokio::io::DuplexStream,
+    backend_client: tokio::io::DuplexStream,
+) {
+    let (frontend_server_r, frontend_server_w) = tokio::io::split(frontend_server);
+    let (backend_client_r, backend_client_w) = tokio::io::split(backend_client);
+
+    let fe_options = ProxyOptions::default();
+    let fe_request = FrontendReader::new(frontend_server_r, 256)
+        .read(8192, fe_options.max_chunk_header_length())
+        .await
+        .expect("frontend read failed");
+    let backend_connection = (
+        BackendReader::new(backend_client_r, 256),
+        BackendWriter::new(backend_client_w),
+    );
+
+    let response = FrontendProxyRequest::from_request(
+        fe_request,
+        FrontendWriter::new(frontend_server_w),
+        fe_options,
+    )
+    .expect("client start failed")
+    .into_backend_request()
+    .forward(backend_connection)
+    .await
+    .expect("backend write failed")
+    .read_backend_response()
+    .await
+    .expect("failed to read backend response");
+
+    let final_response = match response {
+        BackendProxyResponseStream::Final(rbr) => rbr,
+        BackendProxyResponseStream::Informational(_) => panic!("unexpected informational response"),
+    };
+
+    final_response
+        .forward_response_head()
+        .await
+        .expect("forward_response_head failed")
+        .finish()
+        .await
+        .expect("failed to finish");
+}
+
 #[tokio::test]
 async fn test_oneshot_transaction() {
     let frontend_reader = b"\
@@ -1915,43 +1967,7 @@ async fn proxy_completes_when_backend_requires_full_request_body_before_respondi
         backend_server_w.flush().await.unwrap();
     });
 
-    let proxy_task = tokio::spawn(async move {
-        let (frontend_server_r, frontend_server_w) = tokio::io::split(frontend_server);
-        let (backend_client_r, backend_client_w) = tokio::io::split(backend_client);
-
-        let fe_writer = FrontendWriter::new(frontend_server_w);
-        let fe_options = ProxyOptions::default();
-        let fe_request = FrontendReader::new(frontend_server_r, 256)
-            .read(8192, fe_options.max_chunk_header_length())
-            .await
-            .expect("frontend read failed");
-        let backend_connection = (
-            BackendReader::new(backend_client_r, 256),
-            BackendWriter::new(backend_client_w),
-        );
-
-        let be_res_stat = FrontendProxyRequest::from_request(fe_request, fe_writer, fe_options)
-            .expect("client start failed")
-            .into_backend_request()
-            .forward(backend_connection)
-            .await
-            .expect("backend write failed")
-            .read_backend_response()
-            .await
-            .expect("failed to read backend response");
-
-        let rbr = match be_res_stat {
-            BackendProxyResponseStream::Final(rbr) => rbr,
-            BackendProxyResponseStream::Informational(_) => panic!("unexpected informational"),
-        };
-
-        rbr.forward_response_head()
-            .await
-            .expect("forward_response_head failed")
-            .finish()
-            .await
-            .expect("failed to finish");
-    });
+    let proxy_task = tokio::spawn(run_proxy_transaction(frontend_server, backend_client));
 
     tokio::time::timeout(Duration::from_secs(1), async move {
         proxy_task.await.unwrap();
@@ -1961,6 +1977,100 @@ async fn proxy_completes_when_backend_requires_full_request_body_before_respondi
     .expect(
         "timed out - proxy deadlocked waiting for backend response \
              before forwarding the request body",
+    );
+}
+
+/// A backend that sends its complete response *before* consuming the request
+/// body. The early response must not truncate the upload: the proxy must keep
+/// pumping the request body through to the backend to completion. This
+/// exercises the unconditional both-directions drain in
+/// `ProxyBodyExchanger::finish` - abandoning the request copy once the response
+/// finished would leave the backend short of the body it is still reading.
+#[tokio::test]
+async fn proxy_drains_request_body_even_when_response_arrives_early() {
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Larger than the duplex pipe buffers below so the body cannot be flushed
+    // in a single step: draining it must span several reactor turns, which is
+    // what makes this a real guard rather than something an in-memory copy
+    // would complete synchronously regardless of the drain policy.
+    const BODY_LEN: usize = 64 * 1024;
+
+    let (frontend_client, frontend_server) = tokio::io::duplex(4096);
+    let (backend_client, backend_server) = tokio::io::duplex(4096);
+
+    // Client: stream the head and a large body, then read the response back.
+    let client_task = tokio::spawn(async move {
+        let (mut fc_r, mut fc_w) = tokio::io::split(frontend_client);
+
+        fc_w.write_all(
+            b"POST / HTTP/1.1\r\n\
+                  Host: example.com\r\n\
+                  Content-Length: 65536\r\n\
+                  \r\n",
+        )
+        .await
+        .unwrap();
+        fc_w.write_all(&vec![b'x'; BODY_LEN]).await.unwrap();
+        fc_w.flush().await.unwrap();
+
+        // Drain the response so the proxy's write-back path never stalls, and
+        // confirm the early response reached the client.
+        let mut sink = Vec::new();
+        fc_r.read_to_end(&mut sink).await.unwrap();
+        assert!(
+            sink.starts_with(b"HTTP/1.1 200"),
+            "client did not observe the early response"
+        );
+    });
+
+    // Backend origin: respond immediately after the head, *then* read the body
+    // the proxy is expected to keep pumping. Returns the number of body bytes
+    // actually received.
+    let backend_task = tokio::spawn(async move {
+        let (backend_server_r, mut backend_server_w) = tokio::io::split(backend_server);
+
+        let req = FrontendReader::new(backend_server_r, 256)
+            .read(8192, 8192)
+            .await
+            .expect("backend: failed to read request head");
+        let (_, mut body_reader) = req.into_parts();
+
+        backend_server_w
+            .write_all(
+                b"HTTP/1.1 200 Ok\r\n\
+                      content-length: 0\r\n\
+                      \r\n",
+            )
+            .await
+            .unwrap();
+        backend_server_w.flush().await.unwrap();
+
+        let mut received = 0usize;
+        while let Some(chunk) = body_reader.read(8192).await.unwrap() {
+            assert!(
+                chunk.iter().all(|&b| b == b'x'),
+                "request body corrupted in transit"
+            );
+            received += chunk.len();
+        }
+        received
+    });
+
+    let proxy_task = tokio::spawn(run_proxy_transaction(frontend_server, backend_client));
+
+    let received = tokio::time::timeout(Duration::from_secs(5), async move {
+        client_task.await.unwrap();
+        proxy_task.await.unwrap();
+        backend_task.await.unwrap()
+    })
+    .await
+    .expect("timed out - proxy did not drain the request body after the early response");
+
+    assert_eq!(
+        received, BODY_LEN,
+        "backend must receive the entire request body despite the early response"
     );
 }
 
