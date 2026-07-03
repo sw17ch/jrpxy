@@ -207,7 +207,8 @@ impl Headers {
     /// Determines the framing represented in the set of headers.
     pub fn framing(&self) -> Result<ParsedFraming, HeaderError> {
         let mut cl = None;
-        let mut te = false;
+        let mut te_headers = 0usize;
+        let mut te_value = None;
 
         for (name, value) in self.iter() {
             if name.eq_ignore_ascii_case(b"content-length") {
@@ -244,20 +245,30 @@ impl Headers {
                     cl = Some(cl_val);
                 }
             } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
-                let te_value = trim_ows(value);
-                if !te_value.eq_ignore_ascii_case(b"chunked") {
-                    return Err(HeaderError::UnsupportedTransferEncoding(
-                        String::from_utf8_lossy(te_value).to_string(),
-                    ));
-                }
-                if te {
-                    return Err(HeaderError::MultipleTransferEncodingHeaders);
-                }
-                te = true;
-            } else {
-                continue;
+                // Capture rather than validate here: the coding list is checked
+                // only after the whole header set has been scanned, so a second
+                // Transfer-Encoding header is reported as a duplicate regardless
+                // of whether either value would have been valid on its own.
+                te_headers += 1;
+                te_value = Some(value);
             }
         }
+
+        let te = match te_headers {
+            0 => false,
+            1 => {
+                ensure_sole_chunked_coding(te_value.expect("one header implies a captured value"))?;
+                true
+            }
+            // RFC 9110 section 5.3 would let a recipient fold repeated
+            // list-valued lines into one comma list, but multiple
+            // Transfer-Encoding headers are a common smuggling probe and
+            // near-nonexistent from honest clients, so we reject rather than
+            // fold. Folding would reach the same verdict anyway: two `chunked`
+            // lines become `chunked, chunked`, which the coding check rejects as
+            // chunked applied twice (RFC 9112 section 6.1).
+            _ => return Err(HeaderError::MultipleTransferEncodingHeaders),
+        };
 
         match (cl, te) {
             (None, true) => Ok(ParsedFraming::Chunked),
@@ -353,6 +364,34 @@ impl Headers {
         let Self { headers } = self;
         headers
     }
+}
+
+/// Validate that a single Transfer-Encoding field value names exactly the
+/// `chunked` coding and nothing else (RFC 9112 section 7). We frame with
+/// `chunked` only and apply no coding transforms (no gzip and the like), so any
+/// other coding is unsupported, and `chunked` applied more than once cannot be
+/// decoded because only a single layer is peeled.
+fn ensure_sole_chunked_coding(value: &[u8]) -> Result<(), HeaderError> {
+    let mut chunked_count = 0usize;
+    for raw in value.split(|&b| b == b',') {
+        let coding = trim_ows(raw);
+        // RFC 9110 section 5.6.1: tolerate empty list elements.
+        if coding.is_empty() {
+            continue;
+        }
+        if !coding.eq_ignore_ascii_case(b"chunked") {
+            return Err(HeaderError::UnsupportedTransferEncoding(
+                String::from_utf8_lossy(coding).to_string(),
+            ));
+        }
+        chunked_count += 1;
+    }
+    if chunked_count != 1 {
+        return Err(HeaderError::UnsupportedTransferEncoding(
+            String::from_utf8_lossy(trim_ows(value)).to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Iterator over the comma-separated tokens of a single `Connection` header
@@ -634,16 +673,45 @@ mod test {
         ));
     }
 
+    /// Two Transfer-Encoding headers, each a valid lone `chunked`, must be
+    /// rejected specifically as a duplicate header rather than as an
+    /// unsupported coding: the presence of the second header is the fault, not
+    /// either value.
     #[test]
     fn reject_message_with_multiple_te_headers() {
         let mut headers = Headers::with_capacity(2);
         headers.push_raw(b"transfer-encoding".as_slice(), b"chunked".as_slice());
         headers.push_raw(b"transfer-encoding".as_slice(), b"chunked".as_slice());
 
-        assert!(
-            headers.framing().is_err(),
-            "Requests with multiple Transfer-Encoding headers must be rejected"
-        );
+        assert!(matches!(
+            headers.framing(),
+            Err(crate::header::HeaderError::MultipleTransferEncodingHeaders)
+        ));
+    }
+
+    /// The duplicate-header verdict must not hinge on header order or on
+    /// whether either value is itself a supported coding: an unsupported coding
+    /// beside a second Transfer-Encoding header still reports the duplicate, in
+    /// either arrangement. Otherwise a message could be rejected as "gzip
+    /// unsupported" while masking that it carried two framing headers - the
+    /// security-relevant fact.
+    #[test]
+    fn multiple_te_headers_report_duplicate_regardless_of_value() {
+        let mut supported_first = Headers::with_capacity(2);
+        supported_first.push_raw(b"transfer-encoding".as_slice(), b"chunked".as_slice());
+        supported_first.push_raw(b"transfer-encoding".as_slice(), b"gzip".as_slice());
+        assert!(matches!(
+            supported_first.framing(),
+            Err(crate::header::HeaderError::MultipleTransferEncodingHeaders)
+        ));
+
+        let mut unsupported_first = Headers::with_capacity(2);
+        unsupported_first.push_raw(b"transfer-encoding".as_slice(), b"gzip".as_slice());
+        unsupported_first.push_raw(b"transfer-encoding".as_slice(), b"chunked".as_slice());
+        assert!(matches!(
+            unsupported_first.framing(),
+            Err(crate::header::HeaderError::MultipleTransferEncodingHeaders)
+        ));
     }
 
     #[test]
@@ -655,6 +723,71 @@ mod test {
             headers.framing().is_ok(),
             "transfer-coding names are case insensitive according to RFC9112 section 7"
         );
+    }
+
+    /// We frame with `chunked` only and transform no other coding, so a lone
+    /// unsupported coding must be rejected rather than silently forwarded.
+    #[test]
+    fn reject_te_with_unsupported_coding() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push_raw(b"transfer-encoding".as_slice(), b"gzip".as_slice());
+        assert!(matches!(
+            headers.framing(),
+            Err(crate::header::HeaderError::UnsupportedTransferEncoding(_))
+        ));
+    }
+
+    /// A list that layers an unsupported coding under chunked (RFC 9112
+    /// section 7) must be rejected: peeling the chunked layer would leave the
+    /// inner coding intact and mislabel the forwarded body.
+    #[test]
+    fn reject_te_list_with_unsupported_coding() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push_raw(b"transfer-encoding".as_slice(), b"gzip, chunked".as_slice());
+        assert!(matches!(
+            headers.framing(),
+            Err(crate::header::HeaderError::UnsupportedTransferEncoding(_))
+        ));
+    }
+
+    /// RFC 9112 section 6.1: chunked must not be applied more than once. Only
+    /// a single layer is peeled, so a doubled `chunked` cannot be framed and
+    /// must be rejected instead of leaving an inner chunked stream as body.
+    #[test]
+    fn reject_te_chunked_applied_twice() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push_raw(
+            b"transfer-encoding".as_slice(),
+            b"chunked, chunked".as_slice(),
+        );
+        assert!(matches!(
+            headers.framing(),
+            Err(crate::header::HeaderError::UnsupportedTransferEncoding(_))
+        ));
+    }
+
+    /// RFC 9110 section 5.6.1: recipients tolerate empty list elements, so a
+    /// trailing comma around a lone `chunked` still frames as chunked.
+    #[test]
+    fn accept_te_chunked_with_empty_list_element() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push_raw(b"transfer-encoding".as_slice(), b"chunked, ".as_slice());
+        assert!(matches!(
+            headers.framing(),
+            Ok(crate::framing::ParsedFraming::Chunked)
+        ));
+    }
+
+    /// A Transfer-Encoding header carrying no coding at all is malformed and
+    /// must not be treated as if the header were absent.
+    #[test]
+    fn reject_te_empty_value() {
+        let mut headers = Headers::with_capacity(1);
+        headers.push_raw(b"transfer-encoding".as_slice(), b"".as_slice());
+        assert!(matches!(
+            headers.framing(),
+            Err(crate::header::HeaderError::UnsupportedTransferEncoding(_))
+        ));
     }
 
     fn b<const C: usize>(a: &'static [u8; C]) -> bytes::Bytes {
